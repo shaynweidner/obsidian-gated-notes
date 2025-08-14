@@ -1,0 +1,10 @@
+{
+	"id": "gated-notes",
+	"name": "Gated Notes",
+	"version": "1.0.0",
+	"minAppVersion": "1.5.0",
+	"description": "Turn your notes into an interactive learning experience with AI-powered flashcards and gated reading.",
+	"author": "Shayn Weidner",
+	"authorUrl": "https://github.com/shaynweidner",
+	"isDesktopOnly": false
+}
