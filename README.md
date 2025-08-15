@@ -123,8 +123,4 @@ Prepare the note for gating by converting paragraphs into trackable units.
 Contributions, bug reports, and feature requests are welcome!  
 Open an issue or PR on [GitHub](https://github.com/shaynweidner/obsidian-gated-notes).
 
----
 
-If you want, I can also **add a “Quick Start” diagram** to visually show the gated reading loop — which would make this README even more beginner-friendly. That could go right under “Core Workflow.”
-
-Do you want me to do that next?
