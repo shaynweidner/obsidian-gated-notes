@@ -559,13 +559,16 @@ export default class GatedNotesPlugin extends Plugin {
 			interval,
 			ease_factor,
 		};
-
+	
 		const now = Date.now();
 		const ONE_DAY_MS = 86_400_000;
 		const ONE_MINUTE_MS = 60_000;
-
+	
+		// FIX: Ensure review_history exists for older cards created before this feature was added.
+		if (!card.review_history) card.review_history = [];
+	
 		card.review_history.push({ ...previousState, timestamp: now });
-
+	
 		if (rating === "Again") {
 			card.status = card.status === "review" ? "relearn" : "learning";
 			card.learning_step_index = 0;
@@ -576,9 +579,9 @@ export default class GatedNotesPlugin extends Plugin {
 			card.last_reviewed = new Date(now).toISOString();
 			return;
 		}
-
+	
 		card.blocked = false;
-
+	
 		if (["new", "learning", "relearn"].includes(card.status)) {
 			const steps =
 				card.status === "relearn"
@@ -587,7 +590,7 @@ export default class GatedNotesPlugin extends Plugin {
 			const stepIncrement = rating === "Easy" ? 2 : 1;
 			const currentIndex =
 				(card.learning_step_index ?? -1) + stepIncrement;
-
+	
 			if (currentIndex < steps.length) {
 				card.learning_step_index = currentIndex;
 				card.due = now + steps[currentIndex] * ONE_MINUTE_MS;
