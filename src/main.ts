@@ -692,8 +692,7 @@ export default class GatedNotesPlugin extends Plugin {
 
 		if (content.includes(SPLIT_TAG)) {
 			const userChoice = await this.showSplitMarkerConflictModal();
-			console.log("userChoice:",userChoice);
-	
+
 			if (userChoice === "manual") {
 				await this.manualFinalizeNote(file);
 				return;
@@ -807,7 +806,7 @@ export default class GatedNotesPlugin extends Plugin {
 		return new Promise((resolve) => {
 			const modal = new Modal(this.app);
 			let choice: "auto" | "manual" | null = null; // Variable to store the choice
-	
+
 			modal.titleEl.setText("Manual Split Markers Detected");
 			modal.contentEl.createEl("p", {
 				text: "This note contains manual paragraph split markers. The 'auto-finalize' action normally ignores these and splits paragraphs based on blank lines.",
@@ -815,18 +814,18 @@ export default class GatedNotesPlugin extends Plugin {
 			modal.contentEl.createEl("p", {
 				text: "How would you like to proceed?",
 			});
-	
+
 			const buttonContainer = modal.contentEl.createDiv({
 				cls: "gn-edit-btnrow",
 			});
-	
+
 			new ButtonComponent(buttonContainer)
 				.setButtonText("Cancel")
 				.onClick(() => {
 					choice = null; // Set choice
 					modal.close();
 				});
-	
+
 			new ButtonComponent(buttonContainer)
 				.setButtonText("Ignore and Auto-Split")
 				.setWarning()
@@ -834,7 +833,7 @@ export default class GatedNotesPlugin extends Plugin {
 					choice = "auto"; // Set choice
 					modal.close();
 				});
-				
+
 			new ButtonComponent(buttonContainer)
 				.setButtonText("Use Manual Breaks")
 				.setCta()
@@ -842,11 +841,11 @@ export default class GatedNotesPlugin extends Plugin {
 					choice = "manual"; // Set choice
 					modal.close();
 				});
-	
+
 			modal.onClose = () => {
 				resolve(choice);
 			};
-			
+
 			modal.open();
 		});
 	}
@@ -3041,7 +3040,7 @@ class GNSettingsTab extends PluginSettingTab {
 		new Setting(containerEl).setName("AI Provider").setHeading();
 		new Setting(containerEl)
 			.setName("API Provider")
-			.setDesc("Choose the AI provider for card generation.")
+			.setDesc("Choose the AI provider for text-based card generation.")
 			.addDropdown((dropdown) =>
 				dropdown
 					.addOption("openai", "OpenAI")
@@ -3052,22 +3051,33 @@ class GNSettingsTab extends PluginSettingTab {
 							| "openai"
 							| "lmstudio";
 						await this.plugin.saveSettings();
-						this.display(); 
+						this.display();
 					})
 			);
 
-		if (this.plugin.settings.apiProvider === "openai") {
-			new Setting(containerEl).setName("OpenAI API key").addText((text) =>
-				text
-					.setPlaceholder("sk-…")
-					.setValue(this.plugin.settings.openaiApiKey)
-					.onChange(async (value) => {
-						this.plugin.settings.openaiApiKey = value;
-						await this.plugin.saveSettings();
-					})
-			);
+		if (
+			this.plugin.settings.apiProvider === "openai" ||
+			this.plugin.settings.analyzeImagesOnGenerate
+		) {
 			new Setting(containerEl)
-				.setName("OpenAI Model")
+				.setName("OpenAI API key")
+				.setDesc(
+					"Required for OpenAI text generation and/or image analysis."
+				)
+				.addText((text) =>
+					text
+						.setPlaceholder("sk-…")
+						.setValue(this.plugin.settings.openaiApiKey)
+						.onChange(async (value) => {
+							this.plugin.settings.openaiApiKey = value;
+							await this.plugin.saveSettings();
+						})
+				);
+		}
+
+		if (this.plugin.settings.apiProvider === "openai") {
+			new Setting(containerEl)
+				.setName("OpenAI Text Model")
 				.addDropdown((dropdown) => {
 					this.plugin.settings.availableModels.forEach((model) =>
 						dropdown.addOption(model, model)
@@ -3080,6 +3090,7 @@ class GNSettingsTab extends PluginSettingTab {
 						});
 				});
 		} else {
+			// This is the LM Studio block
 			new Setting(containerEl)
 				.setName("LM Studio Server URL")
 				.addText((text) =>
@@ -3113,10 +3124,10 @@ class GNSettingsTab extends PluginSettingTab {
 				button.setButtonText("Fetch").onClick(async () => {
 					button.setDisabled(true).setButtonText("Fetching...");
 					try {
-						const ids = await this.plugin.fetchAvailableModels();
-						new Notice(`Fetched ${ids.length} models.`);
+						await this.plugin.fetchAvailableModels();
+						new Notice("Fetched models.");
 					} finally {
-						this.display(); // Re-render to show new models
+						this.display();
 					}
 				})
 			);
@@ -3137,7 +3148,42 @@ class GNSettingsTab extends PluginSettingTab {
 					})
 			);
 
+		// --- Card Generation Section ---
 		new Setting(containerEl).setName("Card Generation").setHeading();
+
+		new Setting(containerEl)
+			.setName("Analyze images on generate (Experimental)")
+			.setDesc(
+				"Analyze images using an OpenAI vision model. This feature requires an OpenAI API key regardless of the main provider setting."
+			)
+			.addToggle((toggle) =>
+				toggle
+					.setValue(this.plugin.settings.analyzeImagesOnGenerate)
+					.onChange(async (value) => {
+						this.plugin.settings.analyzeImagesOnGenerate = value;
+						await this.plugin.saveSettings();
+						this.display();
+					})
+			);
+
+		if (this.plugin.settings.analyzeImagesOnGenerate) {
+			new Setting(containerEl)
+				.setName("OpenAI Multimodal Model")
+				.setDesc(
+					"Model for image analysis (e.g., gpt-4o, gpt-4o-mini)."
+				)
+				.addDropdown((dropdown) => {
+					dropdown.addOption("gpt-4o", "gpt-4o");
+					dropdown.addOption("gpt-4o-mini", "gpt-4o-mini");
+					dropdown
+						.setValue(this.plugin.settings.openaiMultimodalModel)
+						.onChange(async (value) => {
+							this.plugin.settings.openaiMultimodalModel = value;
+							await this.plugin.saveSettings();
+						});
+				});
+		}
+
 		new Setting(containerEl)
 			.setName("Auto-correct AI tags")
 			.setDesc(
@@ -3149,28 +3195,33 @@ class GNSettingsTab extends PluginSettingTab {
 					.onChange(async (value) => {
 						this.plugin.settings.autoCorrectTags = value;
 						await this.plugin.saveSettings();
+						// --- NEW: Re-render to show/hide the retries setting ---
+						this.display();
 					})
 			);
 
-		new Setting(containerEl)
-			.setName("Max tag correction retries")
-			.setDesc(
-				"How many times to ask the AI to fix a single bad tag before giving up."
-			)
-			.addText((text) =>
-				text
-					.setPlaceholder("2")
-					.setValue(
-						String(this.plugin.settings.maxTagCorrectionRetries)
-					)
-					.onChange(async (value) => {
-						const num = parseInt(value, 10);
-						if (!isNaN(num) && num >= 0) {
-							this.plugin.settings.maxTagCorrectionRetries = num;
-							await this.plugin.saveSettings();
-						}
-					})
-			);
+		if (this.plugin.settings.autoCorrectTags) {
+			new Setting(containerEl)
+				.setName("Max tag correction retries")
+				.setDesc(
+					"How many times to ask the AI to fix a single bad tag before giving up."
+				)
+				.addText((text) =>
+					text
+						.setPlaceholder("2")
+						.setValue(
+							String(this.plugin.settings.maxTagCorrectionRetries)
+						)
+						.onChange(async (value) => {
+							const num = parseInt(value, 10);
+							if (!isNaN(num) && num >= 0) {
+								this.plugin.settings.maxTagCorrectionRetries =
+									num;
+								await this.plugin.saveSettings();
+							}
+						})
+				);
+		}
 
 		// --- Spaced Repetition Section ---
 		new Setting(containerEl).setName("Spaced Repetition").setHeading();
