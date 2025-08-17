@@ -19,21 +19,25 @@ import {
 	TAbstractFile,
 	TextComponent,
 	TFile,
+	ToggleComponent,
 } from "obsidian";
+
+import { Buffer } from "buffer";
 
 // ===================================================================
 //
-//                          CONSTANTS & ENUMS
+//                          CONSTANTS & ENUMS
 //
 // ===================================================================
 
 const DECK_FILE_NAME = "_flashcards.json";
-const SPLIT_TAG = '<div class="mm-split-placeholder"></div>';
-const PARA_CLASS = "mm-paragraph";
+const SPLIT_TAG = '<div class="gn-split-placeholder"></div>';
+const PARA_CLASS = "gn-paragraph";
 const PARA_ID_ATTR = "data-para-id";
-const PARA_MD_ATTR = "data-mm-md";
+const PARA_MD_ATTR = "data-gn-md";
 const API_URL_COMPLETIONS = "https://api.openai.com/v1/chat/completions";
 const API_URL_MODELS = "https://api.openai.com/v1/models";
+const IMAGE_ANALYSIS_FILE_NAME = "_images.json";
 
 const ICONS = {
 	blocked: "⏳",
@@ -59,7 +63,7 @@ type ReviewResult = "answered" | "skip" | "abort" | "again";
 
 // ===================================================================
 //
-//                          INTERFACES & TYPES
+//                          INTERFACES & TYPES
 //
 // ===================================================================
 
@@ -107,6 +111,8 @@ interface Settings {
 	logLevel: LogLevel;
 	autoCorrectTags: boolean;
 	maxTagCorrectionRetries: number;
+	openaiMultimodalModel: string;
+	analyzeImagesOnGenerate: boolean;
 }
 
 const DEFAULT_SETTINGS: Settings = {
@@ -124,11 +130,25 @@ const DEFAULT_SETTINGS: Settings = {
 	logLevel: LogLevel.NORMAL,
 	autoCorrectTags: true,
 	maxTagCorrectionRetries: 2,
+	openaiMultimodalModel: "gpt-4o-mini",
+	analyzeImagesOnGenerate: true,
 };
+
+interface ImageAnalysis {
+	path: string;
+	analysis: {
+		type: string;
+		description: Record<string, string | string[]>;
+	};
+}
+
+interface ImageAnalysisGraph {
+	[hash: string]: ImageAnalysis;
+}
 
 // ===================================================================
 //
-//                          MAIN PLUGIN CLASS
+//                          MAIN PLUGIN CLASS
 //
 // ===================================================================
 
@@ -214,25 +234,25 @@ export default class GatedNotesPlugin extends Plugin {
 
 	private registerCommands(): void {
 		this.addCommand({
-			id: "mm-review-due",
+			id: "gn-review-due",
 			name: "Review due cards",
 			callback: () => this.reviewDue(),
 		});
 
 		this.addCommand({
-			id: "mm-toggle-gating",
+			id: "gn-toggle-gating",
 			name: "Toggle content gating",
 			callback: () => this.toggleGating(),
 		});
 
 		this.addCommand({
-			id: "mm-browse-cards",
+			id: "gn-browse-cards",
 			name: "Browse cards",
 			callback: () => new CardBrowser(this).open(),
 		});
 
 		this.addCommand({
-			id: "mm-finalize-auto",
+			id: "gn-finalize-auto",
 			name: "Finalize note (auto-paragraphs)",
 			checkCallback: (checking: boolean) => {
 				const view =
@@ -244,7 +264,7 @@ export default class GatedNotesPlugin extends Plugin {
 		});
 
 		this.addCommand({
-			id: "mm-finalize-manual",
+			id: "gn-finalize-manual",
 			name: "Finalize note (manual splits)",
 			checkCallback: (checking: boolean) => {
 				const view =
@@ -256,7 +276,7 @@ export default class GatedNotesPlugin extends Plugin {
 		});
 
 		this.addCommand({
-			id: "mm-unfinalize",
+			id: "gn-unfinalize",
 			name: "Un-finalize chapter",
 			checkCallback: (checking: boolean) => {
 				const view =
@@ -268,7 +288,7 @@ export default class GatedNotesPlugin extends Plugin {
 		});
 
 		this.addCommand({
-			id: "mm-insert-split",
+			id: "gn-insert-split",
 			name: "Insert paragraph split marker",
 			hotkeys: [{ modifiers: ["Mod", "Shift"], key: "Enter" }],
 			editorCallback: (editor: Editor) =>
@@ -276,7 +296,7 @@ export default class GatedNotesPlugin extends Plugin {
 		});
 
 		this.addCommand({
-			id: "mm-generate-cards",
+			id: "gn-generate-cards",
 			name: "Generate flashcards from finalized note",
 			checkCallback: (checking: boolean) => {
 				const view =
@@ -288,17 +308,48 @@ export default class GatedNotesPlugin extends Plugin {
 					return false;
 				}
 				if (!checking) {
-					const file = view.file;
-					this.promptForCardCount(file, (count: number) => {
-						if (count > 0) this.generateFlashcards(file, count);
-					});
+					// This part needs to be async to check for existing cards
+					(async () => {
+						const file = view.file!;
+						const deckPath = getDeckPathForChapter(file.path);
+						const graph = await this.readDeck(deckPath);
+						const existingCards = Object.values(graph).filter(
+							(c) => c.chapter === file.path
+						);
+
+						if (existingCards.length > 0) {
+							// Open new modal for generating additional cards
+							new GenerateAdditionalCardsModal(
+								this,
+								file,
+								existingCards,
+								(result) => {
+									if (result && result.count > 0) {
+										this.generateFlashcards(
+											file,
+											result.count,
+											result.preventDuplicates
+												? existingCards
+												: undefined
+										);
+									}
+								}
+							).open();
+						} else {
+							// Open original modal for new card generation
+							this.promptForCardCount(file, (count: number) => {
+								if (count > 0)
+									this.generateFlashcards(file, count);
+							});
+						}
+					})();
 				}
 				return true;
 			},
 		});
 
 		this.addCommand({
-			id: "mm-recalculate-para-idx",
+			id: "gn-recalculate-para-idx",
 			name: "Recalculate paragraph indexes for this note",
 			checkCallback: (checking: boolean) => {
 				const view =
@@ -310,13 +361,13 @@ export default class GatedNotesPlugin extends Plugin {
 		});
 
 		this.addCommand({
-			id: "mm-recalculate-all-para-idx",
+			id: "gn-recalculate-all-para-idx",
 			name: "Recalculate paragraph indexes for all notes",
 			callback: () => this.recalculateAllParaIndexes(),
 		});
 
 		this.addCommand({
-			id: "mm-delete-chapter-cards",
+			id: "gn-delete-chapter-cards",
 			name: "Delete all flashcards for this chapter",
 			checkCallback: (checking: boolean) => {
 				const view =
@@ -429,10 +480,22 @@ export default class GatedNotesPlugin extends Plugin {
 			);
 			menu.addItem((item) =>
 				item
-					.setTitle("Generate card with AI")
+					.setTitle("Generate a card with AI")
 					.setIcon("sparkles")
 					.onClick(() =>
 						this.generateCardFromSelection(
+							selection,
+							view.file!,
+							paraIdx
+						)
+					)
+			);
+			menu.addItem((item) =>
+				item
+					.setTitle("Generate one or more cards with AI")
+					.setIcon("sparkles")
+					.onClick(() =>
+						this.generateCardsFromSelection(
 							selection,
 							view.file!,
 							paraIdx
@@ -449,7 +512,6 @@ export default class GatedNotesPlugin extends Plugin {
 
 	private async reviewDue(): Promise<void> {
 		const activePath = this.app.workspace.getActiveFile()?.path ?? "";
-		// eslint-disable-next-line no-constant-condition
 		while (true) {
 			const queue = await this.collectReviewPool(activePath);
 			if (!queue.length) {
@@ -551,26 +613,30 @@ export default class GatedNotesPlugin extends Plugin {
 	}
 
 	private applySm2(card: Flashcard, rating: CardRating): void {
-		const { status: state, interval, ease_factor } = card;
+		const { status: originalStatus, interval, ease_factor } = card;
 		const previousState: ReviewLog = {
 			timestamp: 0,
 			rating,
-			state,
+			state: originalStatus,
 			interval,
 			ease_factor,
 		};
-	
+
 		const now = Date.now();
 		const ONE_DAY_MS = 86_400_000;
 		const ONE_MINUTE_MS = 60_000;
-	
-		// FIX: Ensure review_history exists for older cards created before this feature was added.
+
 		if (!card.review_history) card.review_history = [];
-	
 		card.review_history.push({ ...previousState, timestamp: now });
-	
+
+		if (originalStatus === "new") {
+			card.status = "learning";
+		}
+
 		if (rating === "Again") {
-			card.status = card.status === "review" ? "relearn" : "learning";
+			if (originalStatus === "review") {
+				card.status = "relearn";
+			}
 			card.learning_step_index = 0;
 			card.interval = 0;
 			card.ease_factor = Math.max(1.3, card.ease_factor - 0.2);
@@ -579,10 +645,10 @@ export default class GatedNotesPlugin extends Plugin {
 			card.last_reviewed = new Date(now).toISOString();
 			return;
 		}
-	
+
 		card.blocked = false;
-	
-		if (["new", "learning", "relearn"].includes(card.status)) {
+
+		if (["learning", "relearn"].includes(card.status)) {
 			const steps =
 				card.status === "relearn"
 					? this.settings.relearnSteps
@@ -590,7 +656,7 @@ export default class GatedNotesPlugin extends Plugin {
 			const stepIncrement = rating === "Easy" ? 2 : 1;
 			const currentIndex =
 				(card.learning_step_index ?? -1) + stepIncrement;
-	
+
 			if (currentIndex < steps.length) {
 				card.learning_step_index = currentIndex;
 				card.due = now + steps[currentIndex] * ONE_MINUTE_MS;
@@ -624,6 +690,18 @@ export default class GatedNotesPlugin extends Plugin {
 			return;
 		}
 
+		if (content.includes(SPLIT_TAG)) {
+			const userChoice = await this.showSplitMarkerConflictModal();
+			console.log("userChoice:",userChoice);
+	
+			if (userChoice === "manual") {
+				await this.manualFinalizeNote(file);
+				return;
+			} else if (userChoice === null) {
+				return;
+			}
+		}
+
 		const paragraphs: string[] = [];
 		let inFence = false;
 		let buffer: string[] = [];
@@ -645,7 +723,7 @@ export default class GatedNotesPlugin extends Plugin {
 		const wrappedContent = paragraphs
 			.map(
 				(md, i) =>
-					`<br class="mm-sentinel"><div class="${PARA_CLASS}" ${PARA_ID_ATTR}="${
+					`<br class="gn-sentinel"><div class="${PARA_CLASS}" ${PARA_ID_ATTR}="${
 						i + 1
 					}" ${PARA_MD_ATTR}="${md2attr(md)}"></div>`
 			)
@@ -669,9 +747,9 @@ export default class GatedNotesPlugin extends Plugin {
 		const wrappedContent = chunks
 			.map(
 				(md, i) =>
-					`<br class="mm-sentinel"><div class="${PARA_CLASS}" ${PARA_ID_ATTR}="${
+					`<br class="gn-sentinel"><div class="${PARA_CLASS}" ${PARA_ID_ATTR}="${
 						i + 1
-					}" ${PARA_MD_ATTR}="${md2attr(md)}"></div>`
+					}" ${PARA_MD_ATTR}="${md2attr(md.trim())}"></div>`
 			)
 			.join("\n\n");
 		await this.app.vault.modify(file, wrappedContent);
@@ -689,7 +767,7 @@ export default class GatedNotesPlugin extends Plugin {
 
 		const mdContent = paragraphs
 			.map((p) => p.markdown)
-			.join("\n\n")
+			.join(`\n\n${SPLIT_TAG}\n\n`)
 			.trim();
 		await this.app.vault.modify(file, mdContent);
 		this.refreshReading();
@@ -725,14 +803,121 @@ export default class GatedNotesPlugin extends Plugin {
 		}
 	}
 
+	private showSplitMarkerConflictModal(): Promise<"auto" | "manual" | null> {
+		return new Promise((resolve) => {
+			const modal = new Modal(this.app);
+			let choice: "auto" | "manual" | null = null; // Variable to store the choice
+	
+			modal.titleEl.setText("Manual Split Markers Detected");
+			modal.contentEl.createEl("p", {
+				text: "This note contains manual paragraph split markers. The 'auto-finalize' action normally ignores these and splits paragraphs based on blank lines.",
+			});
+			modal.contentEl.createEl("p", {
+				text: "How would you like to proceed?",
+			});
+	
+			const buttonContainer = modal.contentEl.createDiv({
+				cls: "gn-edit-btnrow",
+			});
+	
+			new ButtonComponent(buttonContainer)
+				.setButtonText("Cancel")
+				.onClick(() => {
+					choice = null; // Set choice
+					modal.close();
+				});
+	
+			new ButtonComponent(buttonContainer)
+				.setButtonText("Ignore and Auto-Split")
+				.setWarning()
+				.onClick(() => {
+					choice = "auto"; // Set choice
+					modal.close();
+				});
+				
+			new ButtonComponent(buttonContainer)
+				.setButtonText("Use Manual Breaks")
+				.setCta()
+				.onClick(() => {
+					choice = "manual"; // Set choice
+					modal.close();
+				});
+	
+			modal.onClose = () => {
+				resolve(choice);
+			};
+			
+			modal.open();
+		});
+	}
+
 	private async generateFlashcards(
 		file: TFile,
-		count: number
+		count: number,
+		existingCardsForContext?: Flashcard[]
 	): Promise<void> {
-		new Notice(`🤖 Generating ${count} flashcard(s)...`);
+		const notice = new Notice(
+			`🤖 Preparing to generate ${count} flashcard(s)...`,
+			0
+		);
 		const wrappedContent = await this.app.vault.read(file);
 		const paragraphs = getParagraphsFromFinalizedNote(wrappedContent);
-		const plainTextForLlm = paragraphs.map((p) => p.markdown).join("\n\n");
+		let plainTextForLlm = paragraphs.map((p) => p.markdown).join("\n\n");
+
+		let hasImages = false;
+		const imageHashMap = new Map<string, number>();
+
+		if (this.settings.analyzeImagesOnGenerate) {
+			const imageRegex = /!\[\[([^\]]+)\]\]/g;
+			const imageDb = await this.getImageDb();
+			let match;
+			const textToProcess = plainTextForLlm;
+
+			while ((match = imageRegex.exec(textToProcess)) !== null) {
+				const imageLinkText = match[0];
+				const imagePath = match[1];
+				const imageFile = this.app.metadataCache.getFirstLinkpathDest(
+					imagePath,
+					file.path
+				);
+
+				if (imageFile instanceof TFile) {
+					hasImages = true;
+					notice.setMessage(
+						`🤖 Analyzing image: ${imageFile.name}...`
+					);
+					const hash = await this.calculateFileHash(imageFile);
+
+					const imagePara = paragraphs.find((p) =>
+						p.markdown.includes(imageLinkText)
+					);
+					if (imagePara) {
+						imageHashMap.set(hash, imagePara.id);
+					}
+
+					let analysisEntry = imageDb[hash];
+
+					if (!analysisEntry) {
+						const newAnalysis = await this.analyzeImage(imageFile);
+						if (newAnalysis) {
+							analysisEntry = newAnalysis;
+							imageDb[hash] = newAnalysis;
+							await this.writeImageDb(imageDb);
+						}
+					}
+
+					if (analysisEntry) {
+						const { type, description } = analysisEntry.analysis;
+						const descriptionJson = JSON.stringify(description);
+						const placeholder = `[[IMAGE: HASH=${hash} TYPE=${type} DESCRIPTION=${descriptionJson}]]`;
+						plainTextForLlm = plainTextForLlm.replace(
+							imageLinkText,
+							placeholder
+						);
+					}
+				}
+			}
+		}
 
 		if (!plainTextForLlm.trim()) {
 			new Notice(
@@ -741,21 +926,72 @@ export default class GatedNotesPlugin extends Plugin {
 			return;
 		}
 
-		const initialPrompt = `Create ${count} concise, simple, and distinct Anki-style flashcards to study the following article. Each card must have a "Front", a "Back", and a "Tag".
-- The Front should be a question.
-- The Back should be a direct answer.
-- The Tag must be a short, contiguous quote copied *verbatim* from the article. **The tag value must not contain any newline characters.**
-- Do not refer to "the article" or "the author".
+		let contextPrompt = "";
+		if (existingCardsForContext && existingCardsForContext.length > 0) {
+			const simplifiedCards = existingCardsForContext.map((c) => ({
+				front: c.front,
+				back: c.back,
+			}));
+			contextPrompt = `To avoid duplicates, do not create cards that cover the same information as the following existing cards:\nExisting Cards:\n${JSON.stringify(
+				simplifiedCards
+			)}\n\n`;
+		}
 
-Return ONLY valid JSON of this shape, with no other text or explanation:
+		let initialPrompt: string;
+		if (hasImages) {
+			initialPrompt = `Create ${count} new, distinct Anki-style flashcards to study the following article. The article contains descriptions of images with this structure: "[[IMAGE: HASH=... TYPE=... DESCRIPTION={...}]]", where DESCRIPTION contains a JSON object with details about the image.
+
+**Card Structure:**
+- The "Front" MUST be a question.
+- The "Back" MUST be a direct answer.
+- The "Tag" MUST be context for the card.
+
+**Tagging Rules:**
+1.  **For cards about an image:** The "Tag" MUST be ONLY the image reference, like "[[IMAGE HASH=...]]".
+2.  **For cards about text:** You MUST find a relevant, contiguous quote from the article and copy it *exactly* into the "Tag" field.
+3.  **Crucially, only use an image reference as a tag if the question in the "Front" is asking specifically about that image. Otherwise, you MUST use a text quote.**
+4.  Do not invent a tag or use placeholders like "none". Every card must have a valid tag.
+
+**Example of a PERFECT image-based card:**
+{
+  "front": "What does the diagram of the solar system show?",
+  "back": "It shows the sun at the center with the planets orbiting it.",
+  "tag": "[[IMAGE HASH=...]]"
+}
+
+Return ONLY valid JSON of this shape:
 [
   {"front":"...","back":"...","tag":"..."}
 ]
 
-Here is the article:
+${contextPrompt}Here is the article:
 ${plainTextForLlm}`;
+		} else {
+			initialPrompt = `Create ${count} new, distinct Anki-style flashcards to study the following article.
 
+**Card Structure:**
+- The "Front" MUST be a question.
+- The "Back" MUST be a direct answer.
+- The "Tag" MUST be context for the card.
+
+**Tagging Rules:**
+1. You MUST find a relevant, contiguous quote from the article and copy it *exactly* into the "Tag" field. Do not summarize or paraphrase it.
+2. The tag value must not contain any newline characters.
+3. **Crucially, do not invent a tag or use placeholders like "none". Every card must have a valid tag.**
+
+
+Return ONLY valid JSON of this shape:
+[
+  {"front":"...","back":"...","tag":"..."}
+]
+
+${contextPrompt}Here is the article:
+${plainTextForLlm}`;
+		}
+
+		notice.setMessage(`🤖 Generating ${count} flashcard(s)...`);
 		const response = await this.sendToLlm(initialPrompt);
+		notice.hide();
 		if (!response) {
 			new Notice("LLM generation failed. See console for details.");
 			return;
@@ -767,11 +1003,31 @@ ${plainTextForLlm}`;
 			[];
 
 		for (const item of generatedItems) {
-			const paraIdx = this.findBestParaForTag(item.tag, paragraphs);
-			if (paraIdx !== undefined) {
-				goodCards.push(this.createCardObject({ ...item, paraIdx }));
+			if (item.tag.startsWith("[[IMAGE HASH=")) {
+				const hashMatch = item.tag.match(
+					/\[\[IMAGE HASH=([a-f0-9]{64})\]\]/
+				);
+				if (hashMatch && imageHashMap.has(hashMatch[1])) {
+					const paraIdx = imageHashMap.get(hashMatch[1]);
+					goodCards.push(this.createCardObject({ ...item, paraIdx }));
+				} else {
+					const imagePara = paragraphs.find((p) =>
+						p.markdown.includes("![[")
+					);
+					goodCards.push(
+						this.createCardObject({
+							...item,
+							paraIdx: imagePara?.id,
+						})
+					);
+				}
 			} else {
-				cardsToFix.push(item);
+				const paraIdx = this.findBestParaForTag(item.tag, paragraphs);
+				if (paraIdx !== undefined) {
+					goodCards.push(this.createCardObject({ ...item, paraIdx }));
+				} else {
+					cardsToFix.push(item);
+				}
 			}
 		}
 
@@ -802,7 +1058,6 @@ ${plainTextForLlm}`;
 		}
 
 		if (goodCards.length > 0) await this.saveCards(file, goodCards);
-
 		let noticeText = `✅ Added ${goodCards.length} cards.`;
 		if (correctedCount > 0)
 			noticeText += ` 🤖 Auto-corrected ${correctedCount} tags.`;
@@ -929,6 +1184,75 @@ ${selection}
 		}
 	}
 
+	private async generateCardsFromSelection(
+		selection: string,
+		file: TFile,
+		paraIdx: number
+	): Promise<void> {
+		new CountModal(this, 1, async (count) => {
+			if (count <= 0) return;
+			const notice = new Notice(
+				`🤖 Generating ${count} card(s) from selection...`,
+				0
+			);
+
+			const prompt = `From the following text, create ${count} concise flashcard(s).
+Return ONLY valid JSON of this shape: [{"front":"...","back":"..."}]
+
+Text:
+"""
+${selection}
+"""`;
+
+			try {
+				const response = await this.sendToLlm(prompt);
+				if (!response)
+					throw new Error("AI returned an empty response.");
+
+				const parsedItems = extractJsonArray<{
+					front: string;
+					back: string;
+				}>(response);
+				if (parsedItems.length === 0) {
+					throw new Error(
+						"AI response did not contain valid card data."
+					);
+				}
+
+				const cards = parsedItems.map((item) =>
+					this.createCardObject({
+						front: item.front.trim(),
+						back: item.back.trim(),
+						tag: selection,
+						chapter: file.path,
+						paraIdx,
+					})
+				);
+
+				await this.saveCards(file, cards);
+				notice.setMessage(
+					`✅ ${cards.length} AI-generated card(s) added!`
+				);
+				setTimeout(() => notice.hide(), 3000);
+
+				this.refreshAllStatuses();
+				this.refreshReading();
+			} catch (e: unknown) {
+				const message =
+					e instanceof Error
+						? e.message
+						: "An unknown error occurred.";
+				notice.hide();
+				new Notice(`Failed to generate AI cards: ${message}`);
+				this.logger(
+					LogLevel.NORMAL,
+					"Failed to generate AI cards from selection:",
+					e
+				);
+			}
+		}).open();
+	}
+
 	private parseLlmResponse(
 		rawResponse: string,
 		chapterPath: string
@@ -987,8 +1311,8 @@ ${selection}
 
 				if (!this.settings.gatingEnabled) {
 					for (const div of paragraphDivs) {
-						div.classList.remove("mm-hidden");
-						if (div.dataset.mmProcessed) continue;
+						div.classList.remove("gn-hidden");
+						if (div.dataset.gnProcessed) continue;
 						const md = attr2md(
 							div.getAttribute(PARA_MD_ATTR) || ""
 						);
@@ -1001,7 +1325,7 @@ ${selection}
 							ctx.sourcePath,
 							this
 						);
-						div.dataset.mmProcessed = "true";
+						div.dataset.gnProcessed = "true";
 					}
 					return;
 				}
@@ -1024,7 +1348,7 @@ ${selection}
 							: Infinity;
 
 					for (const div of paragraphDivs) {
-						if (div.dataset.mmProcessed) continue;
+						if (div.dataset.gnProcessed) continue;
 						const md = attr2md(
 							div.getAttribute(PARA_MD_ATTR) || ""
 						);
@@ -1043,10 +1367,10 @@ ${selection}
 							div.getAttribute(PARA_ID_ATTR) || 0
 						);
 						div.classList.toggle(
-							"mm-hidden",
+							"gn-hidden",
 							paraIdx > firstBlockedParaIdx
 						);
-						div.dataset.mmProcessed = "true";
+						div.dataset.gnProcessed = "true";
 					}
 				} catch (e: unknown) {
 					this.logger(LogLevel.NORMAL, "Gating processor error:", e);
@@ -1063,8 +1387,8 @@ ${selection}
 			if (!path || !path.endsWith(".md")) continue;
 
 			const state = await this.getChapterState(path);
-			el.classList.remove("mm-done", "mm-due", "mm-blocked");
-			if (state) el.classList.add(`mm-${state}`);
+			el.classList.remove("gn-done", "gn-due", "gn-blocked");
+			if (state) el.classList.add(`gn-${state}`);
 		}
 	}
 
@@ -1074,24 +1398,24 @@ ${selection}
 			new Notice("Could not find the source file for this card.");
 			return;
 		}
+		const targetLine = await getLineForParagraph(
+			this,
+			file,
+			card.paraIdx ?? 1
+		);
 
 		const leaf = this.app.workspace.getLeaf(false);
-		await leaf.openFile(file, { state: { mode: "preview" } });
 
-		const mdView = leaf.view;
-		if (
-			!(mdView instanceof MarkdownView) ||
-			mdView.getMode() !== "preview"
-		) {
-			new Notice("Could not switch to preview mode to highlight tag.");
-			return;
-		}
+		await leaf.openFile(file, {
+			state: { mode: "preview" },
+		});
 
-		const flashParagraph = (wrapper: HTMLElement) => {
-			wrapper.scrollIntoView({ behavior: "smooth", block: "center" });
-			wrapper.classList.add("mm-flash");
-			setTimeout(() => wrapper.classList.remove("mm-flash"), 1200);
-		};
+		const mdView = this.app.workspace.getActiveViewOfType(MarkdownView);
+		if (!mdView) return;
+
+		mdView.setEphemeralState({ scroll: targetLine });
+
+		await new Promise((resolve) => setTimeout(resolve, 50));
 
 		const paraSelector = `.${PARA_CLASS}[${PARA_ID_ATTR}="${
 			card.paraIdx ?? 1
@@ -1112,29 +1436,74 @@ ${selection}
 			return;
 		}
 
-		try {
-			const range = findTextRange(card.tag, wrapper);
-			const mark = document.createElement("mark");
-			mark.className = "mm-flash";
-			range.surroundContents(mark);
-			mark.scrollIntoView({ behavior: "smooth", block: "center" });
-
-			setTimeout(() => {
-				const parent = mark.parentNode;
-				if (parent) {
-					while (mark.firstChild)
-						parent.insertBefore(mark.firstChild, mark);
-					parent.removeChild(mark);
-				}
-			}, 1200);
-		} catch (e) {
-			this.logger(
-				LogLevel.NORMAL,
-				`Tag highlighting failed: ${
-					(e as Error).message
-				}. Flashing paragraph as fallback.`
+		if (card.tag.startsWith("[[IMAGE HASH=")) {
+			const hashMatch = card.tag.match(
+				/\[\[IMAGE HASH=([a-f0-9]{64})\]\]/
 			);
-			flashParagraph(wrapper);
+			let imageFound = false;
+
+			if (hashMatch) {
+				const hash = hashMatch[1];
+				const imageDb = await this.getImageDb();
+				const imageInfo = imageDb[hash];
+
+				if (imageInfo) {
+					const filename = imageInfo.path.split("/").pop();
+					const imageSelector = `span.internal-embed[src*="${filename}"]`;
+					const imgContainerEl =
+						wrapper.querySelector<HTMLElement>(imageSelector);
+
+					if (imgContainerEl) {
+						imgContainerEl.scrollIntoView({
+							behavior: "smooth",
+							block: "center",
+						});
+						imgContainerEl.classList.add("gn-flash");
+						setTimeout(
+							() => imgContainerEl.classList.remove("gn-flash"),
+							1200
+						);
+						imageFound = true;
+					}
+				}
+			}
+
+			if (!imageFound) {
+				this.logger(
+					LogLevel.NORMAL,
+					`Could not find specific image element for tag: ${card.tag}. Flashing paragraph.`
+				);
+				wrapper.scrollIntoView({ behavior: "smooth", block: "center" });
+				wrapper.classList.add("gn-flash");
+				setTimeout(() => wrapper.classList.remove("gn-flash"), 1200);
+			}
+		} else {
+			try {
+				const range = findTextRange(card.tag, wrapper);
+				const mark = document.createElement("mark");
+				mark.className = "gn-flash";
+				range.surroundContents(mark);
+				mark.scrollIntoView({ behavior: "smooth", block: "center" });
+
+				setTimeout(() => {
+					const parent = mark.parentNode;
+					if (parent) {
+						while (mark.firstChild)
+							parent.insertBefore(mark.firstChild, mark);
+						parent.removeChild(mark);
+					}
+				}, 1200);
+			} catch (e) {
+				this.logger(
+					LogLevel.NORMAL,
+					`Tag highlighting failed: ${
+						(e as Error).message
+					}. Flashing paragraph as fallback.`
+				);
+				wrapper.scrollIntoView({ behavior: "smooth", block: "center" });
+				wrapper.classList.add("gn-flash");
+				setTimeout(() => wrapper.classList.remove("gn-flash"), 1200);
+			}
 		}
 	}
 
@@ -1144,40 +1513,40 @@ ${selection}
 		const styleEl = document.createElement("style");
 		styleEl.id = styleId;
 		styleEl.textContent = `
-            .mm-sentinel { display: none; }
-            .mm-hidden { filter: blur(5px); background: var(--background-secondary); position: relative; overflow: hidden; padding: 0.1px 0; }
-            .mm-hidden::after { content: "🔒 Unlock by answering earlier cards"; position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; font-weight: bold; color: var(--text-muted); }
-            .mm-blocked::before, .mm-due::before, .mm-done::before { margin-right: 4px; font-size: 0.9em; }
-            .mm-blocked::before { content: "${ICONS.blocked}"; }
-            .mm-due::before { content: "${ICONS.due}"; }
-            .mm-done::before { content: "${ICONS.done}"; }
-            .mm-flash, .mm-flash mark { background-color: var(--text-highlight-bg) !important; transition: background-color 1s ease-out; }
-            .mm-edit-row { display: flex; gap: 0.5rem; align-items: flex-start; margin-block: 0.4rem; }
-            .mm-edit-row > label { min-width: 5rem; font-weight: 600; padding-top: 0.5rem; }
-            .mm-edit-row textarea, .mm-edit-row input { flex: 1; width: 100%; }
-            .mm-edit-row textarea { resize: vertical; font-family: var(--font-text); }
-            .mm-edit-btnrow { display: flex; gap: 0.5rem; margin-top: 0.8rem; justify-content: flex-end; }
-            .mm-browser { width: 60vw; height: 70vh; min-height: 20rem; min-width: 32rem; resize: both; display: flex; flex-direction: column; }
-            .mm-body { flex: 1; display: flex; overflow: hidden; }
-            .mm-tree { width: 40%; padding-right: .75rem; border-right: 1px solid var(--background-modifier-border); overflow-y: auto; overflow-x: hidden; }
-            .mm-node > summary { cursor: pointer; font-weight: 600; }
-            .mm-chap { margin-left: 1.2rem; cursor: pointer; }
-            .mm-chap:hover { text-decoration: underline; }
-            .mm-editor { flex: 1; padding-left: .75rem; overflow-y: auto; overflow-x: hidden; }
-            .mm-cardrow { position: relative; margin: .15rem 0; padding-right: 2.8rem; cursor: pointer; width: 100%; border-radius: var(--radius-s); padding-left: 4px; }
-            .mm-cardrow:hover { background: var(--background-secondary-hover); }
-            .mm-trash { position: absolute; right: 0.5rem; top: 50%; transform: translateY(-50%); cursor: pointer; opacity: .6; }
-            .mm-trash:hover { opacity: 1; }
-            .mm-info { position: absolute; right: 2rem; top: 50%; transform: translateY(-50%); cursor: pointer; opacity: .6; }
-            .mm-info:hover { opacity: 1; }
-            .mm-ease-buttons, .mm-action-bar { display: flex; flex-wrap: wrap; gap: 0.5rem; justify-content: center; margin-top: 0.5rem; }
-            .mm-ease-buttons button { flex-grow: 1; }
-            .mm-info-grid { display: grid; grid-template-columns: 120px 1fr; gap: 0.5rem; margin-bottom: 1rem; }
-            .mm-info-table-wrapper { max-height: 200px; overflow-y: auto; }
-            .mm-info-table { width: 100%; text-align: left; }
-            .mm-info-table th { border-bottom: 1px solid var(--background-modifier-border); }
-            .mm-info-table td { padding-top: 4px; }
-        `;
+              .gn-sentinel { display: none; }
+              .gn-hidden { filter: blur(5px); background: var(--background-secondary); position: relative; overflow: hidden; padding: 0.1px 0; }
+              .gn-hidden::after { content: "🔒 Unlock by answering earlier cards"; position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; font-weight: bold; color: var(--text-muted); }
+              .gn-blocked::before, .gn-due::before, .gn-done::before { margin-right: 4px; font-size: 0.9em; }
+              .gn-blocked::before { content: "${ICONS.blocked}"; }
+              .gn-due::before { content: "${ICONS.due}"; }
+              .gn-done::before { content: "${ICONS.done}"; }
+              .gn-flash, .gn-flash mark { background-color: var(--text-highlight-bg) !important; transition: background-color 1s ease-out; }
+              .gn-edit-row { display: flex; gap: 0.5rem; align-items: flex-start; margin-block: 0.4rem; }
+              .gn-edit-row > label { min-width: 5rem; font-weight: 600; padding-top: 0.5rem; }
+              .gn-edit-row textarea, .gn-edit-row input { flex: 1; width: 100%; }
+              .gn-edit-row textarea { resize: vertical; font-family: var(--font-text); }
+              .gn-edit-btnrow { display: flex; gap: 0.5rem; margin-top: 0.8rem; justify-content: flex-end; }
+              .gn-browser { width: 60vw; height: 70vh; min-height: 20rem; min-width: 32rem; resize: both; display: flex; flex-direction: column; }
+              .gn-body { flex: 1; display: flex; overflow: hidden; }
+              .gn-tree { width: 40%; padding-right: .75rem; border-right: 1px solid var(--background-modifier-border); overflow-y: auto; overflow-x: hidden; }
+              .gn-node > summary { cursor: pointer; font-weight: 600; }
+              .gn-chap { margin-left: 1.2rem; cursor: pointer; }
+              .gn-chap:hover { text-decoration: underline; }
+              .gn-editor { flex: 1; padding-left: .75rem; overflow-y: auto; overflow-x: hidden; }
+              .gn-cardrow { position: relative; margin: .15rem 0; padding-right: 2.8rem; cursor: pointer; width: 100%; border-radius: var(--radius-s); padding-left: 4px; }
+              .gn-cardrow:hover { background: var(--background-secondary-hover); }
+              .gn-trash { position: absolute; right: 0.5rem; top: 50%; transform: translateY(-50%); cursor: pointer; opacity: .6; }
+              .gn-trash:hover { opacity: 1; }
+              .gn-info { position: absolute; right: 2rem; top: 50%; transform: translateY(-50%); cursor: pointer; opacity: .6; }
+              .gn-info:hover { opacity: 1; }
+              .gn-ease-buttons, .gn-action-bar { display: flex; flex-wrap: wrap; gap: 0.5rem; justify-content: center; margin-top: 0.5rem; }
+              .gn-ease-buttons button { flex-grow: 1; }
+              .gn-info-grid { display: grid; grid-template-columns: 120px 1fr; gap: 0.5rem; margin-bottom: 1rem; }
+              .gn-info-table-wrapper { max-height: 200px; overflow-y: auto; }
+              .gn-info-table { width: 100%; text-align: left; }
+              .gn-info-table th { border-bottom: 1px solid var(--background-modifier-border); }
+              .gn-info-table td { padding-top: 4px; }
+            `;
 		document.head.appendChild(styleEl);
 		this.register(() => styleEl.remove());
 	}
@@ -1276,6 +1645,24 @@ ${selection}
 		const graph = await this.readDeck(deckPath);
 		if (Object.keys(graph).length === 0) return;
 
+		const imageHashMap = new Map<string, number>();
+		const imageRegex = /!\[\[([^\]]+)\]\]/g;
+
+		for (const p of paragraphs) {
+			let match;
+			while ((match = imageRegex.exec(p.markdown)) !== null) {
+				const imagePath = match[1];
+				const imageFile = this.app.metadataCache.getFirstLinkpathDest(
+					imagePath,
+					file.path
+				);
+				if (imageFile instanceof TFile) {
+					const hash = await this.calculateFileHash(imageFile);
+					imageHashMap.set(hash, p.id);
+				}
+			}
+		}
+
 		let updatedCount = 0;
 		let notFoundCount = 0;
 		const cardsForChapter = Object.values(graph).filter(
@@ -1283,7 +1670,19 @@ ${selection}
 		);
 
 		for (const card of cardsForChapter) {
-			const newParaIdx = this.findBestParaForTag(card.tag, paragraphs);
+			let newParaIdx: number | undefined;
+
+			if (card.tag.startsWith("[[IMAGE HASH=")) {
+				const hashMatch = card.tag.match(
+					/\[\[IMAGE HASH=([a-f0-9]{64})\]\]/
+				);
+				if (hashMatch && imageHashMap.has(hashMatch[1])) {
+					newParaIdx = imageHashMap.get(hashMatch[1]);
+				}
+			} else {
+				newParaIdx = this.findBestParaForTag(card.tag, paragraphs);
+			}
+
 			if (newParaIdx !== undefined) {
 				if (card.paraIdx !== newParaIdx) {
 					card.paraIdx = newParaIdx;
@@ -1431,6 +1830,156 @@ ${selection}
 		}, 500);
 	}
 
+	// ===========================
+	// --- IMAGE UTILITIES ---
+	// ===========================
+
+	private async getImageDb(): Promise<ImageAnalysisGraph> {
+		const dbPath = normalizePath(
+			this.app.vault.getRoot().path + IMAGE_ANALYSIS_FILE_NAME
+		);
+		if (!(await this.app.vault.adapter.exists(dbPath))) {
+			return {};
+		}
+		try {
+			const content = await this.app.vault.adapter.read(dbPath);
+			return JSON.parse(content) as ImageAnalysisGraph;
+		} catch (e) {
+			this.logger(LogLevel.NORMAL, "Failed to read image DB", e);
+			return {};
+		}
+	}
+
+	private async writeImageDb(db: ImageAnalysisGraph): Promise<void> {
+		const dbPath = normalizePath(
+			this.app.vault.getRoot().path + IMAGE_ANALYSIS_FILE_NAME
+		);
+		await this.app.vault.adapter.write(dbPath, JSON.stringify(db, null, 2));
+	}
+
+	private async calculateFileHash(file: TFile): Promise<string> {
+		const arrayBuffer = await this.app.vault.readBinary(file);
+		const hashBuffer = await crypto.subtle.digest("SHA-256", arrayBuffer);
+		const hashArray = Array.from(new Uint8Array(hashBuffer));
+		return hashArray.map((b) => b.toString(16).padStart(2, "0")).join("");
+	}
+
+	private async analyzeImage(
+		imageFile: TFile
+	): Promise<ImageAnalysis | null> {
+		const notice = new Notice(
+			`🤖 Analyzing image: ${imageFile.name}...`,
+			0
+		);
+		try {
+			const imageData = await this.app.vault.readBinary(imageFile);
+			const base64Image = Buffer.from(imageData).toString("base64");
+			const fileExtension = imageFile.extension
+				.toLowerCase()
+				.replace("jpg", "jpeg");
+			const imageUrl = `data:image/${fileExtension};base64,${base64Image}`;
+
+			const prompt = `You are an expert academic analyst specializing in visual media. Your task is to analyze the provided image and return a single, valid JSON object that classifies and describes it for study purposes.
+
+**Step 1: Classify the Image**
+First, determine the image's primary category and set the \`type\` key to ONE of the following exact string values:
+* \`diagram\`
+* \`chart\`
+* \`map\`
+* \`artwork\`
+* \`photograph\`
+* \`screenshot\`
+
+**Step 2: Generate a Structured Description**
+Based on the \`type\` you chose, create a corresponding \`description\` object with the following required structure:
+
+* If \`type\` is \`diagram\` or \`chart\`: The \`description\` object must contain:
+    * \`title\`: A string for the official title or a concise summary if none exists.
+    * \`components\`: An array of strings, listing each key labeled part or element.
+    * \`relationships\`: A string explaining how the components interact, focusing on the meaning of arrows, lines, and spatial arrangement.
+
+* If \`type\` is \`map\`: The \`description\` object must contain:
+    * \`region\`: A string identifying the main geographical area shown.
+    * \`key_locations\`: An array of strings listing important labeled cities, countries, or landmarks.
+    * \`purpose\`: A string explaining what the map illustrates (e.g., "Political boundaries in 1815," "Topographical features of the Andes").
+
+* If \`type\` is \`artwork\` or \`photograph\`: The \`description\` object must contain:
+    * \`subject\`: A string describing the central subject and any action taking place.
+    * \`composition\`: A string detailing the arrangement, use of color, light, and perspective.
+    * \`mood\`: A string describing the overall feeling or tone the image evokes.
+
+* If \`type\` is \`screenshot\`: The \`description\` object must contain:
+    * \`interface_element\`: A string identifying the application or primary UI element shown.
+    * \`action\`: A string describing the task being performed or the information being displayed.
+
+**Your final output must be ONLY the JSON object, with no other text, explanations, or markdown formatting.**`;
+
+			const response = await this.sendToLlm(prompt, imageUrl);
+			if (!response) throw new Error("LLM returned an empty response.");
+
+			const analysis = extractJsonObjects<any>(response)[0];
+			if (!analysis || !analysis.type || !analysis.description) {
+				throw new Error(
+					"LLM response was not in the expected JSON format."
+				);
+			}
+
+			return {
+				path: imageFile.path,
+				analysis: analysis,
+			};
+		} catch (e: unknown) {
+			this.logger(
+				LogLevel.NORMAL,
+				`Failed to analyze image ${imageFile.path}`,
+				e
+			);
+			new Notice(`⚠️ Failed to analyze image: ${(e as Error).message}`);
+			return null;
+		} finally {
+			notice.hide();
+		}
+	}
+
+	private async renderCardContent(
+		content: string,
+		container: HTMLElement,
+		sourcePath: string
+	) {
+		let processedContent = content;
+		const imageRegex = /\[\[IMAGE HASH=([a-f0-9]{64})\]\]/g;
+		let match;
+		const contentToScan = content;
+		const imageDb = await this.getImageDb();
+
+		while ((match = imageRegex.exec(contentToScan)) !== null) {
+			const hash = match[1];
+			const imageInfo = imageDb[hash];
+			if (imageInfo) {
+				processedContent = processedContent.replace(
+					match[0],
+					`![[${imageInfo.path}]]`
+				);
+			} else {
+				processedContent = processedContent.replace(
+					match[0],
+					`> [!warning] Gated Notes: Image with hash ${hash.substring(
+						0,
+						8
+					)}... not found in database.`
+				);
+			}
+		}
+
+		await MarkdownRenderer.render(
+			this.app,
+			fixMath(processedContent),
+			container,
+			sourcePath,
+			this
+		);
+	}
+
 	// =====================
 	// UI & UX
 	// =====================
@@ -1462,37 +2011,32 @@ ${selection}
 			modal.onClose = () => safeResolve(state);
 
 			const frontContainer = modal.contentEl.createDiv();
-			MarkdownRenderer.render(
-				this.app,
-				fixMath(card.front),
-				frontContainer,
-				card.chapter,
-				this
-			);
+			this.renderCardContent(card.front, frontContainer, card.chapter);
 
-			const revealBtn = new ButtonComponent(modal.contentEl)
-				.setButtonText("Show Answer")
-				.setCta();
-			modal.contentEl.createEl("hr");
-			const actionBar = modal.contentEl.createDiv({
-				cls: "mm-action-bar",
+			const bottomBar = modal.contentEl.createDiv({
+				cls: "gn-action-bar",
 			});
 
+			const revealBtn = new ButtonComponent(bottomBar)
+				.setButtonText("Show Answer")
+				.setCta();
+
+			modal.contentEl.createEl("hr");
+
 			const showAnswer = async () => {
-				revealBtn.buttonEl.hide();
+				revealBtn.buttonEl.style.display = "none";
+
 				const backContainer = modal.contentEl.createDiv();
-				await MarkdownRenderer.render(
-					this.app,
-					fixMath(card.back),
+				await this.renderCardContent(
+					card.back,
 					backContainer,
-					card.chapter,
-					this
+					card.chapter
 				);
 
-				actionBar.empty();
 				const easeButtonContainer = modal.contentEl.createDiv({
-					cls: "mm-ease-buttons",
+					cls: "gn-ease-buttons",
 				});
+
 				(["Again", "Hard", "Good", "Easy"] as const).forEach(
 					(lbl: CardRating) => {
 						new ButtonComponent(easeButtonContainer)
@@ -1508,10 +2052,12 @@ ${selection}
 							});
 					}
 				);
+				modal.contentEl.insertBefore(easeButtonContainer, bottomBar);
 			};
+
 			revealBtn.onClick(showAnswer);
 
-			new ButtonComponent(actionBar)
+			new ButtonComponent(bottomBar)
 				.setIcon("trash")
 				.setTooltip("Delete")
 				.onClick(async () => {
@@ -1525,7 +2071,7 @@ ${selection}
 					}
 				});
 
-			new ButtonComponent(actionBar)
+			new ButtonComponent(bottomBar)
 				.setIcon("pencil")
 				.setTooltip("Edit")
 				.onClick(async () => {
@@ -1533,17 +2079,17 @@ ${selection}
 					this.openEditModal(card, graph, deck, () => {});
 				});
 
-			new ButtonComponent(actionBar)
+			new ButtonComponent(bottomBar)
 				.setIcon("info")
 				.setTooltip("Info")
 				.onClick(() => new CardInfoModal(this.app, card).open());
 
-			new ButtonComponent(actionBar)
+			new ButtonComponent(bottomBar)
 				.setIcon("link")
 				.setTooltip("Context")
 				.onClick(() => this.jumpToTag(card));
 
-			new ButtonComponent(actionBar)
+			new ButtonComponent(bottomBar)
 				.setIcon("file-down")
 				.setTooltip("Bury")
 				.onClick(async () => {
@@ -1555,7 +2101,8 @@ ${selection}
 					state = "answered";
 					modal.close();
 				});
-			new ButtonComponent(actionBar).setButtonText("Skip").onClick(() => {
+
+			new ButtonComponent(bottomBar).setButtonText("Skip").onClick(() => {
 				state = "skip";
 				modal.close();
 			});
@@ -1589,24 +2136,32 @@ ${selection}
 	private showUnfinalizeConfirmModal(): Promise<boolean> {
 		return new Promise((resolve) => {
 			const modal = new Modal(this.app);
-			modal.titleEl.setText("Delete Associated Flashcards?");
+			modal.titleEl.setText("Un-finalize Note");
 			modal.contentEl.createEl("p", {
-				text: "Do you also want to permanently delete this chapter's flashcards?",
+				text: "This note has associated flashcards. Do you want to keep them or delete them?",
 			});
-			new ButtonComponent(modal.contentEl)
-				.setButtonText("Yes, Delete Cards")
+
+			const buttonContainer = modal.contentEl.createDiv({
+				cls: "gn-edit-btnrow",
+			});
+
+			new ButtonComponent(buttonContainer)
+				.setButtonText("No, keep my cards")
+				.setCta()
+				.onClick(() => {
+					modal.close();
+					resolve(false);
+				});
+
+			new ButtonComponent(buttonContainer)
+				.setButtonText("Yes, delete")
 				.setWarning()
 				.onClick(() => {
 					modal.close();
 					resolve(true);
 				});
-			new ButtonComponent(modal.contentEl)
-				.setButtonText("No, Keep Cards")
-				.onClick(() => {
-					modal.close();
-					resolve(false);
-				});
-			modal.onClose = () => resolve(false); // Default to 'no' if closed
+
+			modal.onClose = () => resolve(false);
 			modal.open();
 		});
 	}
@@ -1645,7 +2200,7 @@ ${selection}
 				}
 			}
 			this.statusBar.setText(
-				`MM: ${learningDue} learning, ${reviewDue} review`
+				`GN: ${learningDue} learning, ${reviewDue} review`
 			);
 		}, 150);
 	}
@@ -1667,7 +2222,7 @@ ${selection}
 
 		if (count > 0) {
 			this.cardsMissingParaIdxStatus.setText(
-				`MM Missing Index: ${count}`
+				`GN Missing Index: ${count}`
 			);
 			this.cardsMissingParaIdxStatus.setAttribute(
 				"aria-label",
@@ -1725,15 +2280,19 @@ ${selection}
 	// LLM & API
 	// =====================
 
-	public async sendToLlm(prompt: string): Promise<string> {
+	public async sendToLlm(prompt: string, imageUrl?: string): Promise<string> {
 		const {
 			apiProvider,
 			lmStudioUrl,
 			lmStudioModel,
 			openaiApiKey,
-			openaiModel,
 			openaiTemperature,
 		} = this.settings;
+
+		if (apiProvider === "lmstudio" && imageUrl) {
+			new Notice("Image analysis is not supported with LM Studio.");
+			return "";
+		}
 
 		let apiUrl: string;
 		const headers: Record<string, string> = {
@@ -1750,18 +2309,39 @@ ${selection}
 				return "";
 			}
 			apiUrl = API_URL_COMPLETIONS;
-			model = openaiModel;
+			model = imageUrl
+				? this.settings.openaiMultimodalModel
+				: this.settings.openaiModel;
 			headers["Authorization"] = `Bearer ${openaiApiKey}`;
 		}
 
 		try {
+			const messageContent: any = imageUrl
+				? [
+						{ type: "text", text: prompt },
+						{ type: "image_url", image_url: { url: imageUrl } },
+				  ]
+				: prompt;
+
 			const payload = {
 				model,
 				temperature: openaiTemperature,
-				messages: [{ role: "user", content: prompt }],
+				messages: [{ role: "user", content: messageContent }],
 			};
 
-			this.logger(LogLevel.VERBOSE, "Sending payload to LLM:", payload);
+			if (imageUrl) {
+				this.logger(
+					LogLevel.VERBOSE,
+					"Sending multimodal payload to LLM:",
+					payload
+				);
+			} else {
+				this.logger(
+					LogLevel.VERBOSE,
+					"Sending payload to LLM:",
+					payload
+				);
+			}
 
 			const response = await requestUrl({
 				url: apiUrl,
@@ -1769,11 +2349,20 @@ ${selection}
 				headers,
 				body: JSON.stringify(payload),
 			});
+
+			if (imageUrl) {
+				this.logger(
+					LogLevel.VERBOSE,
+					"Received multimodal payload from LLM:",
+					response.json
+				);
+			}
+
 			const responseText =
 				response.json.choices?.[0]?.message?.content ?? "";
 			this.logger(
 				LogLevel.VERBOSE,
-				"Received response from LLM:",
+				"Received response content from LLM:",
 				responseText
 			);
 			return responseText;
@@ -1954,7 +2543,7 @@ ${selection}
 
 // ===================================================================
 //
-//                          UI COMPONENT CLASSES
+//                          UI COMPONENT CLASSES
 //
 // ===================================================================
 
@@ -1972,10 +2561,10 @@ class EditModal extends Modal {
 	onOpen() {
 		makeModalDraggable(this, this.plugin);
 		this.titleEl.setText("Edit Card");
-		this.contentEl.addClass("mm-edit-container");
+		this.contentEl.addClass("gn-edit-container");
 
 		const createRow = (label: string): HTMLElement => {
-			const row = this.contentEl.createDiv({ cls: "mm-edit-row" });
+			const row = this.contentEl.createDiv({ cls: "gn-edit-row" });
 			row.createEl("label", { text: label });
 			return row;
 		};
@@ -2000,7 +2589,7 @@ class EditModal extends Modal {
 			value: (this.card.paraIdx ?? "").toString(),
 		});
 
-		const btnRow = this.contentEl.createDiv({ cls: "mm-edit-btnrow" });
+		const btnRow = this.contentEl.createDiv({ cls: "gn-edit-btnrow" });
 
 		new ButtonComponent(btnRow)
 			.setButtonText("Refocus with AI")
@@ -2155,15 +2744,15 @@ class CardBrowser extends Modal {
 	}
 
 	async onOpen() {
-		this.modalEl.addClass("mm-browser");
+		this.modalEl.addClass("gn-browser");
 		this.titleEl.setText(
 			this.filter ? "Card Browser (Filtered)" : "Card Browser"
 		);
 		makeModalDraggable(this, this.plugin);
 
-		const body = this.contentEl.createDiv({ cls: "mm-body" });
-		const treePane = body.createDiv({ cls: "mm-tree" });
-		const editorPane = body.createDiv({ cls: "mm-editor" });
+		const body = this.contentEl.createDiv({ cls: "gn-body" });
+		const treePane = body.createDiv({ cls: "gn-tree" });
+		const editorPane = body.createDiv({ cls: "gn-editor" });
 		editorPane.setText("← Choose a chapter to view its cards");
 
 		const showCardsForChapter = async (
@@ -2189,7 +2778,7 @@ class CardBrowser extends Modal {
 			);
 
 			for (const card of cards) {
-				const row = editorPane.createDiv({ cls: "mm-cardrow" });
+				const row = editorPane.createDiv({ cls: "gn-cardrow" });
 				row.setText(card.front || "(empty front)");
 				row.onclick = () => {
 					this.plugin.openEditModal(card, graph, deck, () => {
@@ -2197,13 +2786,13 @@ class CardBrowser extends Modal {
 					});
 				};
 
-				row.createEl("span", { text: "ℹ️", cls: "mm-info" }).onclick = (
+				row.createEl("span", { text: "ℹ️", cls: "gn-info" }).onclick = (
 					ev
 				) => {
 					ev.stopPropagation();
 					new CardInfoModal(this.plugin.app, card).open();
 				};
-				row.createEl("span", { text: "🗑️", cls: "mm-trash" }).onclick =
+				row.createEl("span", { text: "🗑️", cls: "gn-trash" }).onclick =
 					async (ev) => {
 						ev.stopPropagation();
 						if (!confirm("Delete this card permanently?")) return;
@@ -2227,7 +2816,7 @@ class CardBrowser extends Modal {
 
 			const subject = deck.path.split("/")[0] || "Vault Root";
 			const subjectEl = treePane.createEl("details", {
-				cls: "mm-node",
+				cls: "gn-node",
 				attr: { open: true },
 			});
 			subjectEl.createEl("summary", { text: subject });
@@ -2249,7 +2838,7 @@ class CardBrowser extends Modal {
 					chapterPath.split("/").pop()?.replace(/\.md$/, "") ??
 					chapterPath;
 				subjectEl.createEl("div", {
-					cls: "mm-chap",
+					cls: "gn-chap",
 					text: `${count} card(s) • ${chapterName}`,
 				}).onclick = () => showCardsForChapter(deck, chapterPath);
 			}
@@ -2292,13 +2881,93 @@ class CountModal extends Modal {
 			.setButtonText("Generate")
 			.setCta()
 			.onClick(() => this.submit(input.getValue()));
-		input.inputEl.focus();
+
+		setTimeout(() => input.inputEl.focus(), 50);
 	}
 
 	private submit(value: string) {
 		const num = Number(value);
 		this.close();
 		this.callback(num > 0 ? num : this.defaultValue);
+	}
+}
+
+class GenerateAdditionalCardsModal extends Modal {
+	private countInput!: TextComponent;
+	private preventDuplicatesToggle!: ToggleComponent;
+
+	constructor(
+		private plugin: GatedNotesPlugin,
+		private file: TFile,
+		private existingCards: Flashcard[],
+		private callback: (
+			result: {
+				count: number;
+				preventDuplicates: boolean;
+			} | null
+		) => void
+	) {
+		super(plugin.app);
+	}
+
+	async onOpen() {
+		this.titleEl.setText("Generate Additional Cards");
+		makeModalDraggable(this, this.plugin);
+
+		this.contentEl.createEl("p", {
+			text: `This note already has ${this.existingCards.length} card(s). How many *additional* cards should the AI generate?`,
+		});
+
+		const wrappedContent = await this.plugin.app.vault.read(this.file);
+		const plainText = getParagraphsFromFinalizedNote(wrappedContent)
+			.map((p) => p.markdown)
+			.join("\n\n");
+		const wordCount = plainText.split(/\s+/).filter(Boolean).length;
+		const defaultCardCount = Math.max(1, Math.round(wordCount / 100));
+
+		new Setting(this.contentEl)
+			.setName("Number of cards to generate")
+			.addText((text) => {
+				this.countInput = text;
+				text.setValue(String(defaultCardCount));
+				text.inputEl.type = "number";
+			});
+
+		new Setting(this.contentEl)
+			.setName("Prevent creating duplicate cards")
+			.setDesc(
+				"Sends existing cards to the AI for context to avoid creating similar ones. (This will increase API token usage)."
+			)
+			.addToggle((toggle) => {
+				this.preventDuplicatesToggle = toggle;
+				toggle.setValue(true);
+			});
+
+		new Setting(this.contentEl)
+			.addButton((button) =>
+				button
+					.setButtonText("Generate")
+					.setCta()
+					.onClick(() => {
+						const count = Number(this.countInput.getValue());
+						this.callback({
+							count: count > 0 ? count : defaultCardCount,
+							preventDuplicates:
+								this.preventDuplicatesToggle.getValue(),
+						});
+						this.close();
+					})
+			)
+			.addButton((button) =>
+				button.setButtonText("Cancel").onClick(() => {
+					this.callback(null);
+					this.close();
+				})
+			);
+	}
+
+	onClose() {
+		this.contentEl.empty();
 	}
 }
 
@@ -2312,7 +2981,7 @@ class CardInfoModal extends Modal {
 		const { contentEl } = this;
 
 		contentEl.createEl("h4", { text: "Current State" });
-		const grid = contentEl.createDiv({ cls: "mm-info-grid" });
+		const grid = contentEl.createDiv({ cls: "gn-info-grid" });
 		const addStat = (label: string, value: string) => {
 			grid.createEl("strong", { text: label });
 			grid.createEl("span", { text: value });
@@ -2335,9 +3004,9 @@ class CardInfoModal extends Modal {
 		}
 
 		const tableWrapper = contentEl.createDiv({
-			cls: "mm-info-table-wrapper",
+			cls: "gn-info-table-wrapper",
 		});
-		const table = tableWrapper.createEl("table", { cls: "mm-info-table" });
+		const table = tableWrapper.createEl("table", { cls: "gn-info-table" });
 		const header = table.createEl("thead").createEl("tr");
 		["Date", "Rating", "State", "Interval"].forEach((text) =>
 			header.createEl("th", { text })
@@ -2383,7 +3052,7 @@ class GNSettingsTab extends PluginSettingTab {
 							| "openai"
 							| "lmstudio";
 						await this.plugin.saveSettings();
-						this.display(); // Re-render the settings tab
+						this.display(); 
 					})
 			);
 
@@ -2468,7 +3137,6 @@ class GNSettingsTab extends PluginSettingTab {
 					})
 			);
 
-		// --- Card Generation Section ---
 		new Setting(containerEl).setName("Card Generation").setHeading();
 		new Setting(containerEl)
 			.setName("Auto-correct AI tags")
@@ -2599,7 +3267,7 @@ class GNSettingsTab extends PluginSettingTab {
 
 // ===================================================================
 //
-//                          UTILITY FUNCTIONS
+//                          UTILITY FUNCTIONS
 //
 // ===================================================================
 
@@ -2662,7 +3330,7 @@ async function waitForEl<T extends HTMLElement>(
 			const el = container.querySelector<T>(selector);
 			if (
 				el &&
-				(el.dataset.mmProcessed === "true" ||
+				(el.dataset.gnProcessed === "true" ||
 					el.innerText.trim() !== "")
 			) {
 				clearInterval(interval);
@@ -2677,8 +3345,8 @@ async function waitForEl<T extends HTMLElement>(
 }
 
 /**
- * Finds the DOM Range for a text snippet within a container, ignoring punctuation differences.
- * @param tag The text content to find.
+ * Finds the DOM Range for a text snippet within a container using a robust fuzzy matching algorithm.
+ * @param tag The text content to find, which may not be a verbatim quote.
  * @param container The HTML element to search within.
  * @returns A DOM Range object spanning the found text.
  */
@@ -2687,53 +3355,96 @@ function findTextRange(tag: string, container: HTMLElement): Range {
 		s
 			.toLowerCase()
 			.replace(/[^\w\s]/g, "")
-			.replace(/\s+/g, " ");
+			.replace(/\s+/g, " ")
+			.trim();
+
+	const rawFullText = container.textContent ?? "";
 
 	const normalizedTag = normalize(tag);
-	const fullText = container.innerText;
-	const normalizedFullText = normalize(fullText);
+	const normalizedFullText = normalize(rawFullText);
 
-	const startIndexInNormalized = normalizedFullText.indexOf(normalizedTag);
-	if (startIndexInNormalized === -1) {
-		throw new Error("Could not find tag in normalized paragraph text.");
+	let startIndexInNormalized = -1;
+	let endIndexInNormalized = -1;
+
+	const perfectMatchIndex = normalizedFullText.indexOf(normalizedTag);
+	if (perfectMatchIndex !== -1) {
+		startIndexInNormalized = perfectMatchIndex;
+		endIndexInNormalized = perfectMatchIndex + normalizedTag.length;
+	} else {
+		const tagWords = normalizedTag.split(/\s+/).filter(Boolean);
+		let prefixMatch: { index: number; text: string } | null = null;
+		let suffixMatch: { index: number; text: string } | null = null;
+
+		for (let i = tagWords.length; i > 0; i--) {
+			const prefix = tagWords.slice(0, i).join(" ");
+			const index = normalizedFullText.indexOf(prefix);
+			if (index !== -1) {
+				prefixMatch = { index, text: prefix };
+				break;
+			}
+		}
+
+		for (let i = 0; i < tagWords.length; i++) {
+			const suffix = tagWords.slice(i).join(" ");
+			const index = normalizedFullText.lastIndexOf(suffix);
+			if (index !== -1) {
+				suffixMatch = { index, text: suffix };
+				break;
+			}
+		}
+
+		if (prefixMatch && suffixMatch) {
+			const prefixEndIndex = prefixMatch.index + prefixMatch.text.length;
+			const suffixEndIndex = suffixMatch.index + suffixMatch.text.length;
+			if (prefixEndIndex <= suffixMatch.index) {
+				startIndexInNormalized = prefixMatch.index;
+				endIndexInNormalized = suffixEndIndex;
+			}
+		}
 	}
-	const endIndexInNormalized = startIndexInNormalized + normalizedTag.length;
 
-	let originalStartIndex = -1;
-	let originalEndIndex = -1;
+	if (startIndexInNormalized === -1) {
+		throw new Error("Could not find a valid fuzzy match for the tag.");
+	}
+
+	const trimOffset = rawFullText.search(/\S/);
+	if (trimOffset === -1) throw new Error("Container has no text.");
+
+	const trimmedFullText = rawFullText.trim();
+	let startInTrimmed = -1;
+	let endInTrimmed = -1;
 	let normalizedCharCount = 0;
 
-	for (let i = 0; i < fullText.length; i++) {
-		const char = fullText[i];
-		const isWordOrSpace = /[a-zA-Z0-9\s]/.test(char);
+	for (let i = 0; i < trimmedFullText.length; i++) {
+		const char = trimmedFullText[i];
+		const isKeptChar = /[\w\s]/.test(char);
 
-		if (isWordOrSpace) {
+		if (isKeptChar) {
 			if (
 				normalizedCharCount === startIndexInNormalized &&
-				originalStartIndex === -1
+				startInTrimmed === -1
 			) {
-				originalStartIndex = i;
+				startInTrimmed = i;
 			}
 			if (
 				normalizedCharCount >= endIndexInNormalized - 1 &&
-				originalEndIndex === -1
+				endInTrimmed === -1
 			) {
-				originalEndIndex = i + 1;
+				endInTrimmed = i + 1;
 			}
 			normalizedCharCount++;
 		}
-		if (originalEndIndex !== -1) break;
+		if (endInTrimmed !== -1) break;
 	}
 
-	if (originalStartIndex !== -1 && originalEndIndex === -1) {
-		originalEndIndex = fullText.length;
-	}
-
-	if (originalStartIndex === -1 || originalEndIndex === -1) {
+	if (startInTrimmed === -1 || endInTrimmed === -1) {
 		throw new Error(
 			"Failed to map normalized indices back to original text."
 		);
 	}
+
+	const originalStartIndex = startInTrimmed + trimOffset;
+	const originalEndIndex = endInTrimmed + trimOffset;
 
 	const walker = document.createTreeWalker(container, NodeFilter.SHOW_TEXT);
 	let charCount = 0;
@@ -2745,7 +3456,7 @@ function findTextRange(tag: string, container: HTMLElement): Range {
 		const nodeTextLength = currentNode.textContent?.length || 0;
 		const nextCharCount = charCount + nodeTextLength;
 
-		if (startNode === undefined && nextCharCount >= originalStartIndex) {
+		if (startNode === undefined && nextCharCount > originalStartIndex) {
 			startNode = currentNode;
 			startOffset = originalStartIndex - charCount;
 		}
@@ -2831,6 +3542,35 @@ function makeModalDraggable(modal: Modal, plugin: GatedNotesPlugin): void {
 	};
 }
 
+async function getLineForParagraph(
+	plugin: GatedNotesPlugin,
+	file: TFile,
+	paraIdx: number
+): Promise<number> {
+	const content = await plugin.app.vault.cachedRead(file);
+
+	if (content.includes(PARA_CLASS)) {
+		const lines = content.split("\n");
+		let divCount = 0;
+		for (let i = 0; i < lines.length; i++) {
+			if (lines[i].includes(PARA_CLASS)) {
+				divCount++;
+				if (divCount === paraIdx) {
+					return i;
+				}
+			}
+		}
+	}
+
+	const paragraphs = content.split(/\n\s*\n/);
+	if (paraIdx > 0 && paraIdx <= paragraphs.length) {
+		const textBefore = paragraphs.slice(0, paraIdx - 1).join("\n\n");
+		return textBefore.split("\n").length;
+	}
+
+	return 0;
+}
+
 /**
  * Robustly extracts a JSON array from a string that may include code fences or other text.
  * @param s The string to parse.
@@ -2838,7 +3578,8 @@ function makeModalDraggable(modal: Modal, plugin: GatedNotesPlugin): void {
  */
 function extractJsonArray<T>(s: string): T[] {
 	try {
-		return JSON.parse(s) as T[];
+		const parsed = JSON.parse(s);
+		return Array.isArray(parsed) ? parsed : [parsed]; // Also handle single object response
 	} catch {
 		/* continue */
 	}
@@ -2846,7 +3587,8 @@ function extractJsonArray<T>(s: string): T[] {
 	const fence = s.match(/```(?:json)?\s*([\s\S]*?)```/i);
 	if (fence && fence[1]) {
 		try {
-			return JSON.parse(fence[1]) as T[];
+			const parsed = JSON.parse(fence[1]);
+			return Array.isArray(parsed) ? parsed : [parsed];
 		} catch {
 			/* continue */
 		}
@@ -2855,13 +3597,23 @@ function extractJsonArray<T>(s: string): T[] {
 	const arr = s.match(/\[\s*[\s\S]*?\s*\]/);
 	if (arr && arr[0]) {
 		try {
-			return JSON.parse(arr[0]) as T[];
+			const parsed = JSON.parse(arr[0]);
+			return Array.isArray(parsed) ? parsed : [parsed];
 		} catch {
 			/* continue */
 		}
 	}
 
-	throw new Error("No valid JSON array found in the string.");
+	const objMatch = s.match(/\{\s*[\s\S]*?\s*\}/);
+	if (objMatch && objMatch[0]) {
+		try {
+			return [JSON.parse(objMatch[0])];
+		} catch {
+			/* continue */
+		}
+	}
+
+	throw new Error("No valid JSON array or object found in the string.");
 }
 
 /**
