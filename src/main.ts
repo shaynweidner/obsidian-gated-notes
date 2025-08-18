@@ -285,6 +285,23 @@ export default class GatedNotesPlugin extends Plugin {
 				if (!checking) this.unfinalize(view.file);
 				return true;
 			},
+		});this.addCommand({
+			id: "gn-remove-all-breakpoints",
+			name: "Remove all paragraph breakpoints",
+			checkCallback: (checking: boolean) => {
+				const view = this.app.workspace.getActiveViewOfType(MarkdownView);
+				if (!view?.file) return false;
+				
+				const content = view.editor.getValue();
+				if (!content.includes(SPLIT_TAG)) return false;
+	
+				if (!checking) {
+					const newContent = content.replace(new RegExp(SPLIT_TAG, "g"), "");
+					view.editor.setValue(newContent);
+					new Notice("All paragraph breakpoints removed.");
+				}
+				return true;
+			},
 		});
 
 		this.addCommand({
@@ -374,6 +391,65 @@ export default class GatedNotesPlugin extends Plugin {
 					this.app.workspace.getActiveViewOfType(MarkdownView);
 				if (!view?.file) return false;
 				if (!checking) this.deleteChapterCards(view.file);
+				return true;
+			},
+		});
+		this.addCommand({
+			id: "gn-reset-chapter-cards",
+			name: "Reset flashcard review history for this chapter",
+			checkCallback: (checking: boolean) => {
+				const view =
+					this.app.workspace.getActiveViewOfType(MarkdownView);
+				if (!view?.file) return false;
+	
+				if (!checking) {
+					(async () => {
+						const file = view.file!;
+						const deckPath = getDeckPathForChapter(file.path);
+						if (!(await this.app.vault.adapter.exists(deckPath))) {
+							new Notice("No flashcard deck found for this chapter.");
+							return;
+						}
+	
+						const graph = await this.readDeck(deckPath);
+						const cardsForChapter = Object.values(graph).filter(
+							(c) => c.chapter === file.path
+						);
+	
+						if (cardsForChapter.length === 0) {
+							new Notice("No flashcards found to reset.");
+							return;
+						}
+	
+						if (
+							!confirm(
+								`Are you sure you want to reset the review progress for ${cardsForChapter.length} card(s) in "${file.basename}"? All learning history will be lost.`
+							)
+						) {
+							return;
+						}
+	
+						for (const card of cardsForChapter) {
+							card.status = "new";
+							card.last_reviewed = null;
+							card.interval = 0;
+							card.ease_factor = 2.5;
+							card.due = Date.now();
+							card.blocked = true;
+							card.review_history = [];
+							delete card.learning_step_index;
+						}
+	
+						await this.writeDeck(deckPath, graph);
+						new Notice(
+							`Reset ${cardsForChapter.length} card(s) for "${file.basename}".`
+						);
+						
+						this.refreshAllStatuses();
+						this.refreshReading();
+					})();
+				}
+	
 				return true;
 			},
 		});
@@ -511,29 +587,76 @@ export default class GatedNotesPlugin extends Plugin {
 	// =====================
 
 	private async reviewDue(): Promise<void> {
-		const activePath = this.app.workspace.getActiveFile()?.path ?? "";
-		while (true) {
-			const queue = await this.collectReviewPool(activePath);
-			if (!queue.length) {
-				new Notice("🎉 All reviews complete!");
+		const activeFile = this.app.workspace.getActiveFile();
+		if (!activeFile) {
+			new Notice("No active file to review.");
+			return;
+		}
+		const activePath = activeFile.path;
+	
+		const lastVisibleParaBefore = this.getLastVisibleParaIndex();
+		let newContentUnlocked = false;
+	
+		// The `while(true)` loop was causing the "stuck in review" issue.
+		// We only need to process one queue for the reward scroll to work correctly.
+		const queue = await this.collectReviewPool(activePath);
+		if (!queue.length) {
+			new Notice("🎉 All reviews complete!");
+			return;
+		}
+	
+		for (const { card, deck } of queue) {
+			const res = await this.openReviewModal(card, deck);
+	
+			if (res === "answered") {
+				// Give the DOM a moment to update after the card data changes
+				await new Promise(resolve => setTimeout(resolve, 50)); 
+				const lastVisibleAfterAnswer = this.getLastVisibleParaIndex();
+				if (lastVisibleAfterAnswer > lastVisibleParaBefore) {
+					newContentUnlocked = true;
+				}
+			}
+	
+			if (res === "abort") {
+				new Notice("Review session aborted.");
 				return;
 			}
-			let breakEarly = false;
-			for (let i = 0; i < queue.length; i++) {
-				const { card, deck } = queue[i];
-				const res = await this.openReviewModal(card, deck);
-				if (res === "abort") {
-					new Notice("Review session aborted.");
-					return;
-				}
-				if (res === "again" && i === queue.length - 1) {
-					new Notice("Last card failed. Jumping to context…");
-					await this.jumpToTag(card);
-					breakEarly = true;
-					break;
-				}
+	
+			if (res === "again") {
+				new Notice("Last card failed. Jumping to context…");
+				await this.jumpToTag(card);
+				return; 
 			}
-			if (!breakEarly) return;
+	
+			if (newContentUnlocked) {
+				break;
+			}
+		}
+	
+		if (!newContentUnlocked) {
+			new Notice("All reviews for this section are complete!");
+		} else {
+			new Notice("✅ New content unlocked!");
+	
+			const firstNewParaIdx = lastVisibleParaBefore + 1;
+			
+			const leaf = this.app.workspace.getLeaf(false);
+			await leaf.openFile(activeFile, { state: { mode: "preview" } });
+	
+			const mdView = this.app.workspace.getActiveViewOfType(MarkdownView);
+			if (!mdView) return;
+	
+			const paraSelector = `.${PARA_CLASS}[${PARA_ID_ATTR}="${firstNewParaIdx}"]`;
+			const wrapper = await waitForEl<HTMLElement>(
+				paraSelector,
+				mdView.previewMode.containerEl
+			);
+	
+			if (wrapper) {
+				wrapper.scrollIntoView({ behavior: "smooth", block: "center" });
+				wrapper.classList.add("gn-unlocked-flash");
+				setTimeout(() => wrapper.classList.remove("gn-unlocked-flash"), 1500);
+			}
 		}
 	}
 
@@ -1520,6 +1643,7 @@ ${selection}
               .gn-due::before { content: "${ICONS.due}"; }
               .gn-done::before { content: "${ICONS.done}"; }
               .gn-flash, .gn-flash mark { background-color: var(--text-highlight-bg) !important; transition: background-color 1s ease-out; }
+			  .gn-unlocked-flash { background-color: rgba(0, 255, 0, 0.3) !important; transition: background-color 1.2s ease-out; }
               .gn-edit-row { display: flex; gap: 0.5rem; align-items: flex-start; margin-block: 0.4rem; }
               .gn-edit-row > label { min-width: 5rem; font-weight: 600; padding-top: 0.5rem; }
               .gn-edit-row textarea, .gn-edit-row input { flex: 1; width: 100%; }
@@ -2411,6 +2535,32 @@ Based on the \`type\` you chose, create a corresponding \`description\` object w
 			);
 			return [];
 		}
+	}
+
+	private getLastVisibleParaIndex(): number {
+		const mdView = this.app.workspace.getActiveViewOfType(MarkdownView);
+		// Ensure we are in preview mode, otherwise we can't check visibility.
+		if (!mdView || mdView.getMode() !== "preview") {
+			return 0; 
+		}
+	
+		// Get all paragraph elements that are NOT hidden.
+		const visibleParagraphs = Array.from(
+			mdView.previewMode.containerEl.querySelectorAll<HTMLElement>(
+				`.${PARA_CLASS}:not(.gn-hidden)`
+			)
+		);
+	
+		if (visibleParagraphs.length === 0) {
+			return 0;
+		}
+	
+		// Find the highest data-para-id among the visible paragraphs.
+		const lastVisibleId = Math.max(
+			...visibleParagraphs.map(p => Number(p.getAttribute(PARA_ID_ATTR) ?? 0))
+		);
+	
+		return lastVisibleId;
 	}
 
 	// =====================
@@ -3394,6 +3544,8 @@ async function waitForEl<T extends HTMLElement>(
 		}, 3000);
 	});
 }
+
+
 
 /**
  * Finds the DOM Range for a text snippet within a container using a robust fuzzy matching algorithm.
