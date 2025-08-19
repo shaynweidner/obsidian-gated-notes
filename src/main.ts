@@ -18,6 +18,7 @@ import {
 	Setting,
 	TAbstractFile,
 	TextComponent,
+	TextAreaComponent,
 	TFile,
 	ToggleComponent,
 } from "obsidian";
@@ -361,10 +362,16 @@ export default class GatedNotesPlugin extends Plugin {
 							).open();
 						} else {
 							// Open original modal for new card generation
-							this.promptForCardCount(file, (count: number) => {
-								if (count > 0)
-									this.generateFlashcards(file, count);
-							});
+							new GenerateCardsModal(this, file, (result) => {
+								if (result && result.count > 0) {
+									this.generateFlashcards(
+										file,
+										result.count,
+										undefined,
+										result.guidance // Pass guidance
+									);
+								}
+							}).open();
 						}
 					})();
 				}
@@ -1011,7 +1018,8 @@ export default class GatedNotesPlugin extends Plugin {
 	private async generateFlashcards(
 		file: TFile,
 		count: number,
-		existingCardsForContext?: Flashcard[]
+		existingCardsForContext?: Flashcard[],
+		customGuidance?: string
 	): Promise<void> {
 		const notice = new Notice(
 			`🤖 Preparing to generate ${count} flashcard(s)...`,
@@ -1097,22 +1105,29 @@ export default class GatedNotesPlugin extends Plugin {
 				simplifiedCards
 			)}\n\n`;
 		}
-
-		// --- MODIFIED: New, more sophisticated card generation prompt ---
+	
+		// --- MODIFICATION START ---
+		const guidancePrompt = customGuidance
+			? `**User's Custom Instructions:**\n${customGuidance}`
+			: "";
+		// --- MODIFICATION END ---
+	
 		const initialPrompt = `Create ${count} new, distinct Anki-style flashcards from the following article. The article may contain text and special image placeholders of the format [[IMAGE: HASH=... DESCRIPTION=...]].
 	
-	**Card Generation Rules:**
-	1.  **Text-Based Cards:** For cards based on plain text, the "Tag" MUST be a short, verbatim quote from the text.
-	2.  **Image-Based Cards from Facts:** If an image's DESCRIPTION contains "key_facts", treat those facts as source text. Create questions whose answers are derived from these facts. The "Tag" for these cards MUST be the \`[[IMAGE HASH=...]]\` placeholder itself.
-	3.  **Visual Question Cards: Create questions that require the user to see the image to answer. The "Front" of such cards should contain both a question and the \`[[IMAGE HASH=...]]\` placeholder.** For example: "What process does this diagram illustrate? [[IMAGE HASH=...]]".
-	4.  **No Image-Only Fields: The "Front" or "Back" of a card must never consist solely of an image placeholder. Images must always be accompanied by relevant text or a question.**
-	
-	**Output Format:**
-	- Return ONLY valid JSON of this shape: \`[{"front":"...","back":"...","tag":"..."}]\`
-	- Every card must have a valid front, back, and tag.
-	
-	${contextPrompt}Here is the article:
-	${plainTextForLlm}`;
+${guidancePrompt}
+
+**Card Generation Rules:**
+1.  **Text-Based Cards:** For cards based on plain text, the "Tag" MUST be a short, verbatim quote from the text.
+2.  **Image-Based Cards from Facts:** If an image's DESCRIPTION contains "key_facts", treat those facts as source text. Create questions whose answers are derived from these facts. The "Tag" for these cards MUST be the \`[[IMAGE HASH=...]]\` placeholder itself.
+3.  **Visual Question Cards: Create questions that require the user to see the image to answer. The "Front" of such cards should contain both a question and the \`[[IMAGE HASH=...]]\` placeholder.** For example: "What process does this diagram illustrate? [[IMAGE HASH=...]]".
+4.  **No Image-Only Fields: The "Front" or "Back" of a card must never consist solely of an image placeholder. Images must always be accompanied by relevant text or a question.**
+
+**Output Format:**
+- Return ONLY valid JSON of this shape: \`[{"front":"...","back":"...","tag":"..."}]\`
+- Every card must have a valid front, back, and tag.
+
+${contextPrompt}Here is the article:
+${plainTextForLlm}`;
 		// --- END MODIFICATION ---
 
 		notice.setMessage(`🤖 Generating ${count} flashcard(s)...`);
@@ -2975,25 +2990,30 @@ class EditModal extends Modal {
 				back: this.card.back,
 			});
 
-			const prompt = `You are an AI assistant that creates a new, insightful flashcard by "refocusing" an existing one. Your task is to identify the core facts in the card and create a new question that tests a different fact, rather than just rephrasing the original.
+			const prompt = `You are an AI assistant that creates a new, insightful flashcard by "refocusing" an existing one.
+
+**Core Rule:** Your new card MUST be created by inverting the information **explicitly present** in the original card's "front" and "back" fields. The "Source Text" is provided only for context and should NOT be used to introduce new facts into the new card.
 
 **Thought Process:**
-1.  **Deconstruct:** Analyze the original card's Front and Back to identify all distinct pieces of information (e.g., the subject, an action, a specific detail, a date, a location, a reason).
-2.  **Invert & Refocus:** Create a new card where a key detail from the original *answer* becomes the new *question*, and the subject of the original *question* becomes the new *answer*.
+1.  **Deconstruct the Original Card:** Identify the key subject in the "back" and the key detail in the "front".
+2.  **Invert & Refocus:** Create a new card where the original detail becomes the subject of the question, and the original subject becomes the answer.
 
 ---
-**Example:**
+**Example 1:**
 * **Original Card:**
     * "front": "What was the outcome of the War of Fakery in 1653?"
     * "back": "Country A decisively defeated Country B."
-* **AI's Deconstruction:**
-    * Event: War of Fakery
-    * Date: 1653
-    * Participants: Country A, Country B
-    * Outcome: Country A defeated Country B
-* **Refocused Card (testing the date):**
-    * "front": "In what year did the War of Fakery, where Country A defeated Country B, take place?"
+* **Refocused Card (testing the date, which is in the front):**
+    * "front": "In what year did the War of Fakery take place?"
     * "back": "1653"
+
+**Example 2:**
+* **Original Card:**
+    * "front": "Who is said to have lived circa 365–circa 270 BC?"
+    * "back": "Pyrrho"
+* **Refocused Card (testing the date, which is in the front):**
+    * "front": "What were the approximate years of Pyrrho's life?"
+    * "back": "circa 365–circa 270 BC"
 ---
 
 **Your Task:**
@@ -3002,7 +3022,7 @@ Now, apply this process to the following card.
 **Original Card:**
 ${cardJson}
 
-**Source Text for Context (the text the card was made from):**
+**Source Text for Context (use only to understand the card, not to add new facts):**
 ${JSON.stringify(this.card.tag)}
 
 Return ONLY valid JSON of this shape: [{"front":"...","back":"..."}]`;
@@ -3267,6 +3287,88 @@ class CardBrowser extends Modal {
 	}
 }
 
+class GenerateCardsModal extends Modal {
+	private countInput!: TextComponent;
+	private guidanceInput?: TextAreaComponent;
+	private defaultCardCount: number = 1;
+
+	constructor(
+		private plugin: GatedNotesPlugin,
+		private file: TFile,
+		private callback: (
+			result: {
+				count: number;
+				guidance: string;
+			} | null
+		) => void
+	) {
+		super(plugin.app);
+	}
+
+	async onOpen() {
+		this.titleEl.setText("Generate Flashcards");
+		makeModalDraggable(this, this.plugin);
+
+		const wrappedContent = await this.plugin.app.vault.read(this.file);
+		const plainText = getParagraphsFromFinalizedNote(wrappedContent)
+			.map((p) => p.markdown)
+			.join("\n\n");
+		const wordCount = plainText.split(/\s+/).filter(Boolean).length;
+		this.defaultCardCount = Math.max(1, Math.round(wordCount / 100));
+
+		new Setting(this.contentEl)
+			.setName("Number of cards to generate")
+			.addText((text) => {
+				this.countInput = text;
+				text.setValue(String(this.defaultCardCount));
+				text.inputEl.type = "number";
+			});
+
+		const guidanceContainer = this.contentEl.createDiv();
+		const addGuidanceBtn = new ButtonComponent(guidanceContainer)
+			.setButtonText("Add Custom Guidance")
+			.onClick(() => {
+				addGuidanceBtn.buttonEl.style.display = "none";
+				new Setting(guidanceContainer)
+					.setName("Custom Guidance")
+					.setDesc(
+						"Provide specific instructions for the AI (e.g., 'Create cloze deletion cards', 'All answers must be a single word')."
+					)
+					.addTextArea((text) => {
+						this.guidanceInput = text;
+						text.setPlaceholder("Your custom instructions...");
+						text.inputEl.rows = 4;
+						text.inputEl.style.width = "100%";
+					});
+			});
+
+		new Setting(this.contentEl)
+			.addButton((button) =>
+				button
+					.setButtonText("Generate")
+					.setCta()
+					.onClick(() => {
+						const count = Number(this.countInput.getValue());
+						this.callback({
+							count: count > 0 ? count : this.defaultCardCount,
+							guidance: this.guidanceInput?.getValue() || "",
+						});
+						this.close();
+					})
+			)
+			.addButton((button) =>
+				button.setButtonText("Cancel").onClick(() => {
+					this.callback(null);
+					this.close();
+				})
+			);
+	}
+
+	onClose() {
+		this.contentEl.empty();
+	}
+}
+
 class CountModal extends Modal {
 	constructor(
 		private plugin: GatedNotesPlugin,
@@ -3312,6 +3414,7 @@ class CountModal extends Modal {
 class GenerateAdditionalCardsModal extends Modal {
 	private countInput!: TextComponent;
 	private preventDuplicatesToggle!: ToggleComponent;
+	private guidanceInput?: TextAreaComponent;
 
 	constructor(
 		private plugin: GatedNotesPlugin,
@@ -3359,6 +3462,25 @@ class GenerateAdditionalCardsModal extends Modal {
 				this.preventDuplicatesToggle = toggle;
 				toggle.setValue(true);
 			});
+
+		// --- MODIFICATION START ---
+		const guidanceContainer = this.contentEl.createDiv();
+		const addGuidanceBtn = new ButtonComponent(guidanceContainer)
+			.setButtonText("Add Custom Guidance")
+			.onClick(() => {
+				addGuidanceBtn.buttonEl.style.display = "none";
+				new Setting(guidanceContainer)
+					.setName("Custom Guidance")
+					.setDesc("Provide specific instructions for this generation task.")
+					.addTextArea((text) => {
+						this.guidanceInput = text;
+						text.setPlaceholder("Your custom instructions...");
+						text.inputEl.rows = 4;
+						text.inputEl.style.width = "100%";
+					});
+			});
+		// --- MODIFICATION END ---
+
 
 		new Setting(this.contentEl)
 			.addButton((button) =>
