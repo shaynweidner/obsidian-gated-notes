@@ -90,6 +90,7 @@ interface Flashcard {
 	learning_step_index?: number;
 	blocked: boolean;
 	review_history: ReviewLog[];
+	flagged?: boolean;
 }
 
 interface FlashcardGraph {
@@ -1646,6 +1647,10 @@ ${selection}
               .gn-done::before { content: "${ICONS.done}"; }
               .gn-flash, .gn-flash mark { background-color: var(--text-highlight-bg) !important; transition: background-color 1s ease-out; }
 			  .gn-unlocked-flash { background-color: rgba(0, 255, 0, 0.3) !important; transition: background-color 1.2s ease-out; }
+			  .gn-edit-nav { display: flex; border-bottom: 1px solid var(--background-modifier-border); margin-bottom: 1rem; }
+			  .gn-edit-nav button { background: none; border: none; padding: 0.5rem 1rem; cursor: pointer; border-bottom: 2px solid transparent; }
+			  .gn-edit-nav button.active { border-bottom-color: var(--interactive-accent); font-weight: 600; color: var(--text-normal); }
+			  .gn-edit-pane .setting-item { border: none; padding-block: 0.5rem; }
               .gn-edit-row { display: flex; gap: 0.5rem; align-items: flex-start; margin-block: 0.4rem; }
               .gn-edit-row > label { min-width: 5rem; font-weight: 600; padding-top: 0.5rem; }
               .gn-edit-row textarea, .gn-edit-row input { flex: 1; width: 100%; }
@@ -2131,7 +2136,7 @@ ${selection}
 		}
 	}
 
-	private async renderCardContent(
+	public async renderCardContent(
 		content: string,
 		container: HTMLElement,
 		sourcePath: string
@@ -2246,6 +2251,25 @@ ${selection}
 			};
 
 			revealBtn.onClick(showAnswer);
+
+			const flagBtn = new ButtonComponent(bottomBar)
+				.setIcon("flag")
+				.setTooltip("Flag for review")
+				.onClick(async () => {
+					const graph = await this.readDeck(deck.path);
+					const cardInGraph = graph[card.id];
+					if (cardInGraph) {
+						cardInGraph.flagged = !cardInGraph.flagged;
+						card.flagged = cardInGraph.flagged; // Sync state
+						await this.writeDeck(deck.path, graph);
+						new Notice(cardInGraph.flagged ? "Card flagged." : "Flag removed.");
+						flagBtn.buttonEl.style.color = cardInGraph.flagged ? "var(--text-warning)" : "";
+					}
+				});
+			// Set initial state of the flag button
+			if (card.flagged) {
+				flagBtn.buttonEl.style.color = "var(--text-warning)";
+			}
 
 			new ButtonComponent(bottomBar)
 				.setIcon("trash")
@@ -2781,31 +2805,92 @@ class EditModal extends Modal {
 		this.titleEl.setText("Edit Card");
 		this.contentEl.addClass("gn-edit-container");
 
-		const createRow = (label: string): HTMLElement => {
-			const row = this.contentEl.createDiv({ cls: "gn-edit-row" });
+		const nav = this.contentEl.createDiv({ cls: "gn-edit-nav" });
+		const editButton = nav.createEl("button", {
+			text: "Edit",
+			cls: "active",
+		});
+		const previewButton = nav.createEl("button", { text: "Preview" });
+
+		const panesContainer = this.contentEl.createDiv();
+		const editPane = panesContainer.createDiv({ cls: "gn-edit-pane" });
+		const previewPane = panesContainer.createDiv({
+			cls: "gn-edit-pane",
+			attr: { style: "display: none;" },
+		});
+
+		// FIX: createRow now takes a parent element to attach to
+		const createRow = (label: string, parent: HTMLElement): HTMLElement => {
+			const row = parent.createDiv({ cls: "gn-edit-row" });
 			row.createEl("label", { text: label });
 			return row;
 		};
 
-		const frontInput = createRow("Front:").createEl("textarea", {
+		// FIX: All inputs are now correctly parented to 'editPane'
+		const frontInput = createRow("Front:", editPane).createEl("textarea", {
 			attr: { rows: 3 },
 		});
 		frontInput.value = this.card.front;
 
-		const backInput = createRow("Back:").createEl("textarea", {
+		const backInput = createRow("Back:", editPane).createEl("textarea", {
 			attr: { rows: 3 },
 		});
 		backInput.value = this.card.back;
 
-		const tagInput = createRow("Tag:").createEl("textarea", {
+		const tagInput = createRow("Tag:", editPane).createEl("textarea", {
 			attr: { rows: 2 },
 		});
 		tagInput.value = this.card.tag;
 
-		const paraInput = createRow("Para #:").createEl("input", {
+		const paraInput = createRow("Para #:", editPane).createEl("input", {
 			type: "number",
 			value: (this.card.paraIdx ?? "").toString(),
 		});
+
+		new Setting(editPane)
+			.setName("Flag this card")
+			.setDesc("Mark this card for future attention.")
+			.addToggle((toggle) => {
+				toggle.setValue(!!this.card.flagged).onChange((value) => {
+					this.card.flagged = value;
+				});
+			});
+
+		// FIX: Use .onclick for native HTML elements
+		editButton.onclick = () => {
+			editButton.addClass("active");
+			previewButton.removeClass("active");
+			editPane.style.display = "";
+			previewPane.style.display = "none";
+		};
+
+		// FIX: Use .onclick for native HTML elements
+		previewButton.onclick = async () => {
+			previewButton.addClass("active");
+			editButton.removeClass("active");
+			previewPane.style.display = "";
+			editPane.style.display = "none";
+
+			previewPane.empty();
+			const previewFrontContainer = previewPane.createDiv();
+			const previewBackContainer = previewPane.createDiv();
+
+			previewFrontContainer.createEl("h4", { text: "Front Preview" });
+			// FIX: This call now works because renderCardContent is public
+			await this.plugin.renderCardContent(
+				frontInput.value,
+				previewFrontContainer,
+				this.card.chapter
+			);
+
+			previewBackContainer.createEl("hr");
+			previewBackContainer.createEl("h4", { text: "Back Preview" });
+			await this.plugin.renderCardContent(
+				backInput.value,
+				previewBackContainer,
+				this.card.chapter
+			);
+		};
 
 		const btnRow = this.contentEl.createDiv({ cls: "gn-edit-btnrow" });
 
@@ -2841,7 +2926,7 @@ class EditModal extends Modal {
 			this.plugin.createCardObject({
 				front: i.front.trim(),
 				back: i.back.trim(),
-				tag: this.card.tag, // keep existing tag
+				tag: this.card.tag,
 				chapter: this.card.chapter,
 				paraIdx: this.card.paraIdx,
 			})
@@ -2860,8 +2945,6 @@ class EditModal extends Modal {
 				back: this.card.back,
 			});
 
-			// --- MODIFICATION START ---
-			// New, more detailed prompt for better card generation.
 			const prompt = `You are an AI assistant that creates a new, insightful flashcard by "refocusing" an existing one. Your task is to identify the core facts in the card and create a new question that tests a different fact, rather than just rephrasing the original.
 
 **Thought Process:**
@@ -2893,7 +2976,6 @@ ${cardJson}
 ${JSON.stringify(this.card.tag)}
 
 Return ONLY valid JSON of this shape: [{"front":"...","back":"..."}]`;
-			// --- MODIFICATION END ---
 
 			const response = await this.plugin.sendToLlm(prompt);
 			if (!response) throw new Error("LLM returned an empty response.");
@@ -2974,6 +3056,10 @@ ${cardJson}
 }
 
 class CardBrowser extends Modal {
+	private showOnlyFlagged = false;
+	private treePane!: HTMLElement;
+	private editorPane!: HTMLElement;
+
 	constructor(
 		private plugin: GatedNotesPlugin,
 		private filter?: (card: Flashcard) => boolean
@@ -2988,24 +3074,48 @@ class CardBrowser extends Modal {
 		);
 		makeModalDraggable(this, this.plugin);
 
-		const body = this.contentEl.createDiv({ cls: "gn-body" });
-		const treePane = body.createDiv({ cls: "gn-tree" });
-		const editorPane = body.createDiv({ cls: "gn-editor" });
-		editorPane.setText("← Choose a chapter to view its cards");
+		const header = this.contentEl.createDiv();
+		new Setting(header)
+			.setName("Show only flagged cards")
+			.addToggle((toggle) => {
+				toggle.setValue(this.showOnlyFlagged).onChange(async (value) => {
+					this.showOnlyFlagged = value;
+					await this.renderContent();
+				});
+			});
 
+		const body = this.contentEl.createDiv({ cls: "gn-body" });
+		this.treePane = body.createDiv({ cls: "gn-tree" });
+		this.editorPane = body.createDiv({ cls: "gn-editor" });
+
+		await this.renderContent();
+	}
+
+	async renderContent() {
+		this.treePane.empty();
+		this.editorPane.empty();
+		this.editorPane.setText("← Choose a chapter to view its cards");
+
+		// FIX: Use an arrow function to preserve 'this' context
 		const showCardsForChapter = async (
 			deck: TFile,
 			chapterPath: string
 		) => {
-			editorPane.empty();
+			this.editorPane.empty();
 			const graph = await this.plugin.readDeck(deck.path);
 			let cards: Flashcard[] = Object.values(graph).filter(
 				(c) => c.chapter === chapterPath
 			);
 
-			if (this.filter) cards = cards.filter(this.filter);
+			if (this.filter) {
+				cards = cards.filter(this.filter);
+			}
+			if (this.showOnlyFlagged) {
+				cards = cards.filter((c) => c.flagged);
+			}
+
 			if (!cards.length) {
-				editorPane.setText(
+				this.editorPane.setText(
 					"No cards in this chapter match the current filter."
 				);
 				return;
@@ -3016,11 +3126,14 @@ class CardBrowser extends Modal {
 			);
 
 			for (const card of cards) {
-				const row = editorPane.createDiv({ cls: "gn-cardrow" });
-				row.setText(card.front || "(empty front)");
+				const row = this.editorPane.createDiv({ cls: "gn-cardrow" });
+				const cardLabel = `${card.flagged ? "🚩 " : ""}${
+					card.front || "(empty front)"
+				}`;
+				row.setText(cardLabel);
 				row.onclick = () => {
-					this.plugin.openEditModal(card, graph, deck, () => {
-						showCardsForChapter(deck, chapterPath);
+					this.plugin.openEditModal(card, graph, deck, async () => {
+						await this.renderContent();
 					});
 				};
 
@@ -3036,8 +3149,8 @@ class CardBrowser extends Modal {
 						if (!confirm("Delete this card permanently?")) return;
 						delete graph[card.id];
 						await this.plugin.writeDeck(deck.path, graph);
-						row.remove();
 						this.plugin.refreshAllStatuses();
+						await this.renderContent();
 					};
 			}
 		};
@@ -3045,15 +3158,22 @@ class CardBrowser extends Modal {
 		const decks = this.app.vault
 			.getFiles()
 			.filter((f) => f.name.endsWith(DECK_FILE_NAME));
+
 		for (const deck of decks) {
 			const graph = await this.plugin.readDeck(deck.path);
 			let cardsInDeck = Object.values(graph);
 
-			if (this.filter) cardsInDeck = cardsInDeck.filter(this.filter);
+			if (this.filter) {
+				cardsInDeck = cardsInDeck.filter(this.filter);
+			}
+			if (this.showOnlyFlagged) {
+				cardsInDeck = cardsInDeck.filter((c) => c.flagged);
+			}
+
 			if (cardsInDeck.length === 0) continue;
 
 			const subject = deck.path.split("/")[0] || "Vault Root";
-			const subjectEl = treePane.createEl("details", {
+			const subjectEl = this.treePane.createEl("details", {
 				cls: "gn-node",
 				attr: { open: true },
 			});
@@ -3075,10 +3195,12 @@ class CardBrowser extends Modal {
 				const chapterName =
 					chapterPath.split("/").pop()?.replace(/\.md$/, "") ??
 					chapterPath;
-				subjectEl.createEl("div", {
-					cls: "gn-chap",
-					text: `${count} card(s) • ${chapterName}`,
-				}).onclick = () => showCardsForChapter(deck, chapterPath);
+				subjectEl
+					.createEl("div", {
+						cls: "gn-chap",
+						text: `${count} card(s) • ${chapterName}`,
+					})
+					.onclick = () => showCardsForChapter(deck, chapterPath);
 			}
 		}
 	}
