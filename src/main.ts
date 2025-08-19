@@ -1017,25 +1017,26 @@ export default class GatedNotesPlugin extends Plugin {
 		const wrappedContent = await this.app.vault.read(file);
 		const paragraphs = getParagraphsFromFinalizedNote(wrappedContent);
 		let plainTextForLlm = paragraphs.map((p) => p.markdown).join("\n\n");
-	
+
 		let hasImages = false;
 		const imageHashMap = new Map<string, number>();
-	
+
 		if (this.settings.analyzeImagesOnGenerate) {
 			const imageRegex = /!\[\[([^\]]+)\]\]/g;
 			const imageDb = await this.getImageDb();
-			
+
 			// --- MODIFIED: Loop through paragraphs to get context ---
 			for (const para of paragraphs) {
 				let match;
 				while ((match = imageRegex.exec(para.markdown)) !== null) {
 					const imageLinkText = match[0];
 					const imagePath = match[1];
-					const imageFile = this.app.metadataCache.getFirstLinkpathDest(
-						imagePath,
-						file.path
-					);
-	
+					const imageFile =
+						this.app.metadataCache.getFirstLinkpathDest(
+							imagePath,
+							file.path
+						);
+
 					if (imageFile instanceof TFile) {
 						hasImages = true;
 						notice.setMessage(
@@ -1043,22 +1044,26 @@ export default class GatedNotesPlugin extends Plugin {
 						);
 						const hash = await this.calculateFileHash(imageFile);
 						imageHashMap.set(hash, para.id);
-	
+
 						let analysisEntry = imageDb[hash];
 
 						// --- MODIFIED: Re-analyze if the entry or its analysis is missing ---
 						if (!analysisEntry || !analysisEntry.analysis) {
 							// Pass the paragraph's markdown as context
-							const newAnalysis = await this.analyzeImage(imageFile, para.markdown);
+							const newAnalysis = await this.analyzeImage(
+								imageFile,
+								para.markdown
+							);
 							if (newAnalysis) {
 								analysisEntry = newAnalysis;
 								imageDb[hash] = newAnalysis;
 								await this.writeImageDb(imageDb);
 							}
 						}
-	
+
 						if (analysisEntry && analysisEntry.analysis) {
-							const { type, description } = analysisEntry.analysis;
+							const { type, description } =
+								analysisEntry.analysis;
 							const descriptionJson = JSON.stringify(description);
 							const placeholder = `[[IMAGE: HASH=${hash} TYPE=${type} DESCRIPTION=${descriptionJson}]]`;
 							plainTextForLlm = plainTextForLlm.replace(
@@ -1071,14 +1076,14 @@ export default class GatedNotesPlugin extends Plugin {
 			}
 		}
 		// --- END MODIFICATION ---
-	
+
 		if (!plainTextForLlm.trim()) {
 			new Notice(
 				"Error: Could not extract text from the finalized note."
 			);
 			return;
 		}
-	
+
 		let contextPrompt = "";
 		if (existingCardsForContext && existingCardsForContext.length > 0) {
 			const simplifiedCards = existingCardsForContext.map((c) => ({
@@ -1089,7 +1094,7 @@ export default class GatedNotesPlugin extends Plugin {
 				simplifiedCards
 			)}\n\n`;
 		}
-	
+
 		// --- MODIFIED: New, more sophisticated card generation prompt ---
 		const initialPrompt = `Create ${count} new, distinct Anki-style flashcards from the following article. The article may contain text and special image placeholders of the format [[IMAGE: HASH=... DESCRIPTION=...]].
 	
@@ -1106,7 +1111,7 @@ export default class GatedNotesPlugin extends Plugin {
 	${contextPrompt}Here is the article:
 	${plainTextForLlm}`;
 		// --- END MODIFICATION ---
-	
+
 		notice.setMessage(`🤖 Generating ${count} flashcard(s)...`);
 		const response = await this.sendToLlm(initialPrompt);
 		notice.hide();
@@ -1114,13 +1119,13 @@ export default class GatedNotesPlugin extends Plugin {
 			new Notice("LLM generation failed. See console for details.");
 			return;
 		}
-	
+
 		// ... (The rest of the function remains the same)
 		const generatedItems = this.parseLlmResponse(response, file.path);
 		const goodCards: Flashcard[] = [];
 		let cardsToFix: Omit<Flashcard, "id" | "paraIdx" | "review_history">[] =
 			[];
-	
+
 		for (const item of generatedItems) {
 			if (item.tag.startsWith("[[IMAGE HASH=")) {
 				const hashMatch = item.tag.match(
@@ -1149,12 +1154,12 @@ export default class GatedNotesPlugin extends Plugin {
 				}
 			}
 		}
-	
+
 		let correctedCount = 0;
 		if (this.settings.autoCorrectTags && cardsToFix.length > 0) {
 			new Notice(`🤖 Found ${cardsToFix.length} tags to auto-correct...`);
 			const stillUnfixed: typeof cardsToFix = [];
-	
+
 			for (const cardData of cardsToFix) {
 				const correctedCard = await this.attemptTagCorrection(
 					cardData,
@@ -1175,7 +1180,7 @@ export default class GatedNotesPlugin extends Plugin {
 			}
 			cardsToFix = stillUnfixed;
 		}
-	
+
 		if (goodCards.length > 0) await this.saveCards(file, goodCards);
 		let noticeText = `✅ Added ${goodCards.length} cards.`;
 		if (correctedCount > 0)
@@ -1183,7 +1188,7 @@ export default class GatedNotesPlugin extends Plugin {
 		if (cardsToFix.length > 0)
 			noticeText += ` ⚠️ Failed to fix ${cardsToFix.length} tags (see console).`;
 		new Notice(noticeText);
-	
+
 		this.refreshReading();
 		this.refreshAllStatuses();
 	}
@@ -2074,12 +2079,12 @@ ${selection}
 				.toLowerCase()
 				.replace("jpg", "jpeg");
 			const imageUrl = `data:image/${fileExtension};base64,${base64Image}`;
-	
+
 			// --- MODIFIED: New, more powerful prompt ---
 			const contextInstruction = textContext
 				? `Use the following text context to inform your analysis, especially for identifying people, places, or specific concepts:\n---TEXT CONTEXT---\n${textContext}\n--------------------`
 				: "Analyze the image based on its visual content alone.";
-	
+
 			const prompt = `You are an expert academic analyst. Your task is to analyze the provided image and return a single, valid JSON object that classifies and describes it for study purposes.
 	
 	${contextInstruction}
@@ -2098,17 +2103,17 @@ ${selection}
 	
 	Your final output must be ONLY the JSON object.`;
 			// --- END MODIFICATION ---
-	
+
 			const response = await this.sendToLlm(prompt, imageUrl);
 			if (!response) throw new Error("LLM returned an empty response.");
-	
+
 			const analysis = extractJsonObjects<any>(response)[0];
 			if (!analysis || !analysis.type || !analysis.description) {
 				throw new Error(
 					"LLM response was not in the expected JSON format."
 				);
 			}
-	
+
 			return {
 				path: imageFile.path,
 				analysis: analysis,
@@ -2854,21 +2859,41 @@ class EditModal extends Modal {
 				front: this.card.front,
 				back: this.card.back,
 			});
-			const prompt = `You are an AI assistant that helps refine study materials by creating "reverse" flashcards. Given an existing flashcard, take the information from the 'Back' and use it to form a new 'Front'. The subject of the original 'Front' should become the new 'Back'.
 
-Example:
-Original: { "Front": "What is the function of mitochondria?", "Back": "They generate ATP for the cell." }
-Reversed: { "Front": "Which organelle generates ATP for the cell?", "Back": "Mitochondria" }
+			// --- MODIFICATION START ---
+			// New, more detailed prompt for better card generation.
+			const prompt = `You are an AI assistant that creates a new, insightful flashcard by "refocusing" an existing one. Your task is to identify the core facts in the card and create a new question that tests a different fact, rather than just rephrasing the original.
 
-Return ONLY valid JSON of this shape: [{"front":"...","back":"..."}]
+**Thought Process:**
+1.  **Deconstruct:** Analyze the original card's Front and Back to identify all distinct pieces of information (e.g., the subject, an action, a specific detail, a date, a location, a reason).
+2.  **Invert & Refocus:** Create a new card where a key detail from the original *answer* becomes the new *question*, and the subject of the original *question* becomes the new *answer*.
 
 ---
+**Example:**
+* **Original Card:**
+    * "front": "What was the outcome of the War of Fakery in 1653?"
+    * "back": "Country A decisively defeated Country B."
+* **AI's Deconstruction:**
+    * Event: War of Fakery
+    * Date: 1653
+    * Participants: Country A, Country B
+    * Outcome: Country A defeated Country B
+* **Refocused Card (testing the date):**
+    * "front": "In what year did the War of Fakery, where Country A defeated Country B, take place?"
+    * "back": "1653"
+---
+
+**Your Task:**
+Now, apply this process to the following card.
+
 **Original Card:**
 ${cardJson}
 
-**Source Text for Context:**
+**Source Text for Context (the text the card was made from):**
 ${JSON.stringify(this.card.tag)}
----`;
+
+Return ONLY valid JSON of this shape: [{"front":"...","back":"..."}]`;
+			// --- MODIFICATION END ---
 
 			const response = await this.plugin.sendToLlm(prompt);
 			if (!response) throw new Error("LLM returned an empty response.");
