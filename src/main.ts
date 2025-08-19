@@ -136,7 +136,7 @@ const DEFAULT_SETTINGS: Settings = {
 
 interface ImageAnalysis {
 	path: string;
-	analysis: {
+	analysis?: {
 		type: string;
 		description: Record<string, string | string[]>;
 	};
@@ -285,18 +285,23 @@ export default class GatedNotesPlugin extends Plugin {
 				if (!checking) this.unfinalize(view.file);
 				return true;
 			},
-		});this.addCommand({
+		});
+		this.addCommand({
 			id: "gn-remove-all-breakpoints",
 			name: "Remove all paragraph breakpoints",
 			checkCallback: (checking: boolean) => {
-				const view = this.app.workspace.getActiveViewOfType(MarkdownView);
+				const view =
+					this.app.workspace.getActiveViewOfType(MarkdownView);
 				if (!view?.file) return false;
-				
+
 				const content = view.editor.getValue();
 				if (!content.includes(SPLIT_TAG)) return false;
-	
+
 				if (!checking) {
-					const newContent = content.replace(new RegExp(SPLIT_TAG, "g"), "");
+					const newContent = content.replace(
+						new RegExp(SPLIT_TAG, "g"),
+						""
+					);
 					view.editor.setValue(newContent);
 					new Notice("All paragraph breakpoints removed.");
 				}
@@ -401,26 +406,28 @@ export default class GatedNotesPlugin extends Plugin {
 				const view =
 					this.app.workspace.getActiveViewOfType(MarkdownView);
 				if (!view?.file) return false;
-	
+
 				if (!checking) {
 					(async () => {
 						const file = view.file!;
 						const deckPath = getDeckPathForChapter(file.path);
 						if (!(await this.app.vault.adapter.exists(deckPath))) {
-							new Notice("No flashcard deck found for this chapter.");
+							new Notice(
+								"No flashcard deck found for this chapter."
+							);
 							return;
 						}
-	
+
 						const graph = await this.readDeck(deckPath);
 						const cardsForChapter = Object.values(graph).filter(
 							(c) => c.chapter === file.path
 						);
-	
+
 						if (cardsForChapter.length === 0) {
 							new Notice("No flashcards found to reset.");
 							return;
 						}
-	
+
 						if (
 							!confirm(
 								`Are you sure you want to reset the review progress for ${cardsForChapter.length} card(s) in "${file.basename}"? All learning history will be lost.`
@@ -428,7 +435,7 @@ export default class GatedNotesPlugin extends Plugin {
 						) {
 							return;
 						}
-	
+
 						for (const card of cardsForChapter) {
 							card.status = "new";
 							card.last_reviewed = null;
@@ -439,19 +446,36 @@ export default class GatedNotesPlugin extends Plugin {
 							card.review_history = [];
 							delete card.learning_step_index;
 						}
-	
+
 						await this.writeDeck(deckPath, graph);
 						new Notice(
 							`Reset ${cardsForChapter.length} card(s) for "${file.basename}".`
 						);
-						
+
 						this.refreshAllStatuses();
 						this.refreshReading();
 					})();
 				}
-	
+
 				return true;
 			},
+		});
+		this.addCommand({
+			id: "gn-remove-note-image-analysis",
+			name: "Remove image analysis for this note",
+			checkCallback: (checking: boolean) => {
+				const view =
+					this.app.workspace.getActiveViewOfType(MarkdownView);
+				if (!view?.file) return false;
+				if (!checking) this.removeNoteImageAnalysis(view.file);
+				return true;
+			},
+		});
+
+		this.addCommand({
+			id: "gn-remove-all-image-analysis",
+			name: "Remove all image analysis data",
+			callback: () => this.removeAllImageAnalysis(),
 		});
 	}
 
@@ -593,70 +617,78 @@ export default class GatedNotesPlugin extends Plugin {
 			return;
 		}
 		const activePath = activeFile.path;
-	
+
+		// --- MODIFICATION: Capture the initial state reliably ---
 		const lastVisibleParaBefore = this.getLastVisibleParaIndex();
-		let newContentUnlocked = false;
-	
-		// The `while(true)` loop was causing the "stuck in review" issue.
-		// We only need to process one queue for the reward scroll to work correctly.
+
 		const queue = await this.collectReviewPool(activePath);
 		if (!queue.length) {
 			new Notice("🎉 All reviews complete!");
 			return;
 		}
-	
+
+		// --- MODIFICATION: Removed the `newContentUnlocked` flag ---
+		let reviewInterrupted = false;
+
 		for (const { card, deck } of queue) {
 			const res = await this.openReviewModal(card, deck);
-	
-			if (res === "answered") {
-				// Give the DOM a moment to update after the card data changes
-				await new Promise(resolve => setTimeout(resolve, 50)); 
-				const lastVisibleAfterAnswer = this.getLastVisibleParaIndex();
-				if (lastVisibleAfterAnswer > lastVisibleParaBefore) {
-					newContentUnlocked = true;
-				}
-			}
-	
+
 			if (res === "abort") {
 				new Notice("Review session aborted.");
-				return;
+				reviewInterrupted = true;
+				break; // Exit the loop immediately
 			}
-	
+
 			if (res === "again") {
 				new Notice("Last card failed. Jumping to context…");
+				reviewInterrupted = true;
 				await this.jumpToTag(card);
-				return; 
+				break; // Exit the loop immediately
 			}
-	
-			if (newContentUnlocked) {
+
+			// --- MODIFICATION: Simplified loop. We no longer check visibility here.
+			// We only break if the paragraph we just cleared was the gate.
+			const lastVisibleAfterAnswer = this.getLastVisibleParaIndex();
+			if (lastVisibleAfterAnswer > lastVisibleParaBefore) {
 				break;
 			}
 		}
-	
-		if (!newContentUnlocked) {
-			new Notice("All reviews for this section are complete!");
-		} else {
+
+		// --- MODIFICATION: New, robust check AFTER the loop is finished ---
+		if (reviewInterrupted) {
+			return; // Don't show any completion notices if the user aborted or failed a card.
+		}
+
+		// Give the DOM a final moment to settle before the final check.
+		await new Promise((resolve) => setTimeout(resolve, 100));
+		const lastVisibleAfterSession = this.getLastVisibleParaIndex();
+
+		if (lastVisibleAfterSession > lastVisibleParaBefore) {
 			new Notice("✅ New content unlocked!");
-	
+
 			const firstNewParaIdx = lastVisibleParaBefore + 1;
-			
 			const leaf = this.app.workspace.getLeaf(false);
 			await leaf.openFile(activeFile, { state: { mode: "preview" } });
-	
+
 			const mdView = this.app.workspace.getActiveViewOfType(MarkdownView);
 			if (!mdView) return;
-	
+
 			const paraSelector = `.${PARA_CLASS}[${PARA_ID_ATTR}="${firstNewParaIdx}"]`;
 			const wrapper = await waitForEl<HTMLElement>(
 				paraSelector,
 				mdView.previewMode.containerEl
 			);
-	
+
 			if (wrapper) {
 				wrapper.scrollIntoView({ behavior: "smooth", block: "center" });
 				wrapper.classList.add("gn-unlocked-flash");
-				setTimeout(() => wrapper.classList.remove("gn-unlocked-flash"), 1500);
+				setTimeout(
+					() => wrapper.classList.remove("gn-unlocked-flash"),
+					1500
+				);
 			}
+		} else {
+			new Notice("All reviews for this section are complete!");
 		}
 	}
 
@@ -985,69 +1017,68 @@ export default class GatedNotesPlugin extends Plugin {
 		const wrappedContent = await this.app.vault.read(file);
 		const paragraphs = getParagraphsFromFinalizedNote(wrappedContent);
 		let plainTextForLlm = paragraphs.map((p) => p.markdown).join("\n\n");
-
+	
 		let hasImages = false;
 		const imageHashMap = new Map<string, number>();
-
+	
 		if (this.settings.analyzeImagesOnGenerate) {
 			const imageRegex = /!\[\[([^\]]+)\]\]/g;
 			const imageDb = await this.getImageDb();
-			let match;
-			const textToProcess = plainTextForLlm;
-
-			while ((match = imageRegex.exec(textToProcess)) !== null) {
-				const imageLinkText = match[0];
-				const imagePath = match[1];
-				const imageFile = this.app.metadataCache.getFirstLinkpathDest(
-					imagePath,
-					file.path
-				);
-
-				if (imageFile instanceof TFile) {
-					hasImages = true;
-					notice.setMessage(
-						`🤖 Analyzing image: ${imageFile.name}...`
+			
+			// --- MODIFIED: Loop through paragraphs to get context ---
+			for (const para of paragraphs) {
+				let match;
+				while ((match = imageRegex.exec(para.markdown)) !== null) {
+					const imageLinkText = match[0];
+					const imagePath = match[1];
+					const imageFile = this.app.metadataCache.getFirstLinkpathDest(
+						imagePath,
+						file.path
 					);
-					const hash = await this.calculateFileHash(imageFile);
-
-					const imagePara = paragraphs.find((p) =>
-						p.markdown.includes(imageLinkText)
-					);
-					if (imagePara) {
-						imageHashMap.set(hash, imagePara.id);
-					}
-
-					let analysisEntry = imageDb[hash];
-
-					if (!analysisEntry) {
-						const newAnalysis = await this.analyzeImage(imageFile);
-						if (newAnalysis) {
-							analysisEntry = newAnalysis;
-							imageDb[hash] = newAnalysis;
-							await this.writeImageDb(imageDb);
-						}
-					}
-
-					if (analysisEntry) {
-						const { type, description } = analysisEntry.analysis;
-						const descriptionJson = JSON.stringify(description);
-						const placeholder = `[[IMAGE: HASH=${hash} TYPE=${type} DESCRIPTION=${descriptionJson}]]`;
-						plainTextForLlm = plainTextForLlm.replace(
-							imageLinkText,
-							placeholder
+	
+					if (imageFile instanceof TFile) {
+						hasImages = true;
+						notice.setMessage(
+							`🤖 Analyzing image: ${imageFile.name}...`
 						);
+						const hash = await this.calculateFileHash(imageFile);
+						imageHashMap.set(hash, para.id);
+	
+						let analysisEntry = imageDb[hash];
+
+						// --- MODIFIED: Re-analyze if the entry or its analysis is missing ---
+						if (!analysisEntry || !analysisEntry.analysis) {
+							// Pass the paragraph's markdown as context
+							const newAnalysis = await this.analyzeImage(imageFile, para.markdown);
+							if (newAnalysis) {
+								analysisEntry = newAnalysis;
+								imageDb[hash] = newAnalysis;
+								await this.writeImageDb(imageDb);
+							}
+						}
+	
+						if (analysisEntry && analysisEntry.analysis) {
+							const { type, description } = analysisEntry.analysis;
+							const descriptionJson = JSON.stringify(description);
+							const placeholder = `[[IMAGE: HASH=${hash} TYPE=${type} DESCRIPTION=${descriptionJson}]]`;
+							plainTextForLlm = plainTextForLlm.replace(
+								imageLinkText,
+								placeholder
+							);
+						}
 					}
 				}
 			}
 		}
-
+		// --- END MODIFICATION ---
+	
 		if (!plainTextForLlm.trim()) {
 			new Notice(
 				"Error: Could not extract text from the finalized note."
 			);
 			return;
 		}
-
+	
 		let contextPrompt = "";
 		if (existingCardsForContext && existingCardsForContext.length > 0) {
 			const simplifiedCards = existingCardsForContext.map((c) => ({
@@ -1058,59 +1089,24 @@ export default class GatedNotesPlugin extends Plugin {
 				simplifiedCards
 			)}\n\n`;
 		}
-
-		let initialPrompt: string;
-		if (hasImages) {
-			initialPrompt = `Create ${count} new, distinct Anki-style flashcards to study the following article. The article contains descriptions of images with this structure: "[[IMAGE: HASH=... TYPE=... DESCRIPTION={...}]]", where DESCRIPTION contains a JSON object with details about the image.
-
-**Card Structure:**
-- The "Front" MUST be a question.
-- The "Back" MUST be a direct answer.
-- The "Tag" MUST be context for the card.
-
-**Tagging Rules:**
-1.  **For cards about an image:** The "Tag" MUST be ONLY the image reference, like "[[IMAGE HASH=...]]".
-2.  **For cards about text:** You MUST find a relevant, contiguous quote from the article and copy it *exactly* into the "Tag" field.
-3.  **Crucially, only use an image reference as a tag if the question in the "Front" is asking specifically about that image. Otherwise, you MUST use a text quote.**
-4.  Do not invent a tag or use placeholders like "none". Every card must have a valid tag.
-
-**Example of a PERFECT image-based card:**
-{
-  "front": "What does the diagram of the solar system show?",
-  "back": "It shows the sun at the center with the planets orbiting it.",
-  "tag": "[[IMAGE HASH=...]]"
-}
-
-Return ONLY valid JSON of this shape:
-[
-  {"front":"...","back":"...","tag":"..."}
-]
-
-${contextPrompt}Here is the article:
-${plainTextForLlm}`;
-		} else {
-			initialPrompt = `Create ${count} new, distinct Anki-style flashcards to study the following article.
-
-**Card Structure:**
-- The "Front" MUST be a question.
-- The "Back" MUST be a direct answer.
-- The "Tag" MUST be context for the card.
-
-**Tagging Rules:**
-1. You MUST find a relevant, contiguous quote from the article and copy it *exactly* into the "Tag" field. Do not summarize or paraphrase it.
-2. The tag value must not contain any newline characters.
-3. **Crucially, do not invent a tag or use placeholders like "none". Every card must have a valid tag.**
-
-
-Return ONLY valid JSON of this shape:
-[
-  {"front":"...","back":"...","tag":"..."}
-]
-
-${contextPrompt}Here is the article:
-${plainTextForLlm}`;
-		}
-
+	
+		// --- MODIFIED: New, more sophisticated card generation prompt ---
+		const initialPrompt = `Create ${count} new, distinct Anki-style flashcards from the following article. The article may contain text and special image placeholders of the format [[IMAGE: HASH=... DESCRIPTION=...]].
+	
+	**Card Generation Rules:**
+	1.  **Text-Based Cards:** For cards based on plain text, the "Tag" MUST be a short, verbatim quote from the text.
+	2.  **Image-Based Cards from Facts:** If an image's DESCRIPTION contains "key_facts", treat those facts as source text. Create questions whose answers are derived from these facts. The "Tag" for these cards MUST be the \`[[IMAGE HASH=...]]\` placeholder itself.
+	3.  **Visual Question Cards: Create questions that require the user to see the image to answer. The "Front" of such cards should contain both a question and the \`[[IMAGE HASH=...]]\` placeholder.** For example: "What process does this diagram illustrate? [[IMAGE HASH=...]]".
+	4.  **No Image-Only Fields: The "Front" or "Back" of a card must never consist solely of an image placeholder. Images must always be accompanied by relevant text or a question.**
+	
+	**Output Format:**
+	- Return ONLY valid JSON of this shape: \`[{"front":"...","back":"...","tag":"..."}]\`
+	- Every card must have a valid front, back, and tag.
+	
+	${contextPrompt}Here is the article:
+	${plainTextForLlm}`;
+		// --- END MODIFICATION ---
+	
 		notice.setMessage(`🤖 Generating ${count} flashcard(s)...`);
 		const response = await this.sendToLlm(initialPrompt);
 		notice.hide();
@@ -1118,12 +1114,13 @@ ${plainTextForLlm}`;
 			new Notice("LLM generation failed. See console for details.");
 			return;
 		}
-
+	
+		// ... (The rest of the function remains the same)
 		const generatedItems = this.parseLlmResponse(response, file.path);
 		const goodCards: Flashcard[] = [];
 		let cardsToFix: Omit<Flashcard, "id" | "paraIdx" | "review_history">[] =
 			[];
-
+	
 		for (const item of generatedItems) {
 			if (item.tag.startsWith("[[IMAGE HASH=")) {
 				const hashMatch = item.tag.match(
@@ -1152,12 +1149,12 @@ ${plainTextForLlm}`;
 				}
 			}
 		}
-
+	
 		let correctedCount = 0;
 		if (this.settings.autoCorrectTags && cardsToFix.length > 0) {
 			new Notice(`🤖 Found ${cardsToFix.length} tags to auto-correct...`);
 			const stillUnfixed: typeof cardsToFix = [];
-
+	
 			for (const cardData of cardsToFix) {
 				const correctedCard = await this.attemptTagCorrection(
 					cardData,
@@ -1178,7 +1175,7 @@ ${plainTextForLlm}`;
 			}
 			cardsToFix = stillUnfixed;
 		}
-
+	
 		if (goodCards.length > 0) await this.saveCards(file, goodCards);
 		let noticeText = `✅ Added ${goodCards.length} cards.`;
 		if (correctedCount > 0)
@@ -1186,7 +1183,7 @@ ${plainTextForLlm}`;
 		if (cardsToFix.length > 0)
 			noticeText += ` ⚠️ Failed to fix ${cardsToFix.length} tags (see console).`;
 		new Notice(noticeText);
-
+	
 		this.refreshReading();
 		this.refreshAllStatuses();
 	}
@@ -1957,6 +1954,81 @@ ${selection}
 	// --- IMAGE UTILITIES ---
 	// ===========================
 
+	private async removeNoteImageAnalysis(file: TFile): Promise<void> {
+		const imageDb = await this.getImageDb();
+		const noteContent = await this.app.vault.read(file);
+		const imageRegex = /!\[\[([^\]]+)\]\]/g;
+		let match;
+		const hashesToClear: string[] = [];
+
+		while ((match = imageRegex.exec(noteContent)) !== null) {
+			const imagePath = match[1];
+			const imageFile = this.app.metadataCache.getFirstLinkpathDest(
+				imagePath,
+				file.path
+			);
+			if (imageFile instanceof TFile) {
+				const hash = await this.calculateFileHash(imageFile);
+				if (imageDb[hash]?.analysis) {
+					hashesToClear.push(hash);
+				}
+			}
+		}
+
+		if (hashesToClear.length === 0) {
+			new Notice("No analyzed images found in this note.");
+			return;
+		}
+
+		if (
+			!confirm(
+				`Are you sure you want to remove the AI analysis for ${hashesToClear.length} image(s) in this note? The images can be re-analyzed later. This cannot be undone.`
+			)
+		) {
+			return;
+		}
+
+		let clearedCount = 0;
+		for (const hash of hashesToClear) {
+			if (imageDb[hash]) {
+				delete imageDb[hash].analysis;
+				clearedCount++;
+			}
+		}
+
+		await this.writeImageDb(imageDb);
+		new Notice(`✅ Cleared analysis for ${clearedCount} image(s).`);
+	}
+
+	private async removeAllImageAnalysis(): Promise<void> {
+		const imageDb = await this.getImageDb();
+		const keysWithAnalysis = Object.keys(imageDb).filter(
+			(k) => imageDb[k].analysis
+		);
+
+		if (keysWithAnalysis.length === 0) {
+			new Notice("No image analysis data found to remove.");
+			return;
+		}
+
+		if (
+			!confirm(
+				`Are you sure you want to remove ALL AI image analysis data from your vault? This will affect ${keysWithAnalysis.length} image(s). This cannot be undone.`
+			)
+		) {
+			return;
+		}
+
+		for (const hash of keysWithAnalysis) {
+			delete imageDb[hash].analysis;
+		}
+
+		await this.writeImageDb(imageDb);
+		new Notice(
+			`✅ Cleared all AI analysis data for ${keysWithAnalysis.length} image(s).`
+		);
+	}
+
 	private async getImageDb(): Promise<ImageAnalysisGraph> {
 		const dbPath = normalizePath(
 			this.app.vault.getRoot().path + IMAGE_ANALYSIS_FILE_NAME
@@ -1988,7 +2060,8 @@ ${selection}
 	}
 
 	private async analyzeImage(
-		imageFile: TFile
+		imageFile: TFile,
+		textContext?: string // MODIFIED: Accept optional text context
 	): Promise<ImageAnalysis | null> {
 		const notice = new Notice(
 			`🤖 Analyzing image: ${imageFile.name}...`,
@@ -2001,52 +2074,41 @@ ${selection}
 				.toLowerCase()
 				.replace("jpg", "jpeg");
 			const imageUrl = `data:image/${fileExtension};base64,${base64Image}`;
-
-			const prompt = `You are an expert academic analyst specializing in visual media. Your task is to analyze the provided image and return a single, valid JSON object that classifies and describes it for study purposes.
-
-**Step 1: Classify the Image**
-First, determine the image's primary category and set the \`type\` key to ONE of the following exact string values:
-* \`diagram\`
-* \`chart\`
-* \`map\`
-* \`artwork\`
-* \`photograph\`
-* \`screenshot\`
-
-**Step 2: Generate a Structured Description**
-Based on the \`type\` you chose, create a corresponding \`description\` object with the following required structure:
-
-* If \`type\` is \`diagram\` or \`chart\`: The \`description\` object must contain:
-    * \`title\`: A string for the official title or a concise summary if none exists.
-    * \`components\`: An array of strings, listing each key labeled part or element.
-    * \`relationships\`: A string explaining how the components interact, focusing on the meaning of arrows, lines, and spatial arrangement.
-
-* If \`type\` is \`map\`: The \`description\` object must contain:
-    * \`region\`: A string identifying the main geographical area shown.
-    * \`key_locations\`: An array of strings listing important labeled cities, countries, or landmarks.
-    * \`purpose\`: A string explaining what the map illustrates (e.g., "Political boundaries in 1815," "Topographical features of the Andes").
-
-* If \`type\` is \`artwork\` or \`photograph\`: The \`description\` object must contain:
-    * \`subject\`: A string describing the central subject and any action taking place.
-    * \`composition\`: A string detailing the arrangement, use of color, light, and perspective.
-    * \`mood\`: A string describing the overall feeling or tone the image evokes.
-
-* If \`type\` is \`screenshot\`: The \`description\` object must contain:
-    * \`interface_element\`: A string identifying the application or primary UI element shown.
-    * \`action\`: A string describing the task being performed or the information being displayed.
-
-**Your final output must be ONLY the JSON object, with no other text, explanations, or markdown formatting.**`;
-
+	
+			// --- MODIFIED: New, more powerful prompt ---
+			const contextInstruction = textContext
+				? `Use the following text context to inform your analysis, especially for identifying people, places, or specific concepts:\n---TEXT CONTEXT---\n${textContext}\n--------------------`
+				: "Analyze the image based on its visual content alone.";
+	
+			const prompt = `You are an expert academic analyst. Your task is to analyze the provided image and return a single, valid JSON object that classifies and describes it for study purposes.
+	
+	${contextInstruction}
+	
+	**Step 1: Classify the Image**
+	Set the \`type\` key to ONE of the following: "diagram", "chart", "map", "artwork", "photograph", "screenshot".
+	
+	**Step 2: Generate a Structured Description**
+	Based on the \`type\`, create a \`description\` object.
+	- For diagrams, charts, or maps, the description MUST contain:
+		- \`title\`: A concise title for the image.
+		- \`key_facts\`: An array of strings, where each string is a distinct, self-contained factual proposition or observation extracted from the image.
+	- For artwork, photographs, or screenshots, the description MUST contain:
+		- \`subject\`: A string describing the central subject.
+		- \`context\`: A string explaining the historical, cultural, or technical context, informed by the provided text.
+	
+	Your final output must be ONLY the JSON object.`;
+			// --- END MODIFICATION ---
+	
 			const response = await this.sendToLlm(prompt, imageUrl);
 			if (!response) throw new Error("LLM returned an empty response.");
-
+	
 			const analysis = extractJsonObjects<any>(response)[0];
 			if (!analysis || !analysis.type || !analysis.description) {
 				throw new Error(
 					"LLM response was not in the expected JSON format."
 				);
 			}
-
+	
 			return {
 				path: imageFile.path,
 				analysis: analysis,
@@ -2541,25 +2603,27 @@ Based on the \`type\` you chose, create a corresponding \`description\` object w
 		const mdView = this.app.workspace.getActiveViewOfType(MarkdownView);
 		// Ensure we are in preview mode, otherwise we can't check visibility.
 		if (!mdView || mdView.getMode() !== "preview") {
-			return 0; 
+			return 0;
 		}
-	
+
 		// Get all paragraph elements that are NOT hidden.
 		const visibleParagraphs = Array.from(
 			mdView.previewMode.containerEl.querySelectorAll<HTMLElement>(
 				`.${PARA_CLASS}:not(.gn-hidden)`
 			)
 		);
-	
+
 		if (visibleParagraphs.length === 0) {
 			return 0;
 		}
-	
+
 		// Find the highest data-para-id among the visible paragraphs.
 		const lastVisibleId = Math.max(
-			...visibleParagraphs.map(p => Number(p.getAttribute(PARA_ID_ATTR) ?? 0))
+			...visibleParagraphs.map((p) =>
+				Number(p.getAttribute(PARA_ID_ATTR) ?? 0)
+			)
 		);
-	
+
 		return lastVisibleId;
 	}
 
@@ -3544,8 +3608,6 @@ async function waitForEl<T extends HTMLElement>(
 		}, 3000);
 	});
 }
-
-
 
 /**
  * Finds the DOM Range for a text snippet within a container using a robust fuzzy matching algorithm.
