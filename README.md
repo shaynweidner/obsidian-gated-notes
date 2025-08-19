@@ -10,19 +10,25 @@ Instead of passively consuming information, you must _earn_ your way through a n
 
 ## ✨ Key Features
 
--   **Gated Reading:** Locks later paragraphs in a note until you’ve mastered the flashcards for the current section.
+-   **Gated Reading:** Locks later paragraphs in a note until you’ve mastered the flashcards for the current section. When you unlock new content, the plugin **automatically scrolls to it and highlights it**.
 
--   **🖼️ Multimodal AI:**
-    -   **Image Analysis:** Automatically analyzes images in your notes, understanding diagrams, charts, photos, and more.
-    -   **Contextual Card Generation:** Creates flashcards that specifically ask about the content and purpose of your images.
-    -   **Intelligent Tagging:** Links image-based cards directly to the source image for quick context-jumping during reviews.
+-   🖼️ **Multimodal AI:**
+    -   **Contextual Image Analysis:** Automatically analyzes images, using surrounding text to understand diagrams, charts, and photos. It extracts key facts and context, not just visual elements.
+    -   **Smarter Card Generation:** Creates flashcards that test factual knowledge *from* diagrams (`key_facts`) or ask visual questions that require seeing the image.
+    -   **Intelligent Tagging:** Links image-based cards directly to the source image for quick context-jumping.
 
 -   **AI-Powered Flashcards:** Create cards automatically using OpenAI (including GPT-4o) or a local LM Studio instance.
 
 -   **Advanced AI Tools:**
+    -   **Custom Guidance:** Direct the AI during card generation with specific instructions (e.g., "the answer (back) should only be names of people and places or dates").
     -   **Split Card:** Break a complex card into smaller, more atomic ones.
-    -   **Refocus Card:** Generate alternate phrasings or questions for the same fact.
+    -   **Refocus Card:** Generate alternate phrasings or "reverse" questions for the same fact.
     -   **Auto-Correct Tags:** If the AI generates a tag that isn't a direct quote, it will automatically attempt to fix it.
+
+-   **Powerful Card Management:**
+    -   **Flag Cards:** Mark cards with a 🚩 to easily find and filter them in the Card Browser.
+    -   **Suspend Cards:** Temporarily remove cards from review queues and content gating without deleting them.
+    -   **Card Preview:** See how your Markdown will render on the front and back of a card, right from the edit modal.
 
 -   **SM-2 Scheduling:** Built-in spaced repetition ensures maximum retention.
 
@@ -34,7 +40,7 @@ Instead of passively consuming information, you must _earn_ your way through a n
 -   **Rich UI Enhancements:**
     -   Status bar due-card counter.
     -   File explorer icons showing chapter status (`⏳` blocked, `📆` due, `✅` done).
-    -   Full card browser with filters and inline editing.
+    -   Full card browser with filters for flagged or suspended cards.
 
 ---
 
@@ -46,19 +52,20 @@ Treat each note as a “chapter” within a subject (folder). Write normally in 
 
 ### 2. Finalize the Chapter
 
-Prepare the note for gating by converting paragraphs into trackable units. The process is now idempotent, meaning you can finalize and un-finalize without losing your manual splits.
+Prepare the note for gating by converting paragraphs into trackable units. The process is idempotent, meaning you can finalize and un-finalize without losing your manual splits.
 
 -   **Auto Finalize:**
     -   `Gated Notes: Finalize note (auto-paragraphs)` — Splits on double newlines. If manual split markers are detected, you'll be prompted to choose which method to use.
 -   **Manual Finalize:**
-    -   Insert split markers (`Mod+Shift+Enter`) where you want breaks, then run
-    -   `Gated Notes: Finalize note (manual splits)`.
+    -   Insert split markers (`Mod+Shift+Enter`) where you want breaks, then run `Gated Notes: Finalize note (manual splits)`.
+    -   Use `Gated Notes: Remove all paragraph breakpoints` to clean up a note.
 
 ### 3. Generate or Add Cards
 
 -   **AI Generation:**
     -   `Gated Notes: Generate flashcards from finalized note` — The AI will read the entire note, including image analyses, to create cards.
-    -   If cards already exist, you'll be prompted to generate *additional* cards, with an option to prevent duplicates.
+    -   A new modal allows you to provide **custom guidance** to steer the AI's output.
+    -   If cards already exist, you'll be prompted to generate *additional* cards, with options to prevent duplicates and add guidance.
 -   **Manual Creation:**
     -   Highlight text → right-click → “Add flashcard (manual)” or use one of the "Generate with AI" options for targeted creation.
 
@@ -66,7 +73,7 @@ Prepare the note for gating by converting paragraphs into trackable units. The p
 
 -   Open a gated note — only the first section is visible.
 -   Start a review in **Chapter Mode**.
--   As you answer correctly, the next section automatically unblurs. When you fail a card, you can instantly jump to the source text or image to review.
+-   As you answer correctly, the next section automatically unblurs and the view scrolls to it. When you fail a card, you can instantly jump to the source text or image to review.
 
 ---
 
@@ -89,15 +96,19 @@ Prepare the note for gating by converting paragraphs into trackable units. The p
 
 ## ⚙️ Key Commands
 
-| Command                               | Description                                                      |
-| ------------------------------------- | ---------------------------------------------------------------- |
-| `Review due cards`                    | Starts a review session for the current mode.                    |
-| `Toggle content gating`               | Enable/disable blur without changing settings.                   |
-| `Browse cards`                        | Open the Card Browser.                                           |
-| `Finalize note (auto/manual)`         | Prepare note for gating.                                         |
-| `Un-finalize chapter`                 | Revert to plain Markdown, preserving manual split markers.       |
-| `Recalculate paragraph indexes`       | Re-sync all cards with their source text after edits.            |
-| `Delete all flashcards for this chapter` | Remove all cards tied to the active note.                      |
+| Command | Description |
+| :--- | :--- |
+| `Review due cards` | Starts a review session for the current mode. |
+| `Toggle content gating` | Enable/disable blur without changing settings. |
+| `Browse cards` | Open the Card Browser with filtering options. |
+| `Finalize note (auto/manual)` | Prepare note for gating. |
+| `Un-finalize chapter` | Revert to plain Markdown, adding split markers between former paragraphs. |
+| `Remove all paragraph breakpoints` | Deletes all manual split markers from the current note. |
+| `Reset flashcard review history...` | Resets all cards in the chapter to "new," preserving the cards themselves. |
+| `Recalculate paragraph indexes...` | Re-sync all cards with their source text after edits. |
+| `Delete all flashcards for this chapter` | Remove all cards tied to the active note. |
+| `Remove image analysis for this note` | Deletes the cached AI analysis for all images within the current note. |
+| `Remove all image analysis data` | Deletes all cached AI image analysis data across the entire vault. |
 
 ---
 
