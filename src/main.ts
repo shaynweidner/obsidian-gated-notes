@@ -91,6 +91,7 @@ interface Flashcard {
 	blocked: boolean;
 	review_history: ReviewLog[];
 	flagged?: boolean;
+	suspended?: boolean;
 }
 
 interface FlashcardGraph {
@@ -736,6 +737,7 @@ export default class GatedNotesPlugin extends Plugin {
 			}
 
 			for (const card of cardsInScope) {
+				if (card.suspended) continue;
 				if (card.due > now) continue;
 
 				const isNew = isUnseen(card);
@@ -1461,7 +1463,7 @@ ${selection}
 					const graph = await this.readDeck(deckPath);
 
 					const blockedCards = Object.values(graph).filter(
-						(c) => c.chapter === chapterPath && c.blocked
+						(c) => c.chapter === chapterPath && c.blocked && !c.suspended
 					);
 					const firstBlockedParaIdx =
 						blockedCards.length > 0
@@ -1740,6 +1742,7 @@ ${selection}
 			due: Date.now(),
 			blocked: true,
 			review_history: [],
+			suspended: false,
 		};
 	}
 
@@ -2291,6 +2294,23 @@ ${selection}
 				.onClick(async () => {
 					const graph = await this.readDeck(deck.path);
 					this.openEditModal(card, graph, deck, () => {});
+				});
+			new ButtonComponent(bottomBar)
+				.setIcon("ban")
+				.setTooltip("Suspend card from reviews")
+				.onClick(async () => {
+					if (confirm("Suspend this card? You can unsuspend it later from the Card Browser or Edit menu.")) {
+						const graph = await this.readDeck(deck.path);
+						const cardInGraph = graph[card.id];
+						if (cardInGraph) {
+							cardInGraph.suspended = true;
+							await this.writeDeck(deck.path, graph);
+							this.refreshReading();
+							new Notice("Card suspended.");
+							state = "answered"; // Treat as answered to continue the session
+							modal.close();
+						}
+					}
 				});
 
 			new ButtonComponent(bottomBar)
@@ -2856,6 +2876,16 @@ class EditModal extends Modal {
 				});
 			});
 
+		// --- MODIFICATION START ---
+		new Setting(editPane)
+			.setName("Suspend this card")
+			.setDesc("Temporarily remove this card from reviews and content gating.")
+			.addToggle((toggle) => {
+				toggle.setValue(!!this.card.suspended).onChange((value) => {
+					this.card.suspended = value;
+				});
+			});
+
 		// FIX: Use .onclick for native HTML elements
 		editButton.onclick = () => {
 			editButton.addClass("active");
@@ -3057,6 +3087,7 @@ ${cardJson}
 
 class CardBrowser extends Modal {
 	private showOnlyFlagged = false;
+	private showOnlySuspended = false;
 	private treePane!: HTMLElement;
 	private editorPane!: HTMLElement;
 
@@ -3080,6 +3111,16 @@ class CardBrowser extends Modal {
 			.addToggle((toggle) => {
 				toggle.setValue(this.showOnlyFlagged).onChange(async (value) => {
 					this.showOnlyFlagged = value;
+					await this.renderContent();
+				});
+			});
+		
+		// --- MODIFICATION START ---
+		new Setting(header)
+			.setName("Show only suspended cards")
+			.addToggle((toggle) => {
+				toggle.setValue(this.showOnlySuspended).onChange(async (value) => {
+					this.showOnlySuspended = value;
 					await this.renderContent();
 				});
 			});
@@ -3113,6 +3154,10 @@ class CardBrowser extends Modal {
 			if (this.showOnlyFlagged) {
 				cards = cards.filter((c) => c.flagged);
 			}
+			// --- MODIFICATION START ---
+			if (this.showOnlySuspended) {
+				cards = cards.filter((c) => c.suspended);
+			}
 
 			if (!cards.length) {
 				this.editorPane.setText(
@@ -3127,9 +3172,17 @@ class CardBrowser extends Modal {
 
 			for (const card of cards) {
 				const row = this.editorPane.createDiv({ cls: "gn-cardrow" });
-				const cardLabel = `${card.flagged ? "🚩 " : ""}${
-					card.front || "(empty front)"
-				}`;
+				
+				// --- MODIFICATION START: Add suspended indicator ---
+				let cardLabel = card.front || "(empty front)";
+				if (card.suspended) {
+					cardLabel = `⏸️ ${cardLabel}`;
+				}
+				if (card.flagged) {
+					cardLabel = `🚩 ${cardLabel}`;
+				}
+				// --- MODIFICATION END ---
+				
 				row.setText(cardLabel);
 				row.onclick = () => {
 					this.plugin.openEditModal(card, graph, deck, async () => {
@@ -3168,6 +3221,10 @@ class CardBrowser extends Modal {
 			}
 			if (this.showOnlyFlagged) {
 				cardsInDeck = cardsInDeck.filter((c) => c.flagged);
+			}
+			// --- MODIFICATION START ---
+			if (this.showOnlySuspended) {
+				cardsInDeck = cardsInDeck.filter((c) => c.suspended);
 			}
 
 			if (cardsInDeck.length === 0) continue;
