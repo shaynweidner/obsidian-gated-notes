@@ -26,9 +26,7 @@ import {
 import { Buffer } from "buffer";
 
 // ===================================================================
-//
-//                          CONSTANTS & ENUMS
-//
+// CONSTANTS & ENUMS
 // ===================================================================
 
 const DECK_FILE_NAME = "_flashcards.json";
@@ -63,9 +61,7 @@ type CardStatus = "new" | "learning" | "review" | "relearn";
 type ReviewResult = "answered" | "skip" | "abort" | "again";
 
 // ===================================================================
-//
-//                          INTERFACES & TYPES
-//
+// INTERFACES & TYPES
 // ===================================================================
 
 interface ReviewLog {
@@ -149,15 +145,28 @@ interface ImageAnalysisGraph {
 	[hash: string]: ImageAnalysis;
 }
 
+interface CardBrowserState {
+	openSubjects: Set<string>;
+	activeChapterPath: string | null;
+	treeScroll: number;
+	editorScroll: number;
+	isFirstRender: boolean;
+}
+
 // ===================================================================
-//
-//                          MAIN PLUGIN CLASS
-//
+// MAIN PLUGIN CLASS
 // ===================================================================
 
 export default class GatedNotesPlugin extends Plugin {
 	settings!: Settings;
 	public lastModalTransform: string | null = null;
+	private cardBrowserState: CardBrowserState = {
+		openSubjects: new Set(),
+		activeChapterPath: null,
+		treeScroll: 0,
+		editorScroll: 0,
+		isFirstRender: true,
+	};
 
 	private statusBar!: HTMLElement;
 	private gatingStatus!: HTMLElement;
@@ -227,10 +236,8 @@ export default class GatedNotesPlugin extends Plugin {
 
 		this.cardsMissingParaIdxStatus = this.addStatusBarItem();
 		this.cardsMissingParaIdxStatus.onClickEvent(() => {
-			new CardBrowser(
-				this,
-				(card: Flashcard) =>
-					card.paraIdx === undefined || card.paraIdx === null
+			new CardBrowser(this, this.cardBrowserState, (card: Flashcard) =>
+				card.paraIdx === undefined || card.paraIdx === null
 			).open();
 		});
 	}
@@ -251,7 +258,7 @@ export default class GatedNotesPlugin extends Plugin {
 		this.addCommand({
 			id: "gn-browse-cards",
 			name: "Browse cards",
-			callback: () => new CardBrowser(this).open(),
+			callback: () => new CardBrowser(this, this.cardBrowserState).open(),
 		});
 
 		this.addCommand({
@@ -333,7 +340,6 @@ export default class GatedNotesPlugin extends Plugin {
 					return false;
 				}
 				if (!checking) {
-					// This part needs to be async to check for existing cards
 					(async () => {
 						const file = view.file!;
 						const deckPath = getDeckPathForChapter(file.path);
@@ -343,7 +349,6 @@ export default class GatedNotesPlugin extends Plugin {
 						);
 
 						if (existingCards.length > 0) {
-							// Open new modal for generating additional cards
 							new GenerateAdditionalCardsModal(
 								this,
 								file,
@@ -361,14 +366,13 @@ export default class GatedNotesPlugin extends Plugin {
 								}
 							).open();
 						} else {
-							// Open original modal for new card generation
 							new GenerateCardsModal(this, file, (result) => {
 								if (result && result.count > 0) {
 									this.generateFlashcards(
 										file,
 										result.count,
 										undefined,
-										result.guidance // Pass guidance
+										result.guidance
 									);
 								}
 							}).open();
@@ -508,7 +512,7 @@ export default class GatedNotesPlugin extends Plugin {
 		});
 
 		this.addRibbonIcon("wallet-cards", "Card Browser", () => {
-			new CardBrowser(this).open();
+			new CardBrowser(this, this.cardBrowserState).open();
 		});
 	}
 
@@ -627,8 +631,8 @@ export default class GatedNotesPlugin extends Plugin {
 		}
 		const activePath = activeFile.path;
 
-		// --- MODIFICATION: Capture the initial state reliably ---
-		const lastVisibleParaBefore = this.getLastVisibleParaIndex();
+		// Store the gate's position before the review session begins.
+		const gateBefore = await this.getFirstBlockedParaIndex(activePath);
 
 		const queue = await this.collectReviewPool(activePath);
 		if (!queue.length) {
@@ -636,7 +640,6 @@ export default class GatedNotesPlugin extends Plugin {
 			return;
 		}
 
-		// --- MODIFICATION: Removed the `newContentUnlocked` flag ---
 		let reviewInterrupted = false;
 
 		for (const { card, deck } of queue) {
@@ -645,51 +648,68 @@ export default class GatedNotesPlugin extends Plugin {
 			if (res === "abort") {
 				new Notice("Review session aborted.");
 				reviewInterrupted = true;
-				break; // Exit the loop immediately
+				break;
 			}
 
 			if (res === "again") {
 				new Notice("Last card failed. Jumping to context…");
 				reviewInterrupted = true;
 				await this.jumpToTag(card);
-				break; // Exit the loop immediately
+				break;
 			}
 
-			// --- MODIFICATION: Simplified loop. We no longer check visibility here.
-			// We only break if the paragraph we just cleared was the gate.
-			const lastVisibleAfterAnswer = this.getLastVisibleParaIndex();
-			if (lastVisibleAfterAnswer > lastVisibleParaBefore) {
+			// If the gate has moved forward, end the review to show the new content.
+			const gateAfterLoop = await this.getFirstBlockedParaIndex(
+				activePath
+			);
+			if (gateAfterLoop > gateBefore) {
 				break;
 			}
 		}
 
-		// --- MODIFICATION: New, robust check AFTER the loop is finished ---
+		// Only show completion notices if the session wasn't interrupted.
 		if (reviewInterrupted) {
-			return; // Don't show any completion notices if the user aborted or failed a card.
+			return;
 		}
 
-		// Give the DOM a final moment to settle before the final check.
-		await new Promise((resolve) => setTimeout(resolve, 100));
-		const lastVisibleAfterSession = this.getLastVisibleParaIndex();
+		const gateAfter = await this.getFirstBlockedParaIndex(activePath);
 
-		if (lastVisibleAfterSession > lastVisibleParaBefore) {
+		if (gateAfter > gateBefore) {
 			new Notice("✅ New content unlocked!");
 
-			const firstNewParaIdx = lastVisibleParaBefore + 1;
+			// The paragraph to scroll to is the one that was just unlocked.
+			const targetParaIdx = gateBefore;
+
 			const leaf = this.app.workspace.getLeaf(false);
 			await leaf.openFile(activeFile, { state: { mode: "preview" } });
 
 			const mdView = this.app.workspace.getActiveViewOfType(MarkdownView);
 			if (!mdView) return;
 
-			const paraSelector = `.${PARA_CLASS}[${PARA_ID_ATTR}="${firstNewParaIdx}"]`;
+			// Find the line number of the target paragraph.
+			const targetLine = await getLineForParagraph(
+				this,
+				activeFile,
+				targetParaIdx
+			);
+
+			// Tell Obsidian to scroll its view to that line, forcing a render.
+			mdView.setEphemeralState({ scroll: targetLine });
+
+			// Allow the DOM time to update after the scroll command.
+			await new Promise((resolve) => setTimeout(resolve, 100));
+
+			const paraSelector = `.${PARA_CLASS}[${PARA_ID_ATTR}="${targetParaIdx}"]`;
 			const wrapper = await waitForEl<HTMLElement>(
 				paraSelector,
 				mdView.previewMode.containerEl
 			);
 
 			if (wrapper) {
-				wrapper.scrollIntoView({ behavior: "smooth", block: "center" });
+				wrapper.scrollIntoView({
+					behavior: "smooth",
+					block: "center",
+				});
 				wrapper.classList.add("gn-unlocked-flash");
 				setTimeout(
 					() => wrapper.classList.remove("gn-unlocked-flash"),
@@ -970,7 +990,7 @@ export default class GatedNotesPlugin extends Plugin {
 	private showSplitMarkerConflictModal(): Promise<"auto" | "manual" | null> {
 		return new Promise((resolve) => {
 			const modal = new Modal(this.app);
-			let choice: "auto" | "manual" | null = null; // Variable to store the choice
+			let choice: "auto" | "manual" | null = null;
 
 			modal.titleEl.setText("Manual Split Markers Detected");
 			modal.contentEl.createEl("p", {
@@ -987,7 +1007,7 @@ export default class GatedNotesPlugin extends Plugin {
 			new ButtonComponent(buttonContainer)
 				.setButtonText("Cancel")
 				.onClick(() => {
-					choice = null; // Set choice
+					choice = null;
 					modal.close();
 				});
 
@@ -995,7 +1015,7 @@ export default class GatedNotesPlugin extends Plugin {
 				.setButtonText("Ignore and Auto-Split")
 				.setWarning()
 				.onClick(() => {
-					choice = "auto"; // Set choice
+					choice = "auto";
 					modal.close();
 				});
 
@@ -1003,7 +1023,7 @@ export default class GatedNotesPlugin extends Plugin {
 				.setButtonText("Use Manual Breaks")
 				.setCta()
 				.onClick(() => {
-					choice = "manual"; // Set choice
+					choice = "manual";
 					modal.close();
 				});
 
@@ -1036,7 +1056,7 @@ export default class GatedNotesPlugin extends Plugin {
 			const imageRegex = /!\[\[([^\]]+)\]\]/g;
 			const imageDb = await this.getImageDb();
 
-			// --- MODIFIED: Loop through paragraphs to get context ---
+			// Iterate through paragraphs to find images and their text context.
 			for (const para of paragraphs) {
 				let match;
 				while ((match = imageRegex.exec(para.markdown)) !== null) {
@@ -1058,9 +1078,8 @@ export default class GatedNotesPlugin extends Plugin {
 
 						let analysisEntry = imageDb[hash];
 
-						// --- MODIFIED: Re-analyze if the entry or its analysis is missing ---
+						// Analyze the image if it hasn't been analyzed before or if its analysis is missing.
 						if (!analysisEntry || !analysisEntry.analysis) {
-							// Pass the paragraph's markdown as context
 							const newAnalysis = await this.analyzeImage(
 								imageFile,
 								para.markdown
@@ -1086,7 +1105,6 @@ export default class GatedNotesPlugin extends Plugin {
 				}
 			}
 		}
-		// --- END MODIFICATION ---
 
 		if (!plainTextForLlm.trim()) {
 			new Notice(
@@ -1105,13 +1123,11 @@ export default class GatedNotesPlugin extends Plugin {
 				simplifiedCards
 			)}\n\n`;
 		}
-	
-		// --- MODIFICATION START ---
+
 		const guidancePrompt = customGuidance
 			? `**User's Custom Instructions:**\n${customGuidance}`
 			: "";
-		// --- MODIFICATION END ---
-	
+
 		const initialPrompt = `Create ${count} new, distinct Anki-style flashcards from the following article. The article may contain text and special image placeholders of the format [[IMAGE: HASH=... DESCRIPTION=...]].
 	
 ${guidancePrompt}
@@ -1128,7 +1144,6 @@ ${guidancePrompt}
 
 ${contextPrompt}Here is the article:
 ${plainTextForLlm}`;
-		// --- END MODIFICATION ---
 
 		notice.setMessage(`🤖 Generating ${count} flashcard(s)...`);
 		const response = await this.sendToLlm(initialPrompt);
@@ -1138,7 +1153,6 @@ ${plainTextForLlm}`;
 			return;
 		}
 
-		// ... (The rest of the function remains the same)
 		const generatedItems = this.parseLlmResponse(response, file.path);
 		const goodCards: Flashcard[] = [];
 		let cardsToFix: Omit<Flashcard, "id" | "paraIdx" | "review_history">[] =
@@ -1443,6 +1457,38 @@ ${selection}
 		});
 	}
 
+	/**
+	 * Refreshes all reading views to update gating, but preserves the scroll
+	 * position of the currently active view.
+	 */
+	public async refreshReadingAndPreserveScroll(): Promise<void> {
+		const mdView = this.app.workspace.getActiveViewOfType(MarkdownView);
+
+		if (!mdView) {
+			this.refreshReading();
+			return;
+		}
+
+		// 1. Get the current scroll position.
+		const state = mdView.getEphemeralState();
+		this.logger(LogLevel.VERBOSE, "Preserving scroll state", state);
+
+		// 2. Trigger the hard refresh that causes the view to re-render.
+		this.refreshReading();
+
+		// 3. Restore the scroll position after a short delay to allow Obsidian's
+		//    internal view state to update after the rerender.
+		setTimeout(() => {
+			// Re-fetch the active view to ensure we have the current reference.
+			let newMdView =
+				this.app.workspace.getActiveViewOfType(MarkdownView);
+			if (newMdView) {
+				newMdView.setEphemeralState(state);
+				this.logger(LogLevel.VERBOSE, "Restored scroll state");
+			}
+		}, 50);
+	}
+
 	private registerGatingProcessor(): void {
 		this.registerMarkdownPostProcessor(
 			async (el: HTMLElement, ctx: MarkdownPostProcessorContext) => {
@@ -1478,7 +1524,10 @@ ${selection}
 					const graph = await this.readDeck(deckPath);
 
 					const blockedCards = Object.values(graph).filter(
-						(c) => c.chapter === chapterPath && c.blocked && !c.suspended
+						(c) =>
+							c.chapter === chapterPath &&
+							c.blocked &&
+							!c.suspended
 					);
 					const firstBlockedParaIdx =
 						blockedCards.length > 0
@@ -1598,7 +1647,6 @@ ${selection}
 					if (imgContainerEl) {
 						imgContainerEl.scrollIntoView({
 							behavior: "smooth",
-							block: "center",
 						});
 						imgContainerEl.classList.add("gn-flash");
 						setTimeout(
@@ -1615,7 +1663,9 @@ ${selection}
 					LogLevel.NORMAL,
 					`Could not find specific image element for tag: ${card.tag}. Flashing paragraph.`
 				);
-				wrapper.scrollIntoView({ behavior: "smooth", block: "center" });
+				wrapper.scrollIntoView({
+					behavior: "smooth",
+				});
 				wrapper.classList.add("gn-flash");
 				setTimeout(() => wrapper.classList.remove("gn-flash"), 1200);
 			}
@@ -1625,7 +1675,9 @@ ${selection}
 				const mark = document.createElement("mark");
 				mark.className = "gn-flash";
 				range.surroundContents(mark);
-				mark.scrollIntoView({ behavior: "smooth", block: "center" });
+				mark.scrollIntoView({
+					behavior: "smooth",
+				});
 
 				setTimeout(() => {
 					const parent = mark.parentNode;
@@ -1642,7 +1694,9 @@ ${selection}
 						(e as Error).message
 					}. Flashing paragraph as fallback.`
 				);
-				wrapper.scrollIntoView({ behavior: "smooth", block: "center" });
+				wrapper.scrollIntoView({
+					behavior: "smooth",
+				});
 				wrapper.classList.add("gn-flash");
 				setTimeout(() => wrapper.classList.remove("gn-flash"), 1200);
 			}
@@ -1655,45 +1709,85 @@ ${selection}
 		const styleEl = document.createElement("style");
 		styleEl.id = styleId;
 		styleEl.textContent = `
-              .gn-sentinel { display: none; }
-              .gn-hidden { filter: blur(5px); background: var(--background-secondary); position: relative; overflow: hidden; padding: 0.1px 0; }
-              .gn-hidden::after { content: "🔒 Unlock by answering earlier cards"; position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; font-weight: bold; color: var(--text-muted); }
-              .gn-blocked::before, .gn-due::before, .gn-done::before { margin-right: 4px; font-size: 0.9em; }
-              .gn-blocked::before { content: "${ICONS.blocked}"; }
-              .gn-due::before { content: "${ICONS.due}"; }
-              .gn-done::before { content: "${ICONS.done}"; }
-              .gn-flash, .gn-flash mark { background-color: var(--text-highlight-bg) !important; transition: background-color 1s ease-out; }
-			  .gn-unlocked-flash { background-color: rgba(0, 255, 0, 0.3) !important; transition: background-color 1.2s ease-out; }
-			  .gn-edit-nav { display: flex; border-bottom: 1px solid var(--background-modifier-border); margin-bottom: 1rem; }
-			  .gn-edit-nav button { background: none; border: none; padding: 0.5rem 1rem; cursor: pointer; border-bottom: 2px solid transparent; }
-			  .gn-edit-nav button.active { border-bottom-color: var(--interactive-accent); font-weight: 600; color: var(--text-normal); }
-			  .gn-edit-pane .setting-item { border: none; padding-block: 0.5rem; }
-              .gn-edit-row { display: flex; gap: 0.5rem; align-items: flex-start; margin-block: 0.4rem; }
-              .gn-edit-row > label { min-width: 5rem; font-weight: 600; padding-top: 0.5rem; }
-              .gn-edit-row textarea, .gn-edit-row input { flex: 1; width: 100%; }
-              .gn-edit-row textarea { resize: vertical; font-family: var(--font-text); }
-              .gn-edit-btnrow { display: flex; gap: 0.5rem; margin-top: 0.8rem; justify-content: flex-end; }
-              .gn-browser { width: 60vw; height: 70vh; min-height: 20rem; min-width: 32rem; resize: both; display: flex; flex-direction: column; }
-              .gn-body { flex: 1; display: flex; overflow: hidden; }
-              .gn-tree { width: 40%; padding-right: .75rem; border-right: 1px solid var(--background-modifier-border); overflow-y: auto; overflow-x: hidden; }
-              .gn-node > summary { cursor: pointer; font-weight: 600; }
-              .gn-chap { margin-left: 1.2rem; cursor: pointer; }
-              .gn-chap:hover { text-decoration: underline; }
-              .gn-editor { flex: 1; padding-left: .75rem; overflow-y: auto; overflow-x: hidden; }
-              .gn-cardrow { position: relative; margin: .15rem 0; padding-right: 2.8rem; cursor: pointer; width: 100%; border-radius: var(--radius-s); padding-left: 4px; }
-              .gn-cardrow:hover { background: var(--background-secondary-hover); }
-              .gn-trash { position: absolute; right: 0.5rem; top: 50%; transform: translateY(-50%); cursor: pointer; opacity: .6; }
-              .gn-trash:hover { opacity: 1; }
-              .gn-info { position: absolute; right: 2rem; top: 50%; transform: translateY(-50%); cursor: pointer; opacity: .6; }
-              .gn-info:hover { opacity: 1; }
-              .gn-ease-buttons, .gn-action-bar { display: flex; flex-wrap: wrap; gap: 0.5rem; justify-content: center; margin-top: 0.5rem; }
-              .gn-ease-buttons button { flex-grow: 1; }
-              .gn-info-grid { display: grid; grid-template-columns: 120px 1fr; gap: 0.5rem; margin-bottom: 1rem; }
-              .gn-info-table-wrapper { max-height: 200px; overflow-y: auto; }
-              .gn-info-table { width: 100%; text-align: left; }
-              .gn-info-table th { border-bottom: 1px solid var(--background-modifier-border); }
-              .gn-info-table td { padding-top: 4px; }
-            `;
+			.gn-sentinel { display: none; }
+			.gn-hidden { filter: blur(5px); background: var(--background-secondary); position: relative; overflow: hidden; padding: 0.1px 0; }
+			.gn-hidden::after { content: "🔒 Unlock by answering earlier cards"; position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; font-weight: bold; color: var(--text-muted); }
+			.gn-blocked::before, .gn-due::before, .gn-done::before { margin-right: 4px; font-size: 0.9em; }
+			.gn-blocked::before { content: "${ICONS.blocked}"; }
+			.gn-due::before { content: "${ICONS.due}"; }
+			.gn-done::before { content: "${ICONS.done}"; }
+			.gn-flash, .gn-flash mark { background-color: var(--text-highlight-bg) !important; transition: background-color 1s ease-out; }
+			.gn-unlocked-flash { background-color: rgba(0, 255, 0, 0.3) !important; transition: background-color 1.2s ease-out; }
+			.gn-edit-nav { display: flex; border-bottom: 1px solid var(--background-modifier-border); margin-bottom: 1rem; }
+			.gn-edit-nav button { background: none; border: none; padding: 0.5rem 1rem; cursor: pointer; border-bottom: 2px solid transparent; }
+			.gn-edit-nav button.active { border-bottom-color: var(--interactive-accent); font-weight: 600; color: var(--text-normal); }
+			.gn-edit-pane .setting-item { border: none; padding-block: 0.5rem; }
+			.gn-edit-row { display: flex; gap: 0.5rem; align-items: flex-start; margin-block: 0.4rem; }
+			.gn-edit-row > label { min-width: 5rem; font-weight: 600; padding-top: 0.5rem; }
+			.gn-edit-row textarea, .gn-edit-row input { flex: 1; width: 100%; }
+			.gn-edit-row textarea { resize: vertical; font-family: var(--font-text); }
+			.gn-edit-btnrow { display: flex; gap: 0.5rem; margin-top: 0.8rem; justify-content: flex-end; }
+			
+			/* Fixed modal structure styles */
+			.gn-browser { 
+				width: 60vw; 
+				height: 70vh; 
+				min-height: 20rem; 
+				min-width: 32rem; 
+				resize: both; 
+				display: flex; 
+				flex-direction: column; 
+			}
+			.gn-browser .modal-content {
+				display: flex;
+				flex-direction: column;
+				height: 100%;
+				overflow: hidden; /* Prevent modal content from scrolling */
+			}
+			.gn-header {
+				flex-shrink: 0; /* Keep header fixed size */
+				border-bottom: 1px solid var(--background-modifier-border);
+				padding-bottom: 0.5rem;
+				margin-bottom: 0.5rem;
+			}
+			.gn-body { 
+				flex: 1; 
+				display: flex; 
+				overflow: hidden; /* Important: prevent body from scrolling */
+				min-height: 0; /* Allow flex item to shrink below content size */
+			}
+			.gn-tree { 
+				width: 40%; 
+				padding-right: .75rem; 
+				border-right: 1px solid var(--background-modifier-border); 
+				overflow-y: auto; 
+				overflow-x: hidden; 
+			}
+			.gn-editor { 
+				flex: 1; 
+				padding-left: .75rem; 
+				overflow-y: auto; 
+				overflow-x: hidden; 
+			}
+			
+			/* Rest of styles remain the same */
+			.gn-node > summary { cursor: pointer; font-weight: 600; }
+			.gn-chap { margin-left: 1.2rem; cursor: pointer; }
+			.gn-chap:hover { text-decoration: underline; }
+			.gn-cardrow { position: relative; margin: .15rem 0; padding-right: 2.8rem; cursor: pointer; width: 100%; border-radius: var(--radius-s); padding-left: 4px; }
+			.gn-cardrow:hover { background: var(--background-secondary-hover); }
+			.gn-trash { position: absolute; right: 0.5rem; top: 50%; transform: translateY(-50%); cursor: pointer; opacity: .6; }
+			.gn-trash:hover { opacity: 1; }
+			.gn-info { position: absolute; right: 2rem; top: 50%; transform: translateY(-50%); cursor: pointer; opacity: .6; }
+			.gn-info:hover { opacity: 1; }
+			.gn-ease-buttons, .gn-action-bar { display: flex; flex-wrap: wrap; gap: 0.5rem; justify-content: center; margin-top: 0.5rem; }
+			.gn-ease-buttons button { flex-grow: 1; }
+			.gn-info-grid { display: grid; grid-template-columns: 120px 1fr; gap: 0.5rem; margin-bottom: 1rem; }
+			.gn-info-table-wrapper { max-height: 200px; overflow-y: auto; }
+			.gn-info-table { width: 100%; text-align: left; }
+			.gn-info-table th { border-bottom: 1px solid var(--background-modifier-border); }
+			.gn-info-table td { padding-top: 4px; }
+		`;
 		document.head.appendChild(styleEl);
 		this.register(() => styleEl.remove());
 	}
@@ -1887,6 +1981,17 @@ ${selection}
 		}
 	}
 
+	public resetCardProgress(card: Flashcard): void {
+		card.status = "new";
+		card.last_reviewed = null;
+		card.interval = 0;
+		card.ease_factor = 2.5;
+		card.due = Date.now();
+		card.blocked = true;
+		card.review_history = [];
+		delete card.learning_step_index;
+	}
+
 	private async deleteChapterCards(file: TFile): Promise<void> {
 		const deckPath = getDeckPathForChapter(file.path);
 		if (!(await this.app.vault.adapter.exists(deckPath))) {
@@ -1979,7 +2084,7 @@ ${selection}
 	}
 
 	// ===========================
-	// --- IMAGE UTILITIES ---
+	// Image Utilities
 	// ===========================
 
 	private async removeNoteImageAnalysis(file: TFile): Promise<void> {
@@ -2089,7 +2194,7 @@ ${selection}
 
 	private async analyzeImage(
 		imageFile: TFile,
-		textContext?: string // MODIFIED: Accept optional text context
+		textContext?: string
 	): Promise<ImageAnalysis | null> {
 		const notice = new Notice(
 			`🤖 Analyzing image: ${imageFile.name}...`,
@@ -2103,7 +2208,6 @@ ${selection}
 				.replace("jpg", "jpeg");
 			const imageUrl = `data:image/${fileExtension};base64,${base64Image}`;
 
-			// --- MODIFIED: New, more powerful prompt ---
 			const contextInstruction = textContext
 				? `Use the following text context to inform your analysis, especially for identifying people, places, or specific concepts:\n---TEXT CONTEXT---\n${textContext}\n--------------------`
 				: "Analyze the image based on its visual content alone.";
@@ -2125,7 +2229,6 @@ ${selection}
 		- \`context\`: A string explaining the historical, cultural, or technical context, informed by the provided text.
 	
 	Your final output must be ONLY the JSON object.`;
-			// --- END MODIFICATION ---
 
 			const response = await this.sendToLlm(prompt, imageUrl);
 			if (!response) throw new Error("LLM returned an empty response.");
@@ -2255,11 +2358,51 @@ ${selection}
 						new ButtonComponent(easeButtonContainer)
 							.setButtonText(lbl)
 							.onClick(async () => {
-								const graph = await this.readDeck(deck.path);
-								this.applySm2(card, lbl);
-								graph[card.id] = card;
-								await this.writeDeck(deck.path, graph);
-								this.refreshReading();
+								const deckPath = getDeckPathForChapter(
+									card.chapter
+								);
+								const graph = await this.readDeck(deckPath);
+								const cardInGraph = graph[card.id];
+
+								if (!cardInGraph) {
+									modal.close();
+									return;
+								}
+
+								// Get the gate's position before applying the review.
+								const gateBefore =
+									await this.getFirstBlockedParaIndex(
+										card.chapter,
+										graph
+									);
+
+								// Apply the SM-2 algorithm to update the card state.
+								this.applySm2(cardInGraph, lbl);
+
+								// Get the gate's position after the review.
+								const gateAfter =
+									await this.getFirstBlockedParaIndex(
+										card.chapter,
+										graph
+									);
+
+								// Save the updated graph to disk.
+								await this.writeDeck(deckPath, graph);
+
+								// Refresh the reading view only if the gate has moved.
+								if (gateBefore !== gateAfter) {
+									this.logger(
+										LogLevel.VERBOSE,
+										`Gate moved from ${gateBefore} to ${gateAfter}. Refreshing view.`
+									);
+									await this.refreshReadingAndPreserveScroll();
+								} else {
+									this.logger(
+										LogLevel.VERBOSE,
+										`Gate unchanged at ${gateBefore}. Skipping view refresh.`
+									);
+								}
+
 								state = lbl === "Again" ? "again" : "answered";
 								modal.close();
 							});
@@ -2278,13 +2421,18 @@ ${selection}
 					const cardInGraph = graph[card.id];
 					if (cardInGraph) {
 						cardInGraph.flagged = !cardInGraph.flagged;
-						card.flagged = cardInGraph.flagged; // Sync state
+						card.flagged = cardInGraph.flagged; // Sync local state
 						await this.writeDeck(deck.path, graph);
-						new Notice(cardInGraph.flagged ? "Card flagged." : "Flag removed.");
-						flagBtn.buttonEl.style.color = cardInGraph.flagged ? "var(--text-warning)" : "";
+						new Notice(
+							cardInGraph.flagged
+								? "Card flagged."
+								: "Flag removed."
+						);
+						flagBtn.buttonEl.style.color = cardInGraph.flagged
+							? "var(--text-warning)"
+							: "";
 					}
 				});
-			// Set initial state of the flag button
 			if (card.flagged) {
 				flagBtn.buttonEl.style.color = "var(--text-warning)";
 			}
@@ -2297,7 +2445,7 @@ ${selection}
 						const graph = await this.readDeck(deck.path);
 						delete graph[card.id];
 						await this.writeDeck(deck.path, graph);
-						this.refreshReading();
+						this.refreshReadingAndPreserveScroll();
 						state = "answered";
 						modal.close();
 					}
@@ -2314,15 +2462,19 @@ ${selection}
 				.setIcon("ban")
 				.setTooltip("Suspend card from reviews")
 				.onClick(async () => {
-					if (confirm("Suspend this card? You can unsuspend it later from the Card Browser or Edit menu.")) {
+					if (
+						confirm(
+							"Suspend this card? You can unsuspend it later from the Card Browser or Edit menu."
+						)
+					) {
 						const graph = await this.readDeck(deck.path);
 						const cardInGraph = graph[card.id];
 						if (cardInGraph) {
 							cardInGraph.suspended = true;
 							await this.writeDeck(deck.path, graph);
-							this.refreshReading();
+							this.refreshReadingAndPreserveScroll();
 							new Notice("Card suspended.");
-							state = "answered"; // Treat as answered to continue the session
+							state = "answered";
 							modal.close();
 						}
 					}
@@ -2346,7 +2498,7 @@ ${selection}
 					graph[card.id].due =
 						Date.now() + this.settings.buryDelayHours * 3_600_000;
 					await this.writeDeck(deck.path, graph);
-					this.refreshReading();
+					this.refreshReadingAndPreserveScroll();
 					state = "answered";
 					modal.close();
 				});
@@ -2663,32 +2815,25 @@ ${selection}
 		}
 	}
 
-	private getLastVisibleParaIndex(): number {
-		const mdView = this.app.workspace.getActiveViewOfType(MarkdownView);
-		// Ensure we are in preview mode, otherwise we can't check visibility.
-		if (!mdView || mdView.getMode() !== "preview") {
-			return 0;
-		}
+	private async getFirstBlockedParaIndex(
+		chapterPath: string,
+		graphToUse?: FlashcardGraph
+	): Promise<number> {
+		// If a pre-loaded graph is provided, use it. Otherwise, read from the vault.
+		const graph =
+			graphToUse ??
+			(await this.readDeck(getDeckPathForChapter(chapterPath)));
 
-		// Get all paragraph elements that are NOT hidden.
-		const visibleParagraphs = Array.from(
-			mdView.previewMode.containerEl.querySelectorAll<HTMLElement>(
-				`.${PARA_CLASS}:not(.gn-hidden)`
-			)
+		const blockedCards = Object.values(graph).filter(
+			(c) => c.chapter === chapterPath && c.blocked && !c.suspended
 		);
 
-		if (visibleParagraphs.length === 0) {
-			return 0;
+		if (blockedCards.length === 0) {
+			return Infinity; // Represents a fully unlocked chapter.
 		}
 
-		// Find the highest data-para-id among the visible paragraphs.
-		const lastVisibleId = Math.max(
-			...visibleParagraphs.map((p) =>
-				Number(p.getAttribute(PARA_ID_ATTR) ?? 0)
-			)
-		);
-
-		return lastVisibleId;
+		// Return the lowest paragraph index among all blocked cards.
+		return Math.min(...blockedCards.map((c) => c.paraIdx ?? Infinity));
 	}
 
 	// =====================
@@ -2819,9 +2964,7 @@ ${selection}
 }
 
 // ===================================================================
-//
-//                          UI COMPONENT CLASSES
-//
+// UI COMPONENT CLASSES
 // ===================================================================
 
 class EditModal extends Modal {
@@ -2854,14 +2997,12 @@ class EditModal extends Modal {
 			attr: { style: "display: none;" },
 		});
 
-		// FIX: createRow now takes a parent element to attach to
 		const createRow = (label: string, parent: HTMLElement): HTMLElement => {
 			const row = parent.createDiv({ cls: "gn-edit-row" });
 			row.createEl("label", { text: label });
 			return row;
 		};
 
-		// FIX: All inputs are now correctly parented to 'editPane'
 		const frontInput = createRow("Front:", editPane).createEl("textarea", {
 			attr: { rows: 3 },
 		});
@@ -2891,17 +3032,17 @@ class EditModal extends Modal {
 				});
 			});
 
-		// --- MODIFICATION START ---
 		new Setting(editPane)
 			.setName("Suspend this card")
-			.setDesc("Temporarily remove this card from reviews and content gating.")
+			.setDesc(
+				"Temporarily remove this card from reviews and content gating."
+			)
 			.addToggle((toggle) => {
 				toggle.setValue(!!this.card.suspended).onChange((value) => {
 					this.card.suspended = value;
 				});
 			});
 
-		// FIX: Use .onclick for native HTML elements
 		editButton.onclick = () => {
 			editButton.addClass("active");
 			previewButton.removeClass("active");
@@ -2909,7 +3050,6 @@ class EditModal extends Modal {
 			previewPane.style.display = "none";
 		};
 
-		// FIX: Use .onclick for native HTML elements
 		previewButton.onclick = async () => {
 			previewButton.addClass("active");
 			editButton.removeClass("active");
@@ -2921,7 +3061,6 @@ class EditModal extends Modal {
 			const previewBackContainer = previewPane.createDiv();
 
 			previewFrontContainer.createEl("h4", { text: "Front Preview" });
-			// FIX: This call now works because renderCardContent is public
 			await this.plugin.renderCardContent(
 				frontInput.value,
 				previewFrontContainer,
@@ -2938,6 +3077,30 @@ class EditModal extends Modal {
 		};
 
 		const btnRow = this.contentEl.createDiv({ cls: "gn-edit-btnrow" });
+
+		new ButtonComponent(btnRow)
+			.setButtonText("Reset Progress")
+			.setWarning()
+			.onClick(async () => {
+				if (
+					!confirm(
+						"Are you sure you want to reset the review progress for this card? This cannot be undone."
+					)
+				) {
+					return;
+				}
+
+				this.plugin.resetCardProgress(this.card);
+				this.graph[this.card.id] = this.card;
+				await this.plugin.writeDeck(this.deck.path, this.graph);
+
+				new Notice("Card progress has been reset.");
+				this.plugin.refreshReading();
+				this.plugin.refreshAllStatuses();
+
+				this.close();
+				this.onDone();
+			});
 
 		new ButtonComponent(btnRow)
 			.setButtonText("Refocus with AI")
@@ -3113,19 +3276,30 @@ class CardBrowser extends Modal {
 
 	constructor(
 		private plugin: GatedNotesPlugin,
+		private state: CardBrowserState,
 		private filter?: (card: Flashcard) => boolean
 	) {
 		super(plugin.app);
 	}
 
 	async onOpen() {
+		this.plugin.logger(
+			LogLevel.VERBOSE,
+			"CardBrowser: onOpen -> Initializing modal."
+		);
+		this.plugin.logger(
+			LogLevel.VERBOSE,
+			"CardBrowser: onOpen -> Received state:",
+			{ ...this.state, openSubjects: [...this.state.openSubjects] }
+		);
+
 		this.modalEl.addClass("gn-browser");
 		this.titleEl.setText(
 			this.filter ? "Card Browser (Filtered)" : "Card Browser"
 		);
 		makeModalDraggable(this, this.plugin);
 
-		const header = this.contentEl.createDiv();
+		const header = this.contentEl.createDiv({ cls: "gn-header" });
 		new Setting(header)
 			.setName("Show only flagged cards")
 			.addToggle((toggle) => {
@@ -3134,76 +3308,92 @@ class CardBrowser extends Modal {
 					await this.renderContent();
 				});
 			});
-		
-		// --- MODIFICATION START ---
+
 		new Setting(header)
 			.setName("Show only suspended cards")
 			.addToggle((toggle) => {
-				toggle.setValue(this.showOnlySuspended).onChange(async (value) => {
-					this.showOnlySuspended = value;
-					await this.renderContent();
-				});
+				toggle
+					.setValue(this.showOnlySuspended)
+					.onChange(async (value) => {
+						this.showOnlySuspended = value;
+						await this.renderContent();
+					});
 			});
 
 		const body = this.contentEl.createDiv({ cls: "gn-body" });
 		this.treePane = body.createDiv({ cls: "gn-tree" });
 		this.editorPane = body.createDiv({ cls: "gn-editor" });
 
+		this.treePane.addEventListener("scroll", () => {
+			this.state.treeScroll = this.treePane.scrollTop;
+			this.plugin.logger(
+				LogLevel.VERBOSE,
+				`CardBrowser: Scroll state updated -> Tree: ${this.state.treeScroll}`
+			);
+		});
+		this.editorPane.addEventListener("scroll", () => {
+			this.state.editorScroll = this.editorPane.scrollTop;
+			this.plugin.logger(
+				LogLevel.VERBOSE,
+				`CardBrowser: Scroll state updated -> Editor: ${this.state.editorScroll}`
+			);
+		});
+
 		await this.renderContent();
 	}
 
 	async renderContent() {
+		this.plugin.logger(
+			LogLevel.VERBOSE,
+			"CardBrowser: renderContent -> Starting render."
+		);
 		this.treePane.empty();
 		this.editorPane.empty();
 		this.editorPane.setText("← Choose a chapter to view its cards");
 
-		// FIX: Use an arrow function to preserve 'this' context
 		const showCardsForChapter = async (
 			deck: TFile,
 			chapterPath: string
 		) => {
+			this.state.activeChapterPath = chapterPath;
+			this.plugin.logger(
+				LogLevel.VERBOSE,
+				`CardBrowser: showCardsForChapter -> Active chapter state updated to '${chapterPath}'`
+			);
+
+			this.treePane
+				.querySelectorAll(".gn-chap.is-active")
+				.forEach((el) => el.removeClass("is-active"));
+			this.treePane
+				.querySelector(`[data-chapter-path="${chapterPath}"]`)
+				?.addClass("is-active");
+
 			this.editorPane.empty();
 			const graph = await this.plugin.readDeck(deck.path);
 			let cards: Flashcard[] = Object.values(graph).filter(
 				(c) => c.chapter === chapterPath
 			);
 
-			if (this.filter) {
-				cards = cards.filter(this.filter);
-			}
-			if (this.showOnlyFlagged) {
-				cards = cards.filter((c) => c.flagged);
-			}
-			// --- MODIFICATION START ---
-			if (this.showOnlySuspended) {
+			if (this.filter) cards = cards.filter(this.filter);
+			if (this.showOnlyFlagged) cards = cards.filter((c) => c.flagged);
+			if (this.showOnlySuspended)
 				cards = cards.filter((c) => c.suspended);
-			}
 
 			if (!cards.length) {
-				this.editorPane.setText(
-					"No cards in this chapter match the current filter."
-				);
+				this.editorPane.setText("No cards match the current filter.");
 				return;
 			}
-
 			cards.sort(
 				(a, b) => (a.paraIdx ?? Infinity) - (b.paraIdx ?? Infinity)
 			);
 
 			for (const card of cards) {
 				const row = this.editorPane.createDiv({ cls: "gn-cardrow" });
-				
-				// --- MODIFICATION START: Add suspended indicator ---
 				let cardLabel = card.front || "(empty front)";
-				if (card.suspended) {
-					cardLabel = `⏸️ ${cardLabel}`;
-				}
-				if (card.flagged) {
-					cardLabel = `🚩 ${cardLabel}`;
-				}
-				// --- MODIFICATION END ---
-				
+				if (card.suspended) cardLabel = `⏸️ ${cardLabel}`;
+				if (card.flagged) cardLabel = `🚩 ${cardLabel}`;
 				row.setText(cardLabel);
+
 				row.onclick = () => {
 					this.plugin.openEditModal(card, graph, deck, async () => {
 						await this.renderContent();
@@ -3216,15 +3406,17 @@ class CardBrowser extends Modal {
 					ev.stopPropagation();
 					new CardInfoModal(this.plugin.app, card).open();
 				};
-				row.createEl("span", { text: "🗑️", cls: "gn-trash" }).onclick =
-					async (ev) => {
-						ev.stopPropagation();
-						if (!confirm("Delete this card permanently?")) return;
-						delete graph[card.id];
-						await this.plugin.writeDeck(deck.path, graph);
-						this.plugin.refreshAllStatuses();
-						await this.renderContent();
-					};
+				row.createEl("span", {
+					text: "🗑️",
+					cls: "gn-trash",
+				}).onclick = async (ev) => {
+					ev.stopPropagation();
+					if (!confirm("Delete this card permanently?")) return;
+					delete graph[card.id];
+					await this.plugin.writeDeck(deck.path, graph);
+					this.plugin.refreshAllStatuses();
+					await this.renderContent();
+				};
 			}
 		};
 
@@ -3235,26 +3427,42 @@ class CardBrowser extends Modal {
 		for (const deck of decks) {
 			const graph = await this.plugin.readDeck(deck.path);
 			let cardsInDeck = Object.values(graph);
-
-			if (this.filter) {
-				cardsInDeck = cardsInDeck.filter(this.filter);
-			}
-			if (this.showOnlyFlagged) {
+			if (this.filter) cardsInDeck = cardsInDeck.filter(this.filter);
+			if (this.showOnlyFlagged)
 				cardsInDeck = cardsInDeck.filter((c) => c.flagged);
-			}
-			// --- MODIFICATION START ---
-			if (this.showOnlySuspended) {
+			if (this.showOnlySuspended)
 				cardsInDeck = cardsInDeck.filter((c) => c.suspended);
-			}
-
 			if (cardsInDeck.length === 0) continue;
 
 			const subject = deck.path.split("/")[0] || "Vault Root";
+
+			const shouldBeOpen =
+				this.state.isFirstRender || this.state.openSubjects.has(subject);
+			this.plugin.logger(
+				LogLevel.VERBOSE,
+				`CardBrowser: renderContent -> Subject '${subject}' should be open: ${shouldBeOpen} (isFirstRender: ${this.state.isFirstRender})`
+			);
+
 			const subjectEl = this.treePane.createEl("details", {
 				cls: "gn-node",
-				attr: { open: true },
 			});
+			subjectEl.open = shouldBeOpen;
+
 			subjectEl.createEl("summary", { text: subject });
+
+			subjectEl.addEventListener("toggle", () => {
+				if (subjectEl.open) this.state.openSubjects.add(subject);
+				else this.state.openSubjects.delete(subject);
+				this.plugin.logger(
+					LogLevel.VERBOSE,
+					`CardBrowser: Subject toggle -> '${subject}' is now ${
+						subjectEl.open ? "open" : "closed"
+					}. New state:`,
+					[...this.state.openSubjects]
+				);
+			});
+
+			if (this.state.isFirstRender) this.state.openSubjects.add(subject);
 
 			const chaptersInSubject = new Map<string, number>();
 			for (const c of cardsInDeck) {
@@ -3267,7 +3475,6 @@ class CardBrowser extends Modal {
 			const sortedChapters = [...chaptersInSubject.entries()].sort(
 				(a, b) => a[0].localeCompare(b[0])
 			);
-
 			for (const [chapterPath, count] of sortedChapters) {
 				const chapterName =
 					chapterPath.split("/").pop()?.replace(/\.md$/, "") ??
@@ -3276,13 +3483,65 @@ class CardBrowser extends Modal {
 					.createEl("div", {
 						cls: "gn-chap",
 						text: `${count} card(s) • ${chapterName}`,
+						attr: { "data-chapter-path": chapterPath },
 					})
 					.onclick = () => showCardsForChapter(deck, chapterPath);
 			}
 		}
+
+		if (this.state.isFirstRender) {
+			this.plugin.logger(
+				LogLevel.VERBOSE,
+				"CardBrowser: renderContent -> First render complete, setting flag to false."
+			);
+			this.state.isFirstRender = false;
+		}
+
+		// Restore the view using the persistent state.
+		if (this.state.activeChapterPath) {
+			this.plugin.logger(
+				LogLevel.VERBOSE,
+				`CardBrowser: renderContent -> Attempting to restore active chapter: '${this.state.activeChapterPath}'`
+			);
+			const activeChapterDeck = decks.find(
+				(d) =>
+					getDeckPathForChapter(this.state.activeChapterPath!) ===
+					d.path
+			);
+			if (activeChapterDeck) {
+				await showCardsForChapter(
+					activeChapterDeck,
+					this.state.activeChapterPath
+				);
+			} else {
+				this.plugin.logger(
+					LogLevel.VERBOSE,
+					"CardBrowser: renderContent -> ...deck not found for active chapter."
+				);
+			}
+		}
+
+		// Use setTimeout to apply scroll after the DOM has fully rendered.
+		setTimeout(() => {
+			this.plugin.logger(
+				LogLevel.VERBOSE,
+				`CardBrowser: renderContent -> Applying scroll positions in setTimeout -> Tree: ${this.state.treeScroll}, Editor: ${this.state.editorScroll}`
+			);
+			this.treePane.scrollTop = this.state.treeScroll;
+			this.editorPane.scrollTop = this.state.editorScroll;
+		}, 0);
 	}
 
 	onClose() {
+		this.plugin.logger(
+			LogLevel.VERBOSE,
+			"CardBrowser: onClose -> Closing modal."
+		);
+		this.plugin.logger(
+			LogLevel.VERBOSE,
+			"CardBrowser: onClose -> Final state on close:",
+			{ ...this.state, openSubjects: [...this.state.openSubjects] }
+		);
 		this.contentEl.empty();
 	}
 }
@@ -3463,7 +3722,6 @@ class GenerateAdditionalCardsModal extends Modal {
 				toggle.setValue(true);
 			});
 
-		// --- MODIFICATION START ---
 		const guidanceContainer = this.contentEl.createDiv();
 		const addGuidanceBtn = new ButtonComponent(guidanceContainer)
 			.setButtonText("Add Custom Guidance")
@@ -3471,7 +3729,9 @@ class GenerateAdditionalCardsModal extends Modal {
 				addGuidanceBtn.buttonEl.style.display = "none";
 				new Setting(guidanceContainer)
 					.setName("Custom Guidance")
-					.setDesc("Provide specific instructions for this generation task.")
+					.setDesc(
+						"Provide specific instructions for this generation task."
+					)
 					.addTextArea((text) => {
 						this.guidanceInput = text;
 						text.setPlaceholder("Your custom instructions...");
@@ -3479,8 +3739,6 @@ class GenerateAdditionalCardsModal extends Modal {
 						text.inputEl.style.width = "100%";
 					});
 			});
-		// --- MODIFICATION END ---
-
 
 		new Setting(this.contentEl)
 			.addButton((button) =>
@@ -3576,7 +3834,7 @@ class GNSettingsTab extends PluginSettingTab {
 		containerEl.empty();
 		containerEl.createEl("h2", { text: "Gated Notes Settings" });
 
-		// --- AI Provider Section ---
+		// AI Provider Section
 		new Setting(containerEl).setName("AI Provider").setHeading();
 		new Setting(containerEl)
 			.setName("API Provider")
@@ -3630,7 +3888,7 @@ class GNSettingsTab extends PluginSettingTab {
 						});
 				});
 		} else {
-			// This is the LM Studio block
+			// LM Studio Settings
 			new Setting(containerEl)
 				.setName("LM Studio Server URL")
 				.addText((text) =>
@@ -3688,7 +3946,7 @@ class GNSettingsTab extends PluginSettingTab {
 					})
 			);
 
-		// --- Card Generation Section ---
+		// Card Generation Section
 		new Setting(containerEl).setName("Card Generation").setHeading();
 
 		new Setting(containerEl)
@@ -3735,7 +3993,6 @@ class GNSettingsTab extends PluginSettingTab {
 					.onChange(async (value) => {
 						this.plugin.settings.autoCorrectTags = value;
 						await this.plugin.saveSettings();
-						// --- NEW: Re-render to show/hide the retries setting ---
 						this.display();
 					})
 			);
@@ -3763,7 +4020,7 @@ class GNSettingsTab extends PluginSettingTab {
 				);
 		}
 
-		// --- Spaced Repetition Section ---
+		// Spaced Repetition Section
 		new Setting(containerEl).setName("Spaced Repetition").setHeading();
 		this.createNumericArraySetting(
 			containerEl,
@@ -3795,7 +4052,7 @@ class GNSettingsTab extends PluginSettingTab {
 					})
 			);
 
-		// --- Content Gating Section ---
+		// Content Gating Section
 		new Setting(containerEl).setName("Content Gating").setHeading();
 		new Setting(containerEl)
 			.setName("Enable content gating")
@@ -3811,7 +4068,7 @@ class GNSettingsTab extends PluginSettingTab {
 					})
 			);
 
-		// --- Debugging Section ---
+		// Debugging Section
 		new Setting(containerEl).setName("Debugging").setHeading();
 		new Setting(containerEl)
 			.setName("Logging level")
@@ -3857,9 +4114,7 @@ class GNSettingsTab extends PluginSettingTab {
 }
 
 // ===================================================================
-//
-//                          UTILITY FUNCTIONS
-//
+// UTILITY FUNCTIONS
 // ===================================================================
 
 const isUnseen = (card: Flashcard): boolean =>
