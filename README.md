@@ -26,8 +26,10 @@ Instead of passively consuming information, you must _earn_ your way through a n
     -   **Auto-Correct Tags:** If the AI generates a tag that isn't a direct quote, it will automatically attempt to fix it.
 
 -   **Powerful Card Management:**
+    -   **Stateful Card Browser:** The browser remembers your scroll position, expanded folders, and last-viewed chapter between sessions.
     -   **Flag Cards:** Mark cards with a 🚩 to easily find and filter them in the Card Browser.
     -   **Suspend Cards:** Temporarily remove cards from review queues and content gating without deleting them.
+    -   **Reset Card Progress:** Reset individual cards back to "new" from the edit modal.
     -   **Card Preview:** See how your Markdown will render on the front and back of a card, right from the edit modal.
 
 -   **SM-2 Scheduling:** Built-in spaced repetition ensures maximum retention.
@@ -41,6 +43,7 @@ Instead of passively consuming information, you must _earn_ your way through a n
     -   Status bar due-card counter.
     -   File explorer icons showing chapter status (`⏳` blocked, `📆` due, `✅` done).
     -   Full card browser with filters for flagged or suspended cards.
+    -   Smooth scroll preservation after reviews.
 
 ---
 
@@ -100,7 +103,7 @@ Prepare the note for gating by converting paragraphs into trackable units. The p
 | :--- | :--- |
 | `Review due cards` | Starts a review session for the current mode. |
 | `Toggle content gating` | Enable/disable blur without changing settings. |
-| `Browse cards` | Open the Card Browser with filtering options. |
+| `Browse cards` | Open the stateful Card Browser with filtering options. |
 | `Finalize note (auto/manual)` | Prepare note for gating. |
 | `Un-finalize chapter` | Revert to plain Markdown, adding split markers between former paragraphs. |
 | `Remove all paragraph breakpoints` | Deletes all manual split markers from the current note. |
