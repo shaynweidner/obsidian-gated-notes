@@ -1,5 +1,3 @@
-// Gated Notes — Gated Reading & Spaced Repetition for Obsidian
-
 import {
 	App,
 	ButtonComponent,
@@ -25,10 +23,6 @@ import {
 
 import { Buffer } from "buffer";
 
-// ===================================================================
-// CONSTANTS & ENUMS
-// ===================================================================
-
 const DECK_FILE_NAME = "_flashcards.json";
 const SPLIT_TAG = '<div class="gn-split-placeholder"></div>';
 const PARA_CLASS = "gn-paragraph";
@@ -42,6 +36,12 @@ const ICONS = {
 	blocked: "⏳",
 	due: "📆",
 	done: "✅",
+};
+
+const HIGHLIGHT_COLORS = {
+	unlocked: "rgba(0, 255, 0, 0.3)",
+	context: "var(--text-highlight-bg)",
+	failed: "rgba(255, 0, 0, 0.3)",
 };
 
 enum StudyMode {
@@ -59,10 +59,6 @@ enum LogLevel {
 type CardRating = "Again" | "Hard" | "Good" | "Easy";
 type CardStatus = "new" | "learning" | "review" | "relearn";
 type ReviewResult = "answered" | "skip" | "abort" | "again";
-
-// ===================================================================
-// INTERFACES & TYPES
-// ===================================================================
 
 interface ReviewLog {
 	timestamp: number;
@@ -153,10 +149,6 @@ interface CardBrowserState {
 	isFirstRender: boolean;
 }
 
-// ===================================================================
-// MAIN PLUGIN CLASS
-// ===================================================================
-
 export default class GatedNotesPlugin extends Plugin {
 	settings!: Settings;
 	public lastModalTransform: string | null = null;
@@ -174,10 +166,6 @@ export default class GatedNotesPlugin extends Plugin {
 	private statusRefreshQueued = false;
 	private studyMode: StudyMode = StudyMode.CHAPTER;
 	private isRecalculatingAll = false;
-
-	// =====================
-	// Plugin Lifecycle
-	// =====================
 
 	async onload(): Promise<void> {
 		await this.loadSettings();
@@ -199,16 +187,6 @@ export default class GatedNotesPlugin extends Plugin {
 		});
 	}
 
-	// =====================
-	// Logging
-	// =====================
-
-	/**
-	 * Logs messages to the console based on the current logging level.
-	 * @param level The level of the message (NORMAL or VERBOSE).
-	 * @param message The primary message to log.
-	 * @param optionalParams Additional data to log.
-	 */
 	public logger(
 		level: LogLevel,
 		message: string,
@@ -224,10 +202,6 @@ export default class GatedNotesPlugin extends Plugin {
 		}
 	}
 
-	// =====================
-	// Setup & Registration
-	// =====================
-
 	private setupStatusBar(): void {
 		this.statusBar = this.addStatusBarItem();
 		this.gatingStatus = this.addStatusBarItem();
@@ -236,8 +210,11 @@ export default class GatedNotesPlugin extends Plugin {
 
 		this.cardsMissingParaIdxStatus = this.addStatusBarItem();
 		this.cardsMissingParaIdxStatus.onClickEvent(() => {
-			new CardBrowser(this, this.cardBrowserState, (card: Flashcard) =>
-				card.paraIdx === undefined || card.paraIdx === null
+			new CardBrowser(
+				this,
+				this.cardBrowserState,
+				(card: Flashcard) =>
+					card.paraIdx === undefined || card.paraIdx === null
 			).open();
 		});
 	}
@@ -619,10 +596,6 @@ export default class GatedNotesPlugin extends Plugin {
 		});
 	}
 
-	// =====================
-	// Spaced Repetition & Review
-	// =====================
-
 	private async reviewDue(): Promise<void> {
 		const activeFile = this.app.workspace.getActiveFile();
 		if (!activeFile) {
@@ -631,7 +604,6 @@ export default class GatedNotesPlugin extends Plugin {
 		}
 		const activePath = activeFile.path;
 
-		// Store the gate's position before the review session begins.
 		const gateBefore = await this.getFirstBlockedParaIndex(activePath);
 
 		const queue = await this.collectReviewPool(activePath);
@@ -654,11 +626,10 @@ export default class GatedNotesPlugin extends Plugin {
 			if (res === "again") {
 				new Notice("Last card failed. Jumping to context…");
 				reviewInterrupted = true;
-				await this.jumpToTag(card);
+				await this.jumpToTag(card, HIGHLIGHT_COLORS.failed);
 				break;
 			}
 
-			// If the gate has moved forward, end the review to show the new content.
 			const gateAfterLoop = await this.getFirstBlockedParaIndex(
 				activePath
 			);
@@ -667,7 +638,6 @@ export default class GatedNotesPlugin extends Plugin {
 			}
 		}
 
-		// Only show completion notices if the session wasn't interrupted.
 		if (reviewInterrupted) {
 			return;
 		}
@@ -677,48 +647,63 @@ export default class GatedNotesPlugin extends Plugin {
 		if (gateAfter > gateBefore) {
 			new Notice("✅ New content unlocked!");
 
-			// The paragraph to scroll to is the one that was just unlocked.
-			const targetParaIdx = gateBefore;
-
 			const leaf = this.app.workspace.getLeaf(false);
 			await leaf.openFile(activeFile, { state: { mode: "preview" } });
 
 			const mdView = this.app.workspace.getActiveViewOfType(MarkdownView);
 			if (!mdView) return;
 
-			// Find the line number of the target paragraph.
+			await this.findAndScrollToNextContentfulPara(
+				gateBefore,
+				mdView,
+				activeFile
+			);
+		} else {
+			new Notice("All reviews for this section are complete!");
+		}
+	}
+
+	private async findAndScrollToNextContentfulPara(
+		startIdx: number,
+		view: MarkdownView,
+		file: TFile
+	): Promise<void> {
+		const SEARCH_LIMIT = 10;
+
+		for (let i = 1; i <= SEARCH_LIMIT; i++) {
+			const currentParaIdx = startIdx + i;
+
 			const targetLine = await getLineForParagraph(
 				this,
-				activeFile,
-				targetParaIdx
+				file,
+				currentParaIdx
 			);
 
-			// Tell Obsidian to scroll its view to that line, forcing a render.
-			mdView.setEphemeralState({ scroll: targetLine });
+			view.setEphemeralState({ scroll: targetLine });
 
-			// Allow the DOM time to update after the scroll command.
-			await new Promise((resolve) => setTimeout(resolve, 100));
-
-			const paraSelector = `.${PARA_CLASS}[${PARA_ID_ATTR}="${targetParaIdx}"]`;
+			const paraSelector = `.${PARA_CLASS}[${PARA_ID_ATTR}="${currentParaIdx}"]`;
 			const wrapper = await waitForEl<HTMLElement>(
 				paraSelector,
-				mdView.previewMode.containerEl
+				view.previewMode.containerEl
 			);
 
-			if (wrapper) {
+			if (wrapper && wrapper.innerText.trim() !== "") {
 				wrapper.scrollIntoView({
 					behavior: "smooth",
-					block: "center",
 				});
 				wrapper.classList.add("gn-unlocked-flash");
 				setTimeout(
 					() => wrapper.classList.remove("gn-unlocked-flash"),
 					1500
 				);
+				return;
 			}
-		} else {
-			new Notice("All reviews for this section are complete!");
 		}
+
+		this.logger(
+			LogLevel.NORMAL,
+			`Could not find a non-empty paragraph to scroll to after index ${startIdx}.`
+		);
 	}
 
 	private async collectReviewPool(
@@ -863,10 +848,6 @@ export default class GatedNotesPlugin extends Plugin {
 		}
 		card.last_reviewed = new Date(now).toISOString();
 	}
-
-	// =====================
-	// Note Processing & Card Generation
-	// =====================
 
 	private async autoFinalizeNote(file: TFile): Promise<void> {
 		const content = await this.app.vault.read(file);
@@ -1056,7 +1037,6 @@ export default class GatedNotesPlugin extends Plugin {
 			const imageRegex = /!\[\[([^\]]+)\]\]/g;
 			const imageDb = await this.getImageDb();
 
-			// Iterate through paragraphs to find images and their text context.
 			for (const para of paragraphs) {
 				let match;
 				while ((match = imageRegex.exec(para.markdown)) !== null) {
@@ -1078,7 +1058,6 @@ export default class GatedNotesPlugin extends Plugin {
 
 						let analysisEntry = imageDb[hash];
 
-						// Analyze the image if it hasn't been analyzed before or if its analysis is missing.
 						if (!analysisEntry || !analysisEntry.analysis) {
 							const newAnalysis = await this.analyzeImage(
 								imageFile,
@@ -1213,7 +1192,17 @@ ${plainTextForLlm}`;
 			cardsToFix = stillUnfixed;
 		}
 
-		if (goodCards.length > 0) await this.saveCards(file, goodCards);
+		if (goodCards.length > 0) {
+			const deckPath = getDeckPathForChapter(file.path);
+			const graph = await this.readDeck(deckPath);
+			goodCards.forEach((card) => (graph[card.id] = card));
+			const deckFile =
+				(this.app.vault.getAbstractFileByPath(deckPath) as TFile) ||
+				(await this.app.vault.create(deckPath, "{}"));
+			await this.writeDeck(deckPath, graph);
+			await this.promptToReviewNewCards(goodCards, deckFile, graph);
+		}
+
 		let noticeText = `✅ Added ${goodCards.length} cards.`;
 		if (correctedCount > 0)
 			noticeText += ` 🤖 Auto-corrected ${correctedCount} tags.`;
@@ -1444,10 +1433,6 @@ ${selection}
 		}
 	}
 
-	// =====================
-	// Rendering & DOM Manipulation
-	// =====================
-
 	public refreshReading(): void {
 		this.app.workspace.iterateAllLeaves((leaf) => {
 			const view = leaf.view;
@@ -1457,10 +1442,6 @@ ${selection}
 		});
 	}
 
-	/**
-	 * Refreshes all reading views to update gating, but preserves the scroll
-	 * position of the currently active view.
-	 */
 	public async refreshReadingAndPreserveScroll(): Promise<void> {
 		const mdView = this.app.workspace.getActiveViewOfType(MarkdownView);
 
@@ -1469,17 +1450,12 @@ ${selection}
 			return;
 		}
 
-		// 1. Get the current scroll position.
 		const state = mdView.getEphemeralState();
 		this.logger(LogLevel.VERBOSE, "Preserving scroll state", state);
 
-		// 2. Trigger the hard refresh that causes the view to re-render.
 		this.refreshReading();
 
-		// 3. Restore the scroll position after a short delay to allow Obsidian's
-		//    internal view state to update after the rerender.
 		setTimeout(() => {
-			// Re-fetch the active view to ensure we have the current reference.
 			let newMdView =
 				this.app.workspace.getActiveViewOfType(MarkdownView);
 			if (newMdView) {
@@ -1583,124 +1559,131 @@ ${selection}
 		}
 	}
 
-	private async jumpToTag(card: Flashcard): Promise<void> {
+	private async jumpToTag(
+		card: Flashcard,
+		highlightColor: string = HIGHLIGHT_COLORS.context
+	): Promise<void> {
 		const file = this.app.vault.getAbstractFileByPath(card.chapter);
 		if (!(file instanceof TFile)) {
 			new Notice("Could not find the source file for this card.");
 			return;
 		}
+
 		const targetLine = await getLineForParagraph(
 			this,
 			file,
 			card.paraIdx ?? 1
 		);
-
-		const leaf = this.app.workspace.getLeaf(false);
-
-		await leaf.openFile(file, {
-			state: { mode: "preview" },
-		});
-
-		const mdView = this.app.workspace.getActiveViewOfType(MarkdownView);
-		if (!mdView) return;
-
-		mdView.setEphemeralState({ scroll: targetLine });
-
-		await new Promise((resolve) => setTimeout(resolve, 50));
-
 		const paraSelector = `.${PARA_CLASS}[${PARA_ID_ATTR}="${
 			card.paraIdx ?? 1
 		}"]`;
 
-		const wrapper = await waitForEl<HTMLElement>(
-			paraSelector,
-			mdView.previewMode.containerEl
-		);
-		if (!wrapper) {
-			this.logger(
-				LogLevel.NORMAL,
-				`Jump failed: Timed out waiting for paragraph element with selector: ${paraSelector}`
-			);
-			new Notice(
-				"Jump failed: Timed out waiting for paragraph to render."
-			);
-			return;
-		}
+		for (let attempt = 1; attempt <= 3; attempt++) {
+			const leaf = this.app.workspace.getLeaf(false);
+			await leaf.openFile(file, { state: { mode: "preview" } });
 
-		if (card.tag.startsWith("[[IMAGE HASH=")) {
-			const hashMatch = card.tag.match(
-				/\[\[IMAGE HASH=([a-f0-9]{64})\]\]/
-			);
-			let imageFound = false;
+			const mdView = this.app.workspace.getActiveViewOfType(MarkdownView);
+			if (mdView && mdView.file?.path === file.path) {
+				mdView.setEphemeralState({ scroll: targetLine });
+				const wrapper = await waitForEl<HTMLElement>(
+					paraSelector,
+					mdView.previewMode.containerEl
+				);
 
-			if (hashMatch) {
-				const hash = hashMatch[1];
-				const imageDb = await this.getImageDb();
-				const imageInfo = imageDb[hash];
-
-				if (imageInfo) {
-					const filename = imageInfo.path.split("/").pop();
-					const imageSelector = `span.internal-embed[src*="${filename}"]`;
-					const imgContainerEl =
-						wrapper.querySelector<HTMLElement>(imageSelector);
-
-					if (imgContainerEl) {
-						imgContainerEl.scrollIntoView({
-							behavior: "smooth",
-						});
-						imgContainerEl.classList.add("gn-flash");
-						setTimeout(
-							() => imgContainerEl.classList.remove("gn-flash"),
-							1200
+				if (wrapper) {
+					const applyHighlight = (el: HTMLElement) => {
+						el.style.setProperty(
+							"--highlight-color",
+							highlightColor
 						);
-						imageFound = true;
+						el.classList.add("gn-flash-highlight");
+						setTimeout(() => {
+							el.classList.remove("gn-flash-highlight");
+							el.style.removeProperty("--highlight-color");
+						}, 1500);
+					};
+
+					if (card.tag.startsWith("[[IMAGE HASH=")) {
+						const hashMatch = card.tag.match(
+							/\[\[IMAGE HASH=([a-f0-9]{64})\]\]/
+						);
+						let imageFound = false;
+						if (hashMatch) {
+							const hash = hashMatch[1];
+							const imageDb = await this.getImageDb();
+							const imageInfo = imageDb[hash];
+							if (imageInfo) {
+								const filename = imageInfo.path
+									.split("/")
+									.pop();
+								const imageSelector = `span.internal-embed[src*="${filename}"]`;
+								const imgContainerEl =
+									wrapper.querySelector<HTMLElement>(
+										imageSelector
+									);
+								if (imgContainerEl) {
+									imgContainerEl.scrollIntoView({
+										behavior: "smooth",
+									});
+									applyHighlight(imgContainerEl);
+									imageFound = true;
+								}
+							}
+						}
+						if (!imageFound) {
+							wrapper.scrollIntoView({
+								behavior: "smooth",
+							});
+							applyHighlight(wrapper);
+						}
+					} else {
+						try {
+							const range = findTextRange(card.tag, wrapper);
+							const mark = document.createElement("mark");
+							range.surroundContents(mark);
+							mark.scrollIntoView({
+								behavior: "smooth",
+							});
+							applyHighlight(mark);
+							setTimeout(() => {
+								const parent = mark.parentNode;
+								if (parent) {
+									while (mark.firstChild)
+										parent.insertBefore(
+											mark.firstChild,
+											mark
+										);
+									parent.removeChild(mark);
+								}
+							}, 1500);
+						} catch (e) {
+							this.logger(
+								LogLevel.NORMAL,
+								`Tag highlighting failed: ${
+									(e as Error).message
+								}. Flashing paragraph as fallback.`
+							);
+							wrapper.scrollIntoView({
+								behavior: "smooth",
+							});
+							applyHighlight(wrapper);
+						}
 					}
+					return;
 				}
 			}
-
-			if (!imageFound) {
-				this.logger(
-					LogLevel.NORMAL,
-					`Could not find specific image element for tag: ${card.tag}. Flashing paragraph.`
-				);
-				wrapper.scrollIntoView({
-					behavior: "smooth",
-				});
-				wrapper.classList.add("gn-flash");
-				setTimeout(() => wrapper.classList.remove("gn-flash"), 1200);
-			}
-		} else {
-			try {
-				const range = findTextRange(card.tag, wrapper);
-				const mark = document.createElement("mark");
-				mark.className = "gn-flash";
-				range.surroundContents(mark);
-				mark.scrollIntoView({
-					behavior: "smooth",
-				});
-
-				setTimeout(() => {
-					const parent = mark.parentNode;
-					if (parent) {
-						while (mark.firstChild)
-							parent.insertBefore(mark.firstChild, mark);
-						parent.removeChild(mark);
-					}
-				}, 1200);
-			} catch (e) {
-				this.logger(
-					LogLevel.NORMAL,
-					`Tag highlighting failed: ${
-						(e as Error).message
-					}. Flashing paragraph as fallback.`
-				);
-				wrapper.scrollIntoView({
-					behavior: "smooth",
-				});
-				wrapper.classList.add("gn-flash");
-				setTimeout(() => wrapper.classList.remove("gn-flash"), 1200);
-			}
+			this.logger(
+				LogLevel.VERBOSE,
+				`Jump to tag failed on attempt ${attempt}. Retrying...`
+			);
+			await new Promise((resolve) => setTimeout(resolve, 50));
 		}
+
+		this.logger(
+			LogLevel.NORMAL,
+			`Jump failed: Timed out waiting for paragraph element with selector: ${paraSelector} after 3 attempts.`
+		);
+		new Notice("Jump failed: Timed out waiting for paragraph to render.");
 	}
 
 	private injectCss(): void {
@@ -1716,8 +1699,15 @@ ${selection}
 			.gn-blocked::before { content: "${ICONS.blocked}"; }
 			.gn-due::before { content: "${ICONS.due}"; }
 			.gn-done::before { content: "${ICONS.done}"; }
-			.gn-flash, .gn-flash mark { background-color: var(--text-highlight-bg) !important; transition: background-color 1s ease-out; }
-			.gn-unlocked-flash { background-color: rgba(0, 255, 0, 0.3) !important; transition: background-color 1.2s ease-out; }
+			.gn-flash-highlight {
+				--highlight-color: ${HIGHLIGHT_COLORS.context};
+				background-color: var(--highlight-color) !important;
+				transition: background-color 1.5s ease-out;
+			}
+			.gn-unlocked-flash {
+				background-color: ${HIGHLIGHT_COLORS.unlocked} !important;
+				transition: background-color 1.2s ease-out;
+			}
 			.gn-edit-nav { display: flex; border-bottom: 1px solid var(--background-modifier-border); margin-bottom: 1rem; }
 			.gn-edit-nav button { background: none; border: none; padding: 0.5rem 1rem; cursor: pointer; border-bottom: 2px solid transparent; }
 			.gn-edit-nav button.active { border-bottom-color: var(--interactive-accent); font-weight: 600; color: var(--text-normal); }
@@ -1728,49 +1718,47 @@ ${selection}
 			.gn-edit-row textarea { resize: vertical; font-family: var(--font-text); }
 			.gn-edit-btnrow { display: flex; gap: 0.5rem; margin-top: 0.8rem; justify-content: flex-end; }
 			
-			/* Fixed modal structure styles */
-			.gn-browser { 
-				width: 60vw; 
-				height: 70vh; 
-				min-height: 20rem; 
-				min-width: 32rem; 
-				resize: both; 
-				display: flex; 
-				flex-direction: column; 
+			.gn-browser {
+				width: 60vw;
+				height: 70vh;
+				min-height: 20rem;
+				min-width: 32rem;
+				resize: both;
+				display: flex;
+				flex-direction: column;
 			}
 			.gn-browser .modal-content {
 				display: flex;
 				flex-direction: column;
 				height: 100%;
-				overflow: hidden; /* Prevent modal content from scrolling */
+				overflow: hidden;
 			}
 			.gn-header {
-				flex-shrink: 0; /* Keep header fixed size */
+				flex-shrink: 0;
 				border-bottom: 1px solid var(--background-modifier-border);
 				padding-bottom: 0.5rem;
 				margin-bottom: 0.5rem;
 			}
-			.gn-body { 
-				flex: 1; 
-				display: flex; 
-				overflow: hidden; /* Important: prevent body from scrolling */
-				min-height: 0; /* Allow flex item to shrink below content size */
+			.gn-body {
+				flex: 1;
+				display: flex;
+				overflow: hidden;
+				min-height: 0;
 			}
-			.gn-tree { 
-				width: 40%; 
-				padding-right: .75rem; 
-				border-right: 1px solid var(--background-modifier-border); 
-				overflow-y: auto; 
-				overflow-x: hidden; 
+			.gn-tree {
+				width: 40%;
+				padding-right: .75rem;
+				border-right: 1px solid var(--background-modifier-border);
+				overflow-y: auto;
+				overflow-x: hidden;
 			}
-			.gn-editor { 
-				flex: 1; 
-				padding-left: .75rem; 
-				overflow-y: auto; 
-				overflow-x: hidden; 
+			.gn-editor {
+				flex: 1;
+				padding-left: .75rem;
+				overflow-y: auto;
+				overflow-x: hidden;
 			}
 			
-			/* Rest of styles remain the same */
 			.gn-node > summary { cursor: pointer; font-weight: 600; }
 			.gn-chap { margin-left: 1.2rem; cursor: pointer; }
 			.gn-chap:hover { text-decoration: underline; }
@@ -1791,10 +1779,6 @@ ${selection}
 		document.head.appendChild(styleEl);
 		this.register(() => styleEl.remove());
 	}
-
-	// =====================
-	// Card Management
-	// =====================
 
 	private async addFlashcardFromSelection(
 		selectedText: string,
@@ -1825,7 +1809,9 @@ ${selection}
 			card,
 			graph,
 			deckFile ?? (await this.app.vault.create(deckPath, "{}")),
-			() => new Notice("✅ Flashcard created.")
+			() => new Notice("✅ Flashcard created."),
+			undefined,
+			'edit'
 		);
 	}
 
@@ -2083,10 +2069,6 @@ ${selection}
 		}, 500);
 	}
 
-	// ===========================
-	// Image Utilities
-	// ===========================
-
 	private async removeNoteImageAnalysis(file: TFile): Promise<void> {
 		const imageDb = await this.getImageDb();
 		const noteContent = await this.app.vault.read(file);
@@ -2296,10 +2278,6 @@ ${selection}
 		);
 	}
 
-	// =====================
-	// UI & UX
-	// =====================
-
 	private async openReviewModal(
 		card: Flashcard,
 		deck: TFile
@@ -2369,27 +2347,22 @@ ${selection}
 									return;
 								}
 
-								// Get the gate's position before applying the review.
 								const gateBefore =
 									await this.getFirstBlockedParaIndex(
 										card.chapter,
 										graph
 									);
 
-								// Apply the SM-2 algorithm to update the card state.
 								this.applySm2(cardInGraph, lbl);
 
-								// Get the gate's position after the review.
 								const gateAfter =
 									await this.getFirstBlockedParaIndex(
 										card.chapter,
 										graph
 									);
 
-								// Save the updated graph to disk.
 								await this.writeDeck(deckPath, graph);
 
-								// Refresh the reading view only if the gate has moved.
 								if (gateBefore !== gateAfter) {
 									this.logger(
 										LogLevel.VERBOSE,
@@ -2421,7 +2394,7 @@ ${selection}
 					const cardInGraph = graph[card.id];
 					if (cardInGraph) {
 						cardInGraph.flagged = !cardInGraph.flagged;
-						card.flagged = cardInGraph.flagged; // Sync local state
+						card.flagged = cardInGraph.flagged;
 						await this.writeDeck(deck.path, graph);
 						new Notice(
 							cardInGraph.flagged
@@ -2456,7 +2429,28 @@ ${selection}
 				.setTooltip("Edit")
 				.onClick(async () => {
 					const graph = await this.readDeck(deck.path);
-					this.openEditModal(card, graph, deck, () => {});
+			
+					this.openEditModal(
+						card,
+						graph,
+						deck,
+						(actionTaken, newCards) => {
+							if (actionTaken) {
+								state = "abort";
+								modal.close();
+			
+								if (newCards && newCards.length > 0) {
+									this.promptToReviewNewCards(
+										newCards,
+										deck,
+										graph
+									);
+								}
+							}
+						},
+						undefined,
+						'review' 
+					);
 				});
 			new ButtonComponent(bottomBar)
 				.setIcon("ban")
@@ -2488,7 +2482,7 @@ ${selection}
 			new ButtonComponent(bottomBar)
 				.setIcon("link")
 				.setTooltip("Context")
-				.onClick(() => this.jumpToTag(card));
+				.onClick(() => this.jumpToTag(card, HIGHLIGHT_COLORS.context));
 
 			new ButtonComponent(bottomBar)
 				.setIcon("file-down")
@@ -2516,22 +2510,90 @@ ${selection}
 		card: Flashcard,
 		graph: FlashcardGraph,
 		deck: TFile,
-		onDone: () => void
+		onDone: (actionTaken: boolean, newCards?: Flashcard[]) => void,
+		reviewContext?: { index: number; total: number },
+		parentContext?: 'edit' | 'review'
 	): void {
-		new EditModal(this, card, graph, deck, onDone).open();
+		new EditModal(this, card, graph, deck, onDone, reviewContext).open();
 	}
 
-	private async promptForCardCount(
-		file: TFile,
-		callback: (count: number) => void
+	public async promptToReviewNewCards(
+		newCards: Flashcard[],
+		deck: TFile,
+		graph: FlashcardGraph
 	): Promise<void> {
-		const wrappedContent = await this.app.vault.read(file);
-		const plainText = getParagraphsFromFinalizedNote(wrappedContent)
-			.map((p) => p.markdown)
-			.join("\n\n");
-		const wordCount = plainText.split(/\s+/).filter(Boolean).length;
-		const defaultCardCount = Math.max(1, Math.round(wordCount / 100));
-		new CountModal(this, defaultCardCount, callback).open();
+		if (newCards.length === 0) return;
+
+		const userWantsToReview = await new Promise<boolean>((resolve) => {
+			const modal = new Modal(this.app);
+			modal.titleEl.setText("Review New Cards?");
+			modal.contentEl.createEl("p", {
+				text: `You've created ${newCards.length} new card(s). Would you like to review and edit them now?`,
+			});
+			const btnRow = modal.contentEl.createDiv({ cls: "gn-edit-btnrow" });
+			new ButtonComponent(btnRow)
+				.setButtonText("No, I'll do it later")
+				.onClick(() => {
+					modal.close();
+					resolve(false);
+				});
+			new ButtonComponent(btnRow)
+				.setButtonText("Yes, Review Now")
+				.setCta()
+				.onClick(() => {
+					modal.close();
+					resolve(true);
+				});
+
+			modal.onClose = () => resolve(false);
+			modal.open();
+		});
+
+		if (userWantsToReview) {
+			await this.reviewNewCardsInSequence(newCards, deck, graph);
+		}
+	}
+
+	public async reviewNewCardsInSequence(
+		newCards: Flashcard[],
+		deck: TFile,
+		graph: FlashcardGraph
+	): Promise<void> {
+		if (newCards.length === 0) return;
+
+		let reviewAborted = false;
+
+		for (let i = 0; i < newCards.length; i++) {
+			if (reviewAborted) break;
+
+			const card = newCards[i];
+
+			const editPromise = new Promise<void>((resolve) => {
+				this.openEditModal(
+					card,
+					graph,
+					deck,
+					(continueReview: boolean) => {
+						if (!continueReview) {
+							reviewAborted = true;
+						}
+						resolve();
+					},
+					{
+						index: i + 1,
+						total: newCards.length,
+					}
+				);
+			});
+
+			await editPromise;
+		}
+
+		if (reviewAborted) {
+			new Notice("Review session closed.");
+		} else {
+			new Notice("Finished reviewing all new cards.");
+		}
 	}
 
 	private showUnfinalizeConfirmModal(): Promise<boolean> {
@@ -2566,10 +2628,6 @@ ${selection}
 			modal.open();
 		});
 	}
-
-	// =====================
-	// Status & State
-	// =====================
 
 	public async refreshAllStatuses(): Promise<void> {
 		this.refreshDueCardStatus();
@@ -2676,10 +2734,6 @@ ${selection}
 		if (cards.some((c) => c.due <= Date.now())) return "due";
 		return "done";
 	}
-
-	// =====================
-	// LLM & API
-	// =====================
 
 	public async sendToLlm(prompt: string, imageUrl?: string): Promise<string> {
 		const {
@@ -2819,7 +2873,6 @@ ${selection}
 		chapterPath: string,
 		graphToUse?: FlashcardGraph
 	): Promise<number> {
-		// If a pre-loaded graph is provided, use it. Otherwise, read from the vault.
 		const graph =
 			graphToUse ??
 			(await this.readDeck(getDeckPathForChapter(chapterPath)));
@@ -2829,16 +2882,11 @@ ${selection}
 		);
 
 		if (blockedCards.length === 0) {
-			return Infinity; // Represents a fully unlocked chapter.
+			return Infinity;
 		}
 
-		// Return the lowest paragraph index among all blocked cards.
 		return Math.min(...blockedCards.map((c) => c.paraIdx ?? Infinity));
 	}
-
-	// =====================
-	// Settings & Data I/O
-	// =====================
 
 	async loadSettings(): Promise<void> {
 		this.settings = Object.assign(
@@ -2963,24 +3011,26 @@ ${selection}
 	}
 }
 
-// ===================================================================
-// UI COMPONENT CLASSES
-// ===================================================================
-
 class EditModal extends Modal {
 	constructor(
 		private plugin: GatedNotesPlugin,
 		private card: Flashcard,
 		private graph: FlashcardGraph,
 		private deck: TFile,
-		private onDone: () => void
+		private onDone: (actionTaken: boolean, newCards?: Flashcard[]) => void,
+		private reviewContext?: { index: number; total: number },
+		private parentContext?: 'edit' | 'review'
 	) {
 		super(plugin.app);
 	}
 
 	onOpen() {
 		makeModalDraggable(this, this.plugin);
-		this.titleEl.setText("Edit Card");
+		this.titleEl.setText(
+			this.reviewContext
+				? `Reviewing Card ${this.reviewContext.index} of ${this.reviewContext.total}`
+				: "Edit Card"
+		);
 		this.contentEl.addClass("gn-edit-container");
 
 		const nav = this.contentEl.createDiv({ cls: "gn-edit-nav" });
@@ -3078,51 +3128,133 @@ class EditModal extends Modal {
 
 		const btnRow = this.contentEl.createDiv({ cls: "gn-edit-btnrow" });
 
-		new ButtonComponent(btnRow)
-			.setButtonText("Reset Progress")
-			.setWarning()
-			.onClick(async () => {
-				if (
-					!confirm(
-						"Are you sure you want to reset the review progress for this card? This cannot be undone."
+		if (!this.reviewContext) {
+			new ButtonComponent(btnRow)
+				.setButtonText("Reset Progress")
+				.setWarning()
+				.onClick(async () => {
+					if (
+						!confirm(
+							"Are you sure you want to reset the review progress for this card? This cannot be undone."
+						)
+					) {
+						return;
+					}
+
+					this.plugin.resetCardProgress(this.card);
+					await this.saveCardState(
+						frontInput,
+						backInput,
+						tagInput,
+						paraInput
+					);
+					new Notice("Card progress has been reset.");
+					this.close();
+					this.onDone(true);
+				});
+
+			new ButtonComponent(btnRow)
+				.setButtonText("Refocus with AI")
+				.onClick(async (evt) => await this.handleRefocus(evt));
+			new ButtonComponent(btnRow)
+				.setButtonText("Split with AI")
+				.onClick(async (evt) => await this.handleSplit(evt));
+		}
+
+		if (this.reviewContext) {
+			new ButtonComponent(btnRow)
+				.setButtonText("Delete Card")
+				.setWarning()
+				.onClick(async () => {
+					if (
+						!confirm(
+							"Are you sure you want to delete this new card?"
+						)
 					)
-				) {
-					return;
-				}
+						return;
+					delete this.graph[this.card.id];
+					await this.plugin.writeDeck(this.deck.path, this.graph);
+					new Notice("Card deleted.");
+					this.plugin.refreshAllStatuses();
+					this.close();
+					this.onDone(true);
+				});
+			new ButtonComponent(btnRow)
+				.setButtonText("Save & Close Review")
+				.onClick(async () => {
+					await this.saveCardState(
+						frontInput,
+						backInput,
+						tagInput,
+						paraInput
+					);
+					this.close();
+					this.onDone(false);
+				});
 
-				this.plugin.resetCardProgress(this.card);
-				this.graph[this.card.id] = this.card;
-				await this.plugin.writeDeck(this.deck.path, this.graph);
+			if (this.reviewContext.index < this.reviewContext.total) {
+				new ButtonComponent(btnRow)
+					.setButtonText(
+						`Save & Next (${this.reviewContext.index}/${this.reviewContext.total})`
+					)
+					.setCta()
+					.onClick(async () => {
+						await this.saveCardState(
+							frontInput,
+							backInput,
+							tagInput,
+							paraInput
+						);
+						this.close();
+						this.onDone(true);
+					});
+			} else {
+				new ButtonComponent(btnRow)
+					.setButtonText("Save & Finish")
+					.setCta()
+					.onClick(async () => {
+						await this.saveCardState(
+							frontInput,
+							backInput,
+							tagInput,
+							paraInput
+						);
+						this.close();
+						this.onDone(true);
+					});
+			}
+		} else {
+			new ButtonComponent(btnRow)
+				.setButtonText("Save")
+				.setCta()
+				.onClick(async () => {
+					await this.saveCardState(
+						frontInput,
+						backInput,
+						tagInput,
+						paraInput
+					);
+					new Notice("Card saved.");
+					this.close();
+					this.onDone(false);
+				});
+		}
+	}
 
-				new Notice("Card progress has been reset.");
-				this.plugin.refreshReading();
-				this.plugin.refreshAllStatuses();
-
-				this.close();
-				this.onDone();
-			});
-
-		new ButtonComponent(btnRow)
-			.setButtonText("Refocus with AI")
-			.onClick(this.handleRefocus.bind(this));
-		new ButtonComponent(btnRow)
-			.setButtonText("Split with AI")
-			.onClick(this.handleSplit.bind(this));
-		new ButtonComponent(btnRow)
-			.setButtonText("Save")
-			.setCta()
-			.onClick(async () => {
-				this.card.front = frontInput.value.trim();
-				this.card.back = backInput.value.trim();
-				this.card.tag = tagInput.value.trim();
-				this.card.paraIdx = Number(paraInput.value) || undefined;
-				this.graph[this.card.id] = this.card;
-				await this.plugin.writeDeck(this.deck.path, this.graph);
-				this.plugin.refreshReading();
-				this.plugin.refreshAllStatuses();
-				this.close();
-				this.onDone();
-			});
+	private async saveCardState(
+		frontInput: HTMLTextAreaElement,
+		backInput: HTMLTextAreaElement,
+		tagInput: HTMLTextAreaElement,
+		paraInput: HTMLInputElement
+	) {
+		this.card.front = frontInput.value.trim();
+		this.card.back = backInput.value.trim();
+		this.card.tag = tagInput.value.trim();
+		this.card.paraIdx = Number(paraInput.value) || undefined;
+		this.graph[this.card.id] = this.card;
+		await this.plugin.writeDeck(this.deck.path, this.graph);
+		this.plugin.refreshReading();
+		this.plugin.refreshAllStatuses();
 	}
 
 	private _createCardsFromLlmResponse(response: string): Flashcard[] {
@@ -3141,105 +3273,361 @@ class EditModal extends Modal {
 		);
 	}
 
+	private returnToParentContext() {
+		console.log("🔧 DEBUG: returnToParentContext, parentContext:", this.parentContext);
+		
+		if (this.parentContext === 'review') {
+			this.onDone(false);
+		} else {
+			setTimeout(() => {
+				this.plugin.openEditModal(
+					this.card,
+					this.graph,
+					this.deck,
+					this.onDone,
+					this.reviewContext,
+					this.parentContext
+				);
+			}, 100);
+		}
+	}
+
 	private async handleRefocus(evt: MouseEvent) {
+		this.plugin.logger(LogLevel.VERBOSE, "handleRefocus triggered.");
+
+		const result = await new Promise<{
+			quantity: "one" | "many";
+			preventDuplicates: boolean;
+		} | null>((resolve) => {
+			let choiceMade = false;
+			let preventDuplicates = true;
+
+			const modal = new Modal(this.plugin.app);
+			modal.titleEl.setText("Refocus Card");
+			modal.contentEl.createEl("p", {
+				text: "How many alternative cards would you like to generate?",
+			});
+
+			new Setting(modal.contentEl)
+				.setName("Prevent creating duplicate cards")
+				.setDesc(
+					"Sends existing cards to the AI for context to avoid creating similar ones."
+				)
+				.addToggle((toggle) => {
+					toggle
+						.setValue(preventDuplicates)
+						.onChange((value) => (preventDuplicates = value));
+				});
+
+			const btnRow = modal.contentEl.createDiv({ cls: "gn-edit-btnrow" });
+			new ButtonComponent(btnRow)
+				.setButtonText("Just One")
+				.onClick(() => {
+					choiceMade = true;
+					modal.close();
+					resolve({ quantity: "one", preventDuplicates });
+				});
+			new ButtonComponent(btnRow)
+				.setButtonText("One or More")
+				.setCta()
+				.onClick(() => {
+					choiceMade = true;
+					modal.close();
+					resolve({ quantity: "many", preventDuplicates });
+				});
+
+			modal.onClose = () => {
+				if (!choiceMade) {
+					resolve(null);
+				}
+			};
+			modal.open();
+		});
+
+		if (!result) {
+			this.plugin.logger(LogLevel.VERBOSE, "User cancelled selection.");
+			return;
+		}
+
+		const { quantity, preventDuplicates } = result;
+		this.plugin.logger(
+			LogLevel.VERBOSE,
+			`User selected quantity: ${quantity}, Prevent Duplicates: ${preventDuplicates}`
+		);
+
 		const buttonEl = evt.target as HTMLButtonElement;
 		buttonEl.disabled = true;
 		buttonEl.setText("Refocusing...");
-		new Notice("🤖 Generating alternative card...");
+		new Notice("🤖 Generating alternative card(s)...");
 
 		try {
+			let contextPrompt = "";
+			if (preventDuplicates) {
+				this.plugin.logger(
+					LogLevel.VERBOSE,
+					"Building context prompt..."
+				);
+				const otherCards = Object.values(this.graph).filter(
+					(c) =>
+						c.chapter === this.card.chapter && c.id !== this.card.id
+				);
+
+				if (otherCards.length > 0) {
+					const simplifiedCards = otherCards.map((c) => ({
+						front: c.front,
+						back: c.back,
+					}));
+					contextPrompt = `To avoid duplicates, do not create cards that cover the same information as the following existing cards:\nExisting Cards:\n${JSON.stringify(
+						simplifiedCards
+					)}\n\n`;
+				}
+				this.plugin.logger(LogLevel.VERBOSE, "Context prompt built.");
+			}
+
 			const cardJson = JSON.stringify({
 				front: this.card.front,
 				back: this.card.back,
 			});
 
-			const prompt = `You are an AI assistant that creates a new, insightful flashcard by "refocusing" an existing one.
+			const basePrompt = `You are an AI assistant that creates new, insightful flashcards by "refocusing" an existing one.
+	
+	**Core Rule:** Your new card(s) MUST be created by inverting the information **explicitly present** in the original card's "front" and "back" fields. The "Source Text" is provided only for context and should NOT be used to introduce new facts.
+	
+	**Thought Process:**
+	1.  **Deconstruct the Original Card:** Identify all key subjects, details, and relationships.
+	2.  **Invert & Refocus:** Create new card(s) where an original detail becomes the subject of a question, and an original subject becomes the answer.
+	
+	---
+	**Example (Original Card):**
+	{ "front": "What was the outcome of the War of Fakery in 1653?", "back": "Country A decisively defeated Country B." }
+	**Possible Refocused Cards:**
+	- { "front": "In what year did the War of Fakery take place?", "back": "1653" }
+	- { "front": "Who was defeated by Country A in the War of Fakery?", "back": "Country B" }
+	---`;
 
-**Core Rule:** Your new card MUST be created by inverting the information **explicitly present** in the original card's "front" and "back" fields. The "Source Text" is provided only for context and should NOT be used to introduce new facts into the new card.
+			const quantityInstruction =
+				quantity === "one"
+					? `**Your Task:** Apply this process to create a **single** new card.`
+					: `**Your Task:** Apply this process to create **one or more** new, distinct cards. If the original card contains multiple facts, create a separate card for each.`;
 
-**Thought Process:**
-1.  **Deconstruct the Original Card:** Identify the key subject in the "back" and the key detail in the "front".
-2.  **Invert & Refocus:** Create a new card where the original detail becomes the subject of the question, and the original subject becomes the answer.
+			const prompt = `${contextPrompt}${basePrompt}
+	
+	${quantityInstruction}
+	
+	**Original Card:**
+	${cardJson}
+	
+	**Source Text for Context (use only to understand the card, not to add new facts):**
+	${JSON.stringify(this.card.tag)}
+	
+	Return ONLY valid JSON of this shape: [{"front":"...","back":"..."}]`;
 
----
-**Example 1:**
-* **Original Card:**
-    * "front": "What was the outcome of the War of Fakery in 1653?"
-    * "back": "Country A decisively defeated Country B."
-* **Refocused Card (testing the date, which is in the front):**
-    * "front": "In what year did the War of Fakery take place?"
-    * "back": "1653"
-
-**Example 2:**
-* **Original Card:**
-    * "front": "Who is said to have lived circa 365–circa 270 BC?"
-    * "back": "Pyrrho"
-* **Refocused Card (testing the date, which is in the front):**
-    * "front": "What were the approximate years of Pyrrho's life?"
-    * "back": "circa 365–circa 270 BC"
----
-
-**Your Task:**
-Now, apply this process to the following card.
-
-**Original Card:**
-${cardJson}
-
-**Source Text for Context (use only to understand the card, not to add new facts):**
-${JSON.stringify(this.card.tag)}
-
-Return ONLY valid JSON of this shape: [{"front":"...","back":"..."}]`;
-
+			this.plugin.logger(
+				LogLevel.VERBOSE,
+				"Sending prompt to LLM:",
+				prompt
+			);
 			const response = await this.plugin.sendToLlm(prompt);
 			if (!response) throw new Error("LLM returned an empty response.");
+			this.plugin.logger(
+				LogLevel.VERBOSE,
+				"Received LLM response:",
+				response
+			);
 
 			const newCards = this._createCardsFromLlmResponse(response);
 			if (newCards.length === 0)
 				throw new Error(
 					"Could not parse any new cards from the LLM response."
 				);
+			this.plugin.logger(
+				LogLevel.VERBOSE,
+				`Parsed ${newCards.length} new cards.`
+			);
 
-			const file = this.app.vault.getAbstractFileByPath(
-				this.card.chapter
-			) as TFile;
-			if (!file)
-				throw new Error(
-					"Could not find the source file for the new cards."
-				);
-
-			await this.plugin.saveCards(file, newCards);
+			newCards.forEach((card) => (this.graph[card.id] = card));
+			await this.plugin.writeDeck(this.deck.path, this.graph);
 			new Notice(`✅ Added ${newCards.length} new alternative card(s).`);
+
 			this.plugin.refreshAllStatuses();
+
+			const userWantsToReview = await new Promise<boolean>((resolve) => {
+				let choiceMade = false;
+
+				const modal = new Modal(this.plugin.app);
+				modal.titleEl.setText("Review New Cards?");
+				modal.contentEl.createEl("p", {
+					text: `You've created ${newCards.length} new card(s). Would you like to review and edit them now?`,
+				});
+				const btnRow = modal.contentEl.createDiv({
+					cls: "gn-edit-btnrow",
+				});
+				new ButtonComponent(btnRow)
+					.setButtonText("No, I'll do it later")
+					.onClick(() => {
+						choiceMade = true;
+						modal.close();
+						resolve(false);
+					});
+				new ButtonComponent(btnRow)
+					.setButtonText("Yes, Review Now")
+					.setCta()
+					.onClick(() => {
+						choiceMade = true;
+						modal.close();
+						resolve(true);
+					});
+
+				modal.onClose = () => {
+					if (!choiceMade) {
+						resolve(false);
+					}
+				};
+				modal.open();
+			});
+
 			this.close();
-			this.onDone();
+
+			if (userWantsToReview) {
+				setTimeout(() => {
+					this.startNewCardReviewSequence(newCards, 0);
+				}, 100);
+				this.onDone(true);
+			} else {
+				this.returnToParentContext();
+			}
 		} catch (e: unknown) {
 			new Notice(`Failed to generate cards: ${(e as Error).message}`);
 			this.plugin.logger(LogLevel.NORMAL, "Failed to refocus card:", e);
 		} finally {
 			buttonEl.disabled = false;
 			buttonEl.setText("Refocus with AI");
+			this.plugin.logger(LogLevel.VERBOSE, "handleRefocus finished.");
 		}
 	}
 
+	private startNewCardReviewSequence(
+		newCards: Flashcard[],
+		currentIndex: number
+	) {
+		if (currentIndex >= newCards.length) {
+			new Notice("Finished reviewing all new cards.");
+			setTimeout(() => {
+				this.returnToParentContext();
+			}, 100);
+			return;
+		}
+
+		const card = newCards[currentIndex];
+
+		this.plugin.openEditModal(
+			card,
+			this.graph,
+			this.deck,
+			(continueReview: boolean) => {
+				if (continueReview && currentIndex + 1 < newCards.length) {
+					setTimeout(() => {
+						this.startNewCardReviewSequence(
+							newCards,
+							currentIndex + 1
+						);
+					}, 100);
+				} else if (!continueReview) {
+					new Notice("Review session ended.");
+					setTimeout(() => {
+						this.returnToParentContext();
+					}, 100);
+				} else {
+					new Notice("Finished reviewing all new cards.");
+					setTimeout(() => {
+						this.returnToParentContext();
+					}, 100);
+				}
+			},
+			{
+				index: currentIndex + 1,
+				total: newCards.length,
+			}
+		);
+	}
+
 	private async handleSplit(evt: MouseEvent) {
+		const result = await new Promise<{ preventDuplicates: boolean } | null>(
+			(resolve) => {
+				let preventDuplicates = true;
+				const modal = new Modal(this.plugin.app);
+				modal.titleEl.setText("Split Card");
+
+				new Setting(modal.contentEl)
+					.setName("Prevent creating duplicate cards")
+					.setDesc(
+						"Sends existing cards to the AI for context to avoid creating similar ones."
+					)
+					.addToggle((toggle) => {
+						toggle
+							.setValue(preventDuplicates)
+							.onChange((value) => (preventDuplicates = value));
+					});
+
+				new Setting(modal.contentEl)
+					.addButton((btn) =>
+						btn.setButtonText("Cancel").onClick(() => {
+							modal.close();
+							resolve(null);
+						})
+					)
+					.addButton((btn) =>
+						btn
+							.setButtonText("Split")
+							.setCta()
+							.onClick(() => {
+								modal.close();
+								resolve({ preventDuplicates });
+							})
+					);
+
+				modal.open();
+			}
+		);
+
+		if (!result) return;
+		const { preventDuplicates } = result;
+
 		const buttonEl = evt.target as HTMLButtonElement;
 		buttonEl.disabled = true;
 		buttonEl.setText("Splitting...");
 		new Notice("🤖 Splitting card with AI...");
 
 		try {
+			let contextPrompt = "";
+			if (preventDuplicates) {
+				const otherCards = Object.values(this.graph).filter(
+					(c) =>
+						c.chapter === this.card.chapter && c.id !== this.card.id
+				);
+				if (otherCards.length > 0) {
+					const simplifiedCards = otherCards.map((c) => ({
+						front: c.front,
+						back: c.back,
+					}));
+					contextPrompt = `To avoid creating cards similar to existing ones, please review this context:\nExisting Cards in this Note:\n${JSON.stringify(
+						simplifiedCards
+					)}\n\n`;
+				}
+			}
+
 			const cardJson = JSON.stringify({
 				front: this.card.front,
 				back: this.card.back,
 			});
-			const prompt = `Take the following flashcard and split it into one or more new, simpler, more atomic flashcards. The original card may be too complex or cover multiple ideas.
-
-Return ONLY valid JSON of this shape: [{"front":"...","back":"..."}]
-
----
-**Original Card:**
-${cardJson}
----`;
+			const prompt = `${contextPrompt}Take the following flashcard and split it into one or more new, simpler, more atomic flashcards. The original card may be too complex or cover multiple ideas.
+	
+	Return ONLY valid JSON of this shape: [{"front":"...","back":"..."}]
+	
+	---
+	**Original Card:**
+	${cardJson}
+	---`;
 			const response = await this.plugin.sendToLlm(prompt);
 			if (!response) throw new Error("LLM returned an empty response.");
 
@@ -3253,11 +3641,56 @@ ${cardJson}
 			newCards.forEach((newCard) => (this.graph[newCard.id] = newCard));
 
 			await this.plugin.writeDeck(this.deck.path, this.graph);
+			new Notice(`✅ Split card into ${newCards.length} new card(s).`);
+
 			this.plugin.refreshReading();
 			this.plugin.refreshAllStatuses();
-			new Notice(`✅ Split card into ${newCards.length} new card(s).`);
+
+			const userWantsToReview = await new Promise<boolean>((resolve) => {
+				let choiceMade = false;
+
+				const modal = new Modal(this.plugin.app);
+				modal.titleEl.setText("Review New Cards?");
+				modal.contentEl.createEl("p", {
+					text: `You've created ${newCards.length} new card(s). Would you like to review and edit them now?`,
+				});
+				const btnRow = modal.contentEl.createDiv({
+					cls: "gn-edit-btnrow",
+				});
+				new ButtonComponent(btnRow)
+					.setButtonText("No, I'll do it later")
+					.onClick(() => {
+						choiceMade = true;
+						modal.close();
+						resolve(false);
+					});
+				new ButtonComponent(btnRow)
+					.setButtonText("Yes, Review Now")
+					.setCta()
+					.onClick(() => {
+						choiceMade = true;
+						modal.close();
+						resolve(true);
+					});
+
+				modal.onClose = () => {
+					if (!choiceMade) {
+						resolve(false);
+					}
+				};
+				modal.open();
+			});
+
 			this.close();
-			this.onDone();
+
+			if (userWantsToReview) {
+				setTimeout(() => {
+					this.startNewCardReviewSequence(newCards, 0);
+				}, 100);
+				this.onDone(true);
+			} else {
+				this.returnToParentContext();
+			}
 		} catch (e: unknown) {
 			new Notice(`Error splitting card: ${(e as Error).message}`);
 			this.plugin.logger(LogLevel.NORMAL, "Failed to split card:", e);
@@ -3303,10 +3736,12 @@ class CardBrowser extends Modal {
 		new Setting(header)
 			.setName("Show only flagged cards")
 			.addToggle((toggle) => {
-				toggle.setValue(this.showOnlyFlagged).onChange(async (value) => {
-					this.showOnlyFlagged = value;
-					await this.renderContent();
-				});
+				toggle
+					.setValue(this.showOnlyFlagged)
+					.onChange(async (value) => {
+						this.showOnlyFlagged = value;
+						await this.renderContent();
+					});
 			});
 
 		new Setting(header)
@@ -3437,7 +3872,8 @@ class CardBrowser extends Modal {
 			const subject = deck.path.split("/")[0] || "Vault Root";
 
 			const shouldBeOpen =
-				this.state.isFirstRender || this.state.openSubjects.has(subject);
+				this.state.isFirstRender ||
+				this.state.openSubjects.has(subject);
 			this.plugin.logger(
 				LogLevel.VERBOSE,
 				`CardBrowser: renderContent -> Subject '${subject}' should be open: ${shouldBeOpen} (isFirstRender: ${this.state.isFirstRender})`
@@ -3479,13 +3915,11 @@ class CardBrowser extends Modal {
 				const chapterName =
 					chapterPath.split("/").pop()?.replace(/\.md$/, "") ??
 					chapterPath;
-				subjectEl
-					.createEl("div", {
-						cls: "gn-chap",
-						text: `${count} card(s) • ${chapterName}`,
-						attr: { "data-chapter-path": chapterPath },
-					})
-					.onclick = () => showCardsForChapter(deck, chapterPath);
+				subjectEl.createEl("div", {
+					cls: "gn-chap",
+					text: `${count} card(s) • ${chapterName}`,
+					attr: { "data-chapter-path": chapterPath },
+				}).onclick = () => showCardsForChapter(deck, chapterPath);
 			}
 		}
 
@@ -3497,7 +3931,6 @@ class CardBrowser extends Modal {
 			this.state.isFirstRender = false;
 		}
 
-		// Restore the view using the persistent state.
 		if (this.state.activeChapterPath) {
 			this.plugin.logger(
 				LogLevel.VERBOSE,
@@ -3521,7 +3954,6 @@ class CardBrowser extends Modal {
 			}
 		}
 
-		// Use setTimeout to apply scroll after the DOM has fully rendered.
 		setTimeout(() => {
 			this.plugin.logger(
 				LogLevel.VERBOSE,
@@ -3529,7 +3961,7 @@ class CardBrowser extends Modal {
 			);
 			this.treePane.scrollTop = this.state.treeScroll;
 			this.editorPane.scrollTop = this.state.editorScroll;
-		}, 0);
+		}, 50);
 	}
 
 	onClose() {
@@ -3834,7 +4266,6 @@ class GNSettingsTab extends PluginSettingTab {
 		containerEl.empty();
 		containerEl.createEl("h2", { text: "Gated Notes Settings" });
 
-		// AI Provider Section
 		new Setting(containerEl).setName("AI Provider").setHeading();
 		new Setting(containerEl)
 			.setName("API Provider")
@@ -3888,7 +4319,6 @@ class GNSettingsTab extends PluginSettingTab {
 						});
 				});
 		} else {
-			// LM Studio Settings
 			new Setting(containerEl)
 				.setName("LM Studio Server URL")
 				.addText((text) =>
@@ -3946,7 +4376,6 @@ class GNSettingsTab extends PluginSettingTab {
 					})
 			);
 
-		// Card Generation Section
 		new Setting(containerEl).setName("Card Generation").setHeading();
 
 		new Setting(containerEl)
@@ -4020,7 +4449,6 @@ class GNSettingsTab extends PluginSettingTab {
 				);
 		}
 
-		// Spaced Repetition Section
 		new Setting(containerEl).setName("Spaced Repetition").setHeading();
 		this.createNumericArraySetting(
 			containerEl,
@@ -4052,7 +4480,6 @@ class GNSettingsTab extends PluginSettingTab {
 					})
 			);
 
-		// Content Gating Section
 		new Setting(containerEl).setName("Content Gating").setHeading();
 		new Setting(containerEl)
 			.setName("Enable content gating")
@@ -4068,7 +4495,6 @@ class GNSettingsTab extends PluginSettingTab {
 					})
 			);
 
-		// Debugging Section
 		new Setting(containerEl).setName("Debugging").setHeading();
 		new Setting(containerEl)
 			.setName("Logging level")
@@ -4112,10 +4538,6 @@ class GNSettingsTab extends PluginSettingTab {
 			);
 	}
 }
-
-// ===================================================================
-// UTILITY FUNCTIONS
-// ===================================================================
 
 const isUnseen = (card: Flashcard): boolean =>
 	card.status === "new" &&
@@ -4190,12 +4612,6 @@ async function waitForEl<T extends HTMLElement>(
 	});
 }
 
-/**
- * Finds the DOM Range for a text snippet within a container using a robust fuzzy matching algorithm.
- * @param tag The text content to find, which may not be a verbatim quote.
- * @param container The HTML element to search within.
- * @returns A DOM Range object spanning the found text.
- */
 function findTextRange(tag: string, container: HTMLElement): Range {
 	const normalize = (s: string) =>
 		s
@@ -4417,17 +4833,11 @@ async function getLineForParagraph(
 	return 0;
 }
 
-/**
- * Robustly extracts a JSON array from a string that may include code fences or other text.
- * @param s The string to parse.
- * @returns A parsed array of objects.
- */
 function extractJsonArray<T>(s: string): T[] {
 	try {
 		const parsed = JSON.parse(s);
-		return Array.isArray(parsed) ? parsed : [parsed]; // Also handle single object response
+		return Array.isArray(parsed) ? parsed : [parsed];
 	} catch {
-		/* continue */
 	}
 
 	const fence = s.match(/```(?:json)?\s*([\s\S]*?)```/i);
@@ -4436,7 +4846,6 @@ function extractJsonArray<T>(s: string): T[] {
 			const parsed = JSON.parse(fence[1]);
 			return Array.isArray(parsed) ? parsed : [parsed];
 		} catch {
-			/* continue */
 		}
 	}
 
@@ -4446,7 +4855,6 @@ function extractJsonArray<T>(s: string): T[] {
 			const parsed = JSON.parse(arr[0]);
 			return Array.isArray(parsed) ? parsed : [parsed];
 		} catch {
-			/* continue */
 		}
 	}
 
@@ -4455,24 +4863,17 @@ function extractJsonArray<T>(s: string): T[] {
 		try {
 			return [JSON.parse(objMatch[0])];
 		} catch {
-			/* continue */
 		}
 	}
 
 	throw new Error("No valid JSON array or object found in the string.");
 }
 
-/**
- * Robustly extracts one or more JSON objects from a string.
- * @param s The string to parse.
- * @returns An array of parsed objects.
- */
 function extractJsonObjects<T>(s: string): T[] {
 	try {
 		const j = JSON.parse(s);
 		return Array.isArray(j) ? j : [j];
 	} catch {
-		/* continue */
 	}
 
 	const fence = s.match(/```(?:json)?\s*([\s\S]*?)```/i);
@@ -4481,7 +4882,6 @@ function extractJsonObjects<T>(s: string): T[] {
 			const j = JSON.parse(fence[1]);
 			return Array.isArray(j) ? j : [j];
 		} catch {
-			/* continue */
 		}
 	}
 
@@ -4491,7 +4891,6 @@ function extractJsonObjects<T>(s: string): T[] {
 			const j = JSON.parse(obj[0]);
 			return Array.isArray(j) ? j : [j];
 		} catch {
-			/* continue */
 		}
 	}
 
