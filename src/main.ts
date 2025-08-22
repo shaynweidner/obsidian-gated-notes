@@ -163,12 +163,21 @@ interface LlmLogEntry {
 		| "correct_tag"
 		| "analyze_image"
 		| "generate_from_selection_single"
-		| "generate_from_selection_many";
+		| "generate_from_selection_many"
+		| "pdf_to_note";
 	model: string;
 	inputTokens: number;
 	outputTokens: number;
 	cost: number | null;
-    cardsGenerated?: number;
+	cardsGenerated?: number;
+	textContentTokens?: number;
+}
+
+interface GetDynamicInputsResult {
+	promptText: string;
+	imageCount: number;
+	action: LlmLogEntry["action"];
+	details?: { cardCount?: number; textContentTokens?: number };
 }
 
 const LLM_LOG_FILE = "_llm_log.json";
@@ -177,7 +186,7 @@ const IMAGE_TOKEN_COST = 1105;
 export default class GatedNotesPlugin extends Plugin {
 	settings!: Settings;
 	public lastModalTransform: string | null = null;
-    private openai: OpenAI | null = null;
+	private openai: OpenAI | null = null;
 	private cardBrowserState: CardBrowserState = {
 		openSubjects: new Set(),
 		activeChapterPath: null,
@@ -231,12 +240,7 @@ export default class GatedNotesPlugin extends Plugin {
 
 	public createCostEstimatorUI(
 		container: HTMLElement,
-		getDynamicInputs: () => {
-			promptText: string;
-			imageCount: number;
-			action: LlmLogEntry["action"];
-			details?: { cardCount?: number };
-		}
+		getDynamicInputs: () => GetDynamicInputsResult
 	): { update: () => Promise<string> } {
 		const costEl = container.createEl("small", {
 			text: "Calculating cost...",
@@ -245,21 +249,22 @@ export default class GatedNotesPlugin extends Plugin {
 		costEl.style.display = "block";
 		costEl.style.marginTop = "10px";
 		costEl.style.opacity = "0.7";
-	
+
 		let lastCostString = "";
-	
+
 		const update = async () => {
-			const { promptText, imageCount, action, details } = getDynamicInputs();
-	
+			const { promptText, imageCount, action, details } =
+				getDynamicInputs();
+
 			const model =
 				imageCount > 0
 					? this.settings.openaiMultimodalModel
 					: this.settings.openaiModel;
-	
+
 			const textTokens = countTextTokens(promptText);
 			const imageTokens = calculateImageTokens(imageCount);
 			const inputTokens = textTokens + imageTokens;
-	
+
 			const { formattedString } = await getEstimatedCost(
 				this,
 				this.settings.apiProvider,
@@ -268,12 +273,12 @@ export default class GatedNotesPlugin extends Plugin {
 				inputTokens,
 				details
 			);
-	
+
 			costEl.setText(formattedString);
 			lastCostString = formattedString;
 			return formattedString;
 		};
-	
+
 		return { update };
 	}
 
@@ -542,6 +547,11 @@ export default class GatedNotesPlugin extends Plugin {
 			name: "Remove all image analysis data",
 			callback: () => this.removeAllImageAnalysis(),
 		});
+		this.addCommand({
+			id: "gn-pdf-to-note",
+			name: "Convert PDF to Note (Experimental)",
+			callback: () => new PdfToNoteModal(this).open(),
+		});
 	}
 
 	private registerRibbonIcons(): void {
@@ -673,8 +683,8 @@ export default class GatedNotesPlugin extends Plugin {
 
 	private initializeOpenAIClient(): void {
 		const { apiProvider, openaiApiKey, lmStudioUrl } = this.settings;
-	
-		if (apiProvider === 'openai') {
+
+		if (apiProvider === "openai") {
 			if (!openaiApiKey) {
 				this.openai = null;
 				return;
@@ -683,10 +693,10 @@ export default class GatedNotesPlugin extends Plugin {
 				apiKey: openaiApiKey,
 				dangerouslyAllowBrowser: true,
 			});
-		} else { 
+		} else {
 			this.openai = new OpenAI({
 				baseURL: `${lmStudioUrl.replace(/\/$/, "")}/v1`,
-				apiKey: 'lm-studio', 
+				apiKey: "lm-studio",
 				dangerouslyAllowBrowser: true,
 			});
 		}
@@ -1221,7 +1231,9 @@ ${contextPrompt}Here is the article:
 ${plainTextForLlm}`;
 
 		notice.setMessage(`🤖 Generating ${count} flashcard(s)...`);
-		const { content: response, usage } = await this.sendToLlm(initialPrompt);
+		const { content: response, usage } = await this.sendToLlm(
+			initialPrompt
+		);
 		notice.hide();
 		if (!response) {
 			new Notice("LLM generation failed. See console for details.");
@@ -1288,9 +1300,14 @@ ${plainTextForLlm}`;
 			cardsToFix = stillUnfixed;
 		}
 
+		let finalNoticeText = "";
+
 		if (goodCards.length > 0) {
 			const deckPath = getDeckPathForChapter(file.path);
 			const graph = await this.readDeck(deckPath);
+
+			const newCardIds = goodCards.map((card) => card.id);
+
 			goodCards.forEach((card) => (graph[card.id] = card));
 			const deckFile =
 				(this.app.vault.getAbstractFileByPath(deckPath) as TFile) ||
@@ -1298,22 +1315,34 @@ ${plainTextForLlm}`;
 			await this.writeDeck(deckPath, graph);
 			if (usage) {
 				await logLlmCall(this, {
-					action: existingCardsForContext ? "generate_additional" : "generate",
+					action: existingCardsForContext
+						? "generate_additional"
+						: "generate",
 					model: this.settings.openaiModel,
 					inputTokens: usage.prompt_tokens,
 					outputTokens: usage.completion_tokens,
 					cardsGenerated: goodCards.length,
 				});
 			}
+
 			await this.promptToReviewNewCards(goodCards, deckFile, graph);
+
+			const keptCardsCount = newCardIds.filter((id) => graph[id]).length;
+			const discardedCount = newCardIds.length - keptCardsCount;
+
+			finalNoticeText = `✅ Added ${keptCardsCount} card(s).`;
+			if (discardedCount > 0) {
+				finalNoticeText += ` (${discardedCount} discarded during review)`;
+			}
+		} else {
+			finalNoticeText = "No new cards were generated.";
 		}
 
-		let noticeText = `✅ Added ${goodCards.length} cards.`;
 		if (correctedCount > 0)
-			noticeText += ` 🤖 Auto-corrected ${correctedCount} tags.`;
+			finalNoticeText += ` 🤖 Auto-corrected ${correctedCount} tags.`;
 		if (cardsToFix.length > 0)
-			noticeText += ` ⚠️ Failed to fix ${cardsToFix.length} tags (see console).`;
-		new Notice(noticeText);
+			finalNoticeText += ` ⚠️ Failed to fix ${cardsToFix.length} tags (see console).`;
+		new Notice(finalNoticeText);
 
 		this.refreshReading();
 		this.refreshAllStatuses();
@@ -1346,7 +1375,9 @@ ${cardJson}
 ${JSON.stringify(sourceText)}
 ---`;
 
-			const { content: fixResponse, usage } = await this.sendToLlm(correctionPrompt);
+			const { content: fixResponse, usage } = await this.sendToLlm(
+				correctionPrompt
+			);
 			if (fixResponse) {
 				try {
 					const fixedItems = extractJsonObjects<{
@@ -1363,7 +1394,7 @@ ${JSON.stringify(sourceText)}
 						if (paraIdx !== undefined) {
 							if (usage) {
 								await logLlmCall(this, {
-									action: 'correct_tag',
+									action: "correct_tag",
 									model: this.settings.openaiModel,
 									inputTokens: usage.prompt_tokens,
 									outputTokens: usage.completion_tokens,
@@ -1433,7 +1464,7 @@ ${selection}
 			await this.saveCards(file, [card]);
 			if (usage) {
 				await logLlmCall(this, {
-					action: 'generate_from_selection_single',
+					action: "generate_from_selection_single",
 					model: this.settings.openaiModel,
 					inputTokens: usage.prompt_tokens,
 					outputTokens: usage.completion_tokens,
@@ -1471,7 +1502,9 @@ ${selection}
 """`;
 
 			try {
-				const { content: response, usage } = await this.sendToLlm(prompt);
+				const { content: response, usage } = await this.sendToLlm(
+					prompt
+				);
 				if (!response)
 					throw new Error("AI returned an empty response.");
 
@@ -1495,9 +1528,9 @@ ${selection}
 					})
 				);
 
-				if (usage) { 
+				if (usage) {
 					await logLlmCall(this, {
-						action: 'generate_from_selection_many',
+						action: "generate_from_selection_many",
 						model: this.settings.openaiModel,
 						inputTokens: usage.prompt_tokens,
 						outputTokens: usage.completion_tokens,
@@ -1769,23 +1802,63 @@ ${selection}
 					} else {
 						try {
 							const range = findTextRange(card.tag, wrapper);
-							const mark = document.createElement("mark");
-							range.surroundContents(mark);
-							mark.scrollIntoView({
-								behavior: "smooth",
-							});
-							applyHighlight(mark);
-							setTimeout(() => {
-								const parent = mark.parentNode;
-								if (parent) {
-									while (mark.firstChild)
-										parent.insertBefore(
-											mark.firstChild,
-											mark
-										);
-									parent.removeChild(mark);
+							
+							const startContainer = range.startContainer;
+							const endContainer = range.endContainer;
+							
+							if (startContainer !== endContainer || 
+								startContainer.parentElement !== endContainer.parentElement) {
+								
+								
+								
+								wrapper.scrollIntoView({
+									behavior: "smooth",
+								});
+								
+								const selection = window.getSelection();
+								if (selection) {
+									selection.removeAllRanges();
+									selection.addRange(range);
+									
+									const style = document.createElement('style');
+									style.textContent = `
+										::selection {
+											background-color: ${highlightColor} !important;
+											color: inherit !important;
+										}
+										::-moz-selection {
+											background-color: ${highlightColor} !important;
+											color: inherit !important;
+										}
+									`;
+									document.head.appendChild(style);
+									
+									setTimeout(() => {
+										selection.removeAllRanges();
+										document.head.removeChild(style);
+									}, 1500);
 								}
-							}, 1500);
+								
+							} else {
+								const mark = document.createElement("mark");
+								range.surroundContents(mark);
+								mark.scrollIntoView({
+									behavior: "smooth",
+								});
+								applyHighlight(mark);
+								setTimeout(() => {
+									const parent = mark.parentNode;
+									if (parent) {
+										while (mark.firstChild)
+											parent.insertBefore(
+												mark.firstChild,
+												mark
+											);
+										parent.removeChild(mark);
+									}
+								}, 1500);
+							}
+							
 						} catch (e) {
 							this.logger(
 								LogLevel.NORMAL,
@@ -1941,7 +2014,7 @@ ${selection}
 			deckFile ?? (await this.app.vault.create(deckPath, "{}")),
 			() => new Notice("✅ Flashcard created."),
 			undefined,
-			'edit'
+			"edit"
 		);
 	}
 
@@ -2342,7 +2415,10 @@ ${selection}
 	
 	Your final output must be ONLY the JSON object.`;
 
-			const { content: response, usage } = await this.sendToLlm(prompt, imageUrl);
+			const { content: response, usage } = await this.sendToLlm(
+				prompt,
+				imageUrl
+			);
 			if (!response) throw new Error("LLM returned an empty response.");
 
 			const analysis = extractJsonObjects<any>(response)[0];
@@ -2353,7 +2429,7 @@ ${selection}
 			}
 			if (usage) {
 				await logLlmCall(this, {
-					action: 'analyze_image',
+					action: "analyze_image",
 					model: this.settings.openaiMultimodalModel,
 					inputTokens: usage.prompt_tokens,
 					outputTokens: usage.completion_tokens,
@@ -2567,7 +2643,7 @@ ${selection}
 				.setTooltip("Edit")
 				.onClick(async () => {
 					const graph = await this.readDeck(deck.path);
-			
+
 					this.openEditModal(
 						card,
 						graph,
@@ -2576,7 +2652,7 @@ ${selection}
 							if (actionTaken) {
 								state = "abort";
 								modal.close();
-			
+
 								if (newCards && newCards.length > 0) {
 									this.promptToReviewNewCards(
 										newCards,
@@ -2587,7 +2663,7 @@ ${selection}
 							}
 						},
 						undefined,
-						'review' 
+						"review"
 					);
 				});
 			new ButtonComponent(bottomBar)
@@ -2650,7 +2726,7 @@ ${selection}
 		deck: TFile,
 		onDone: (actionTaken: boolean, newCards?: Flashcard[]) => void,
 		reviewContext?: { index: number; total: number },
-		parentContext?: 'edit' | 'review'
+		parentContext?: "edit" | "review"
 	): void {
 		new EditModal(this, card, graph, deck, onDone, reviewContext).open();
 	}
@@ -2664,14 +2740,18 @@ ${selection}
 
 		const userWantsToReview = await new Promise<boolean>((resolve) => {
 			const modal = new Modal(this.app);
+			let choiceMade = false; 
+
 			modal.titleEl.setText("Review New Cards?");
 			modal.contentEl.createEl("p", {
 				text: `You've created ${newCards.length} new card(s). Would you like to review and edit them now?`,
 			});
 			const btnRow = modal.contentEl.createDiv({ cls: "gn-edit-btnrow" });
+
 			new ButtonComponent(btnRow)
 				.setButtonText("No, I'll do it later")
 				.onClick(() => {
+					choiceMade = true;
 					modal.close();
 					resolve(false);
 				});
@@ -2679,11 +2759,17 @@ ${selection}
 				.setButtonText("Yes, Review Now")
 				.setCta()
 				.onClick(() => {
+					choiceMade = true;
 					modal.close();
 					resolve(true);
 				});
 
-			modal.onClose = () => resolve(false);
+			modal.onClose = () => {
+				if (!choiceMade) {
+					resolve(false);
+				}
+			};
+
 			modal.open();
 		});
 
@@ -2881,59 +2967,58 @@ ${selection}
 			new Notice("AI client is not configured. Check plugin settings.");
 			return { content: "" };
 		}
-	
-		const {
-			apiProvider,
-			lmStudioModel,
-			openaiTemperature,
-		} = this.settings;
-	
+
+		const { apiProvider, lmStudioModel, openaiTemperature } = this.settings;
+
 		if (apiProvider === "lmstudio" && imageUrl) {
 			new Notice("Image analysis is not supported with LM Studio.");
 			return { content: "" };
 		}
-	
+
 		const model = imageUrl
 			? this.settings.openaiMultimodalModel
 			: apiProvider === "openai"
 			? this.settings.openaiModel
 			: lmStudioModel;
-	
+
 		try {
-			const messageContent: OpenAI.Chat.Completions.ChatCompletionContentPart[] = [
-				{ type: "text", text: prompt },
-			];
+			const messageContent: OpenAI.Chat.Completions.ChatCompletionContentPart[] =
+				[{ type: "text", text: prompt }];
 			if (imageUrl) {
 				messageContent.push({
 					type: "image_url",
 					image_url: { url: imageUrl },
 				});
 			}
-	
-			const payload: OpenAI.Chat.Completions.ChatCompletionCreateParams = {
-				model,
-				temperature: openaiTemperature,
-				messages: [{ role: "user", content: messageContent }],
-			};
-	
+
+			const payload: OpenAI.Chat.Completions.ChatCompletionCreateParams =
+				{
+					model,
+					temperature: openaiTemperature,
+					messages: [{ role: "user", content: messageContent }],
+				};
+
 			this.logger(LogLevel.VERBOSE, "Sending payload to LLM:", payload);
-	
+
 			const response = await this.openai.chat.completions.create(payload);
-	
-			this.logger(LogLevel.VERBOSE, "Received payload from LLM:", response);
-	
+
+			this.logger(
+				LogLevel.VERBOSE,
+				"Received payload from LLM:",
+				response
+			);
+
 			const responseText = response.choices?.[0]?.message?.content ?? "";
 			this.logger(
 				LogLevel.VERBOSE,
 				"Received response content from LLM:",
 				responseText
 			);
-	
+
 			return {
 				content: responseText,
 				usage: response.usage,
 			};
-	
 		} catch (e: unknown) {
 			this.logger(LogLevel.NORMAL, `API Error for ${apiProvider}:`, e);
 			new Notice(`${apiProvider} API error – see developer console.`);
@@ -3125,41 +3210,696 @@ ${selection}
 	}
 }
 
+class PdfToNoteModal extends Modal {
+	private fileInput!: HTMLInputElement;
+	private chapterNameInput!: TextComponent;
+	private folderSelect!: HTMLSelectElement;
+	private newFolderInput!: TextComponent;
+	private pdfViewer!: HTMLElement;
+	private costUi!: { update: () => Promise<string> };
+	private extractedText: string = "";
+	private selectedFile: File | null = null;
+	private exampleNotePath: string = "";
+	private exampleNoteContent: string = "";
+
+	constructor(private plugin: GatedNotesPlugin) {
+		super(plugin.app);
+	}
+
+	async onOpen() {
+		this.titleEl.setText("Convert PDF to Note (EXPERIMENTAL)");
+		this.modalEl.addClass("gn-pdf-modal");
+		makeModalDraggable(this, this.plugin);
+
+		const warningEl = this.contentEl.createDiv({
+			attr: { style: "background: var(--background-modifier-error); padding: 10px; border-radius: 5px; margin-bottom: 15px;" }
+		});
+		warningEl.createEl("strong", { text: "⚠️ Experimental Feature" });
+		warningEl.createEl("p", { 
+			text: "This PDF conversion feature is experimental. Results may vary depending on PDF complexity and formatting. Always review the generated content carefully.",
+			attr: { style: "margin: 5px 0 0 0; font-size: 0.9em;" }
+		});
+
+		const fileSection = this.contentEl.createDiv();
+		fileSection.createEl("h4", { text: "Select PDF File" });
+
+		const fileButton = fileSection.createEl("button", {
+			text: "Choose PDF File",
+			cls: "mod-cta",
+		});
+
+		this.fileInput = fileSection.createEl("input", {
+			type: "file",
+			attr: { accept: ".pdf", style: "display: none;" },
+		}) as HTMLInputElement;
+
+		fileButton.onclick = () => this.fileInput.click();
+		this.fileInput.onchange = (e) => this.handleFileSelection(e);
+
+		this.pdfViewer = fileSection.createDiv({
+			cls: "pdf-viewer",
+			attr: {
+				style: "margin-top: 10px; min-height: 200px; border: 1px solid var(--background-modifier-border); padding: 10px;",
+			},
+		});
+		this.pdfViewer.setText("No PDF selected");
+
+		new Setting(this.contentEl)
+			.setName("Chapter Name")
+			.setDesc("Name for the new note/chapter")
+			.addText((text) => {
+				this.chapterNameInput = text;
+				text.setPlaceholder("Enter chapter name...");
+				text.onChange(() => this.costUi?.update());
+			});
+
+		const folderSection = this.contentEl.createDiv();
+		folderSection.createEl("h4", { text: "Destination Folder" });
+
+		this.folderSelect = folderSection.createEl("select");
+		await this.populateFolderOptions();
+
+		this.folderSelect.onchange = () => {
+			const isNewFolder = this.folderSelect.value === "__new__";
+			this.newFolderInput.inputEl.style.display = isNewFolder
+				? "block"
+				: "none";
+		};
+
+		this.newFolderInput = new TextComponent(folderSection);
+		this.newFolderInput.setPlaceholder("Enter new folder name...");
+		this.newFolderInput.inputEl.style.display = "none";
+
+		const exampleSection = this.contentEl.createDiv();
+		exampleSection.createEl("h4", { text: "Example Note (Optional)" });
+		exampleSection.createEl("p", {
+			text: "Select an existing note to use as a structural template for the conversion.",
+			cls: "setting-item-description",
+		});
+
+		const exampleButtonContainer = exampleSection.createDiv({
+			cls: "gn-edit-row",
+		});
+		const exampleButton = exampleButtonContainer.createEl("button", {
+			text: "Choose Example Note",
+		});
+
+		const exampleDisplay = exampleSection.createDiv({
+			attr: {
+				style: "margin-top: 10px; font-style: italic; color: var(--text-muted);",
+			},
+		});
+		exampleDisplay.setText("No example note selected");
+
+		exampleButton.onclick = () =>
+			this.openExampleNoteSelector(exampleDisplay);
+
+		const costContainer = this.contentEl.createDiv();
+		this.costUi = this.plugin.createCostEstimatorUI(costContainer, (): GetDynamicInputsResult => {
+			const promptText = this.buildPrompt(this.extractedText, this.exampleNoteContent);
+			const textContentTokens = countTextTokens(this.extractedText); 
+			return {
+				promptText,
+				imageCount: 0,
+				action: "pdf_to_note",
+				details: { textContentTokens },
+			};
+		});
+
+		new Setting(this.contentEl)
+			.addButton((btn) =>
+				btn.setButtonText("Cancel").onClick(() => this.close())
+			)
+			.addButton((btn) =>
+				btn
+					.setButtonText("Convert")
+					.setCta()
+					.onClick(() => this.handleConvert())
+			);
+	}
+
+	private async handleFileSelection(event: Event): Promise<void> {
+		const target = event.target as HTMLInputElement;
+		const file = target.files?.[0];
+		if (!file) return;
+
+		this.selectedFile = file;
+		this.pdfViewer.setText("Processing PDF...");
+
+		try {
+			const pdfjsLib = await this.loadPdfJs();
+
+			const arrayBuffer = await file.arrayBuffer();
+			const typedArray = new Uint8Array(arrayBuffer);
+
+			const pdf = await pdfjsLib.getDocument(typedArray).promise;
+			let fullText = "";
+
+			for (let i = 1; i <= pdf.numPages; i++) {
+				const page = await pdf.getPage(i);
+				const textContent = await page.getTextContent();
+				const pageText = this.extractParagraphsFromTextContent(
+					textContent.items
+				);
+				fullText += `\n\n--- PAGE ${i} ---\n\n` + pageText + "\n";
+			}
+
+			this.extractedText = fullText;
+
+			this.pdfViewer.empty();
+			const preview = this.pdfViewer.createEl("div");
+			preview.createEl("p", {
+				text: `✅ PDF processed: ${file.name} (${pdf.numPages} pages)`,
+			});
+			const textPreview = preview.createEl("pre", {
+				attr: {
+					style: "max-height: 150px; overflow-y: auto; font-size: 12px; background: var(--background-secondary); padding: 10px;",
+				},
+			});
+			textPreview.setText(fullText.substring(0, 500) + "...");
+
+			if (!this.chapterNameInput.getValue()) {
+				const suggestedName = file.name.replace(/\.pdf$/i, "");
+				this.chapterNameInput.setValue(suggestedName);
+			}
+
+			await this.costUi.update();
+		} catch (error) {
+			const errorMessage =
+				error instanceof Error
+					? error.message
+					: "Unknown error occurred";
+			this.pdfViewer.setText(`Error processing PDF: ${errorMessage}`);
+			console.error("PDF processing error:", error);
+		}
+	}
+
+	private async loadPdfJs(): Promise<any> {
+		if ((window as any).pdfjsLib) {
+			return (window as any).pdfjsLib;
+		}
+
+		try {
+			const script = document.createElement("script");
+			script.src =
+				"https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js";
+			document.head.appendChild(script);
+
+			return new Promise((resolve, reject) => {
+				script.onload = () => {
+					const pdfjsLib = (window as any).pdfjsLib;
+					if (pdfjsLib) {
+						pdfjsLib.GlobalWorkerOptions.workerSrc =
+							"https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js";
+						resolve(pdfjsLib);
+					} else {
+						reject(new Error("pdf.js failed to load"));
+					}
+				};
+				script.onerror = () =>
+					reject(new Error("Failed to load pdf.js from CDN"));
+
+				setTimeout(
+					() => reject(new Error("pdf.js loading timeout")),
+					10000
+				);
+			});
+		} catch (error) {
+			throw new Error(
+				"pdf.js not available. Please check your internet connection."
+			);
+		}
+	}
+
+	private extractParagraphsFromTextContent(items: any[]): string {
+		items.sort((a, b) => {
+			const yDiff = b.transform[5] - a.transform[5];
+			if (Math.abs(yDiff) > 2) return yDiff;
+			return a.transform[4] - b.transform[4];
+		});
+
+		const lines = [];
+		let currentLine = [];
+		let lastY = null;
+		let lastLineY = null;
+		const paragraphGapThreshold = 8;
+
+		for (const item of items) {
+			const y = item.transform[5];
+
+			if (lastY !== null && Math.abs(y - lastY) > 1) {
+				const lineText = currentLine
+					.map((i) => i.str)
+					.join(" ")
+					.trim();
+				if (lineText) {
+					if (
+						lastLineY !== null &&
+						Math.abs(y - lastLineY) > paragraphGapThreshold
+					) {
+						lines.push(""); 
+					}
+					lines.push(lineText);
+					lastLineY = lastY;
+				}
+				currentLine = [];
+			}
+
+			currentLine.push(item);
+			lastY = y;
+		}
+
+		if (currentLine.length) {
+			lines.push(
+				currentLine
+					.map((i) => i.str)
+					.join(" ")
+					.trim()
+			);
+		}
+
+		return lines.join("\n");
+	}
+
+	private async populateFolderOptions(): Promise<void> {
+		const folders = this.app.vault
+			.getAllLoadedFiles()
+			.filter((file) => file.parent?.isRoot() && "children" in file)
+			.map((folder) => folder.name)
+			.sort();
+
+		const rootOption = this.folderSelect.createEl("option", {
+			value: "",
+			text: "📁 Vault Root",
+		});
+
+		folders.forEach((folderName) => {
+			this.folderSelect.createEl("option", {
+				value: folderName,
+				text: `📁 ${folderName}`,
+			});
+		});
+
+		this.folderSelect.createEl("option", {
+			value: "__new__",
+			text: "➕ Create New Folder",
+		});
+	}
+
+	private openExampleNoteSelector(displayElement: HTMLElement): void {
+		const suggester = new ExampleNoteSuggester(this.app, (file: TFile) => {
+			this.exampleNotePath = file.path;
+			displayElement.setText(`📄 ${file.basename}`);
+			this.loadExampleNoteContent(file);
+		});
+		suggester.open();
+	}
+
+	private async loadExampleNoteContent(file: TFile): Promise<void> {
+		try {
+			const content = await this.app.vault.cachedRead(file);
+			this.exampleNoteContent = this.processExampleNote(content);
+			await this.costUi?.update();
+		} catch (error) {
+			console.error("Error loading example note:", error);
+			this.exampleNoteContent = "";
+		}
+	}
+
+	private processExampleNote(content: string): string {
+		const isFinalized = content.includes('class="gn-paragraph"');
+
+		let processedContent: string;
+
+		if (isFinalized) {
+			const paragraphs = getParagraphsFromFinalizedNote(content);
+			processedContent = paragraphs.map((p) => p.markdown).join("\n\n");
+		} else {
+			processedContent = content;
+		}
+
+		processedContent = processedContent.replace(
+			/!\[\[([^\]]+)\]\]/g,
+			"![IMAGE_PLACEHOLDER]"
+		);
+		processedContent = processedContent.replace(
+			/!\[([^\]]*)\]\([^)]+\)/g,
+			"![IMAGE_PLACEHOLDER]"
+		);
+
+		processedContent = processedContent.replace(
+			/<div class="gn-split-placeholder"><\/div>/g,
+			""
+		);
+
+		const paragraphs = processedContent.split(/\n\s*\n/);
+		const abbreviatedParagraphs = paragraphs.map((paragraph) => {
+			const trimmed = paragraph.trim();
+			if (!trimmed) return "";
+
+			if (
+				trimmed.startsWith("#") ||
+				trimmed.startsWith("```") ||
+				trimmed.includes("```") ||
+				trimmed.split(/\s+/).length <= 10
+			) {
+				return trimmed;
+			}
+
+			const words = trimmed.split(/\s+/);
+			if (words.length <= 6) {
+				return trimmed;
+			}
+
+			const firstTwo = words.slice(0, 2).join(" ");
+			const lastTwo = words.slice(-2).join(" ");
+			return `${firstTwo} ... ${lastTwo}`;
+		});
+
+		return abbreviatedParagraphs.filter((p) => p).join("\n\n");
+	}
+
+	private buildPrompt(textContent: string, exampleContent: string): string {
+		let systemPrompt = `You are an expert document processor. Your task is to convert raw text extracted from a PDF into clean, well-structured markdown suitable for a note-taking app like Obsidian. Follow these rules strictly:
+
+1.  **Headers**: Convert section titles (e.g., "1.1 Trading protocol") into markdown headers ("# 1.1 Trading protocol", "## 1.1.1 Order-driven markets", etc.).
+2.  **Paragraphs**: Merge consecutive lines of text into complete paragraphs, removing unnecessary line breaks.
+3.  **Footnotes**: Find footnote citations (e.g., a superscript number) and inject the corresponding footnote text directly into the main text in parentheses. For example, "...a reference^1" with footnote "1 This is the info" becomes "...a reference (This is the info)".
+4.  **Figures & Tables**: For any figures or tables, use a placeholder like "![IMAGE_PLACEHOLDER]" or recreate the table in markdown. Any accompanying text, source, or caption should be placed immediately below the placeholder or markdown table, separated by a single newline.
+5.  **Mathematics**: Format all mathematical and scientific notations using LaTeX delimiters ("$" for inline, "$" for block).
+6.  **Output**: The response should ONLY contain the final markdown text. Do not include any conversational phrases, introductions, or apologies.`;
+
+		let userPrompt = `Please convert the following text to markdown based on the system instructions.`;
+
+		if (exampleContent.trim()) {
+			userPrompt += `
+
+[EXAMPLE_NOTE_START]
+The following is an example of the desired structure and formatting style. Use this as a template for organizing and formatting your output. The "..." represents abbreviated content - you should expand these sections based on the PDF content while maintaining the same structural pattern and formatting style.
+
+${exampleContent}
+[EXAMPLE_NOTE_END]`;
+		}
+
+		userPrompt += `
+
+[START_TEXT_CONTENT]
+${textContent}
+[END_TEXT_CONTENT]`;
+
+		return systemPrompt + "\n\n" + userPrompt;
+	}
+
+	private async handleConvert(): Promise<void> {
+		if (!this.selectedFile || !this.extractedText) {
+			new Notice("Please select a PDF file first.");
+			return;
+		}
+
+		const chapterName = this.chapterNameInput.getValue().trim();
+		if (!chapterName) {
+			new Notice("Please enter a chapter name.");
+			return;
+		}
+
+		let folderPath = this.folderSelect.value;
+		if (folderPath === "__new__") {
+			const newFolderName = this.newFolderInput.getValue().trim();
+			if (!newFolderName) {
+				new Notice("Please enter a new folder name.");
+				return;
+			}
+			folderPath = newFolderName;
+
+			if (!this.app.vault.getAbstractFileByPath(folderPath)) {
+				await this.app.vault.createFolder(folderPath);
+			}
+		}
+
+		const finalCost = await this.costUi.update();
+		if (
+			!confirm(
+				`This will convert the PDF to a note.\n${finalCost}\n\nProceed?`
+			)
+		) {
+			return;
+		}
+
+		const notice = new Notice("🤖 Converting PDF to note...", 0);
+
+		try {
+			const promptText = this.buildPrompt(
+				this.extractedText,
+				this.exampleNoteContent
+			);
+
+			const textContentTokens = countTextTokens(this.extractedText);
+
+			const { content: response, usage } = await this.plugin.sendToLlm(
+				promptText
+			);
+
+			if (!response) {
+				throw new Error("LLM returned an empty response.");
+			}
+
+			const fileName = chapterName.endsWith(".md")
+				? chapterName
+				: `${chapterName}.md`;
+			const notePath = folderPath
+				? `${folderPath}/${fileName}`
+				: fileName;
+
+			await this.app.vault.create(notePath, response);
+
+			if (usage) {
+				await logLlmCall(this.plugin, {
+					action: "pdf_to_note",
+					model: this.plugin.settings.openaiModel,
+					inputTokens: usage.prompt_tokens,
+					outputTokens: usage.completion_tokens,
+					textContentTokens,
+				});
+			}
+
+			notice.setMessage(`✅ Successfully created note: ${notePath}`);
+			setTimeout(() => notice.hide(), 3000);
+
+			const newFile = this.app.vault.getAbstractFileByPath(notePath);
+			if (newFile instanceof TFile) {
+				const leaf = this.app.workspace.getLeaf(false);
+				await leaf.openFile(newFile);
+			}
+
+			this.close();
+		} catch (error) {
+			notice.hide();
+			const errorMessage =
+				error instanceof Error
+					? error.message
+					: "Unknown error occurred";
+			new Notice(`Failed to convert PDF: ${errorMessage}`);
+			this.plugin.logger(LogLevel.NORMAL, "PDF conversion error:", error);
+		}
+	}
+
+	onClose() {
+		this.contentEl.empty();
+	}
+}
+
+class ExampleNoteSuggester extends Modal {
+	private inputEl!: HTMLInputElement;
+	private suggestionsEl!: HTMLElement;
+	private allFiles: TFile[] = [];
+
+	constructor(app: App, private onSelect: (file: TFile) => void) {
+		super(app);
+		this.allFiles = this.app.vault.getMarkdownFiles();
+	}
+
+	onOpen() {
+		this.titleEl.setText("Select Example Note");
+
+		this.inputEl = this.contentEl.createEl("input", {
+			type: "text",
+			placeholder: "Type to search notes...",
+			attr: { style: "width: 100%; margin-bottom: 10px; padding: 8px;" },
+		});
+
+		this.suggestionsEl = this.contentEl.createDiv({
+			attr: {
+				style: "max-height: 300px; overflow-y: auto; border: 1px solid var(--background-modifier-border);",
+			},
+		});
+
+		this.inputEl.addEventListener("input", () => this.updateSuggestions());
+		this.inputEl.addEventListener("keydown", (e) => this.handleKeydown(e));
+
+		this.updateSuggestions();
+		this.inputEl.focus();
+	}
+
+	private updateSuggestions(): void {
+		const query = this.inputEl.value.toLowerCase();
+		const filtered = this.allFiles
+			.filter(
+				(file) =>
+					file.basename.toLowerCase().includes(query) ||
+					file.path.toLowerCase().includes(query)
+			)
+			.slice(0, 20); 
+
+		this.suggestionsEl.empty();
+
+		if (filtered.length === 0) {
+			this.suggestionsEl.createEl("div", {
+				text: "No notes found",
+				attr: {
+					style: "padding: 10px; text-align: center; color: var(--text-muted);",
+				},
+			});
+			return;
+		}
+
+		filtered.forEach((file, index) => {
+			const item = this.suggestionsEl.createEl("div", {
+				attr: {
+					style: "padding: 8px; cursor: pointer; border-bottom: 1px solid var(--background-modifier-border);",
+					"data-index": index.toString(),
+				},
+			});
+
+			item.createEl("div", {
+				text: file.basename,
+				attr: { style: "font-weight: 500;" },
+			});
+
+			item.createEl("div", {
+				text: file.path,
+				attr: { style: "font-size: 0.8em; color: var(--text-muted);" },
+			});
+
+			item.addEventListener("click", () => {
+				this.onSelect(file);
+				this.close();
+			});
+
+			item.addEventListener("mouseenter", () => {
+				this.suggestionsEl
+					.querySelectorAll("[data-index]")
+					.forEach((el) => el.removeClass("is-selected"));
+				item.addClass("is-selected");
+			});
+		});
+
+		this.suggestionsEl
+			.querySelector("[data-index='0']")
+			?.addClass("is-selected");
+	}
+
+	private handleKeydown(e: KeyboardEvent): void {
+		const selected = this.suggestionsEl.querySelector(".is-selected");
+		const items = this.suggestionsEl.querySelectorAll("[data-index]");
+
+		if (e.key === "ArrowDown") {
+			e.preventDefault();
+			if (selected) {
+				const currentIndex = parseInt(
+					selected.getAttribute("data-index") || "0"
+				);
+				const nextIndex = Math.min(currentIndex + 1, items.length - 1);
+				selected.removeClass("is-selected");
+				items[nextIndex]?.addClass("is-selected");
+			}
+		} else if (e.key === "ArrowUp") {
+			e.preventDefault();
+			if (selected) {
+				const currentIndex = parseInt(
+					selected.getAttribute("data-index") || "0"
+				);
+				const prevIndex = Math.max(currentIndex - 1, 0);
+				selected.removeClass("is-selected");
+				items[prevIndex]?.addClass("is-selected");
+			}
+		} else if (e.key === "Enter") {
+			e.preventDefault();
+			if (selected) {
+				const index = parseInt(
+					selected.getAttribute("data-index") || "0"
+				);
+				const filteredFiles = this.allFiles
+					.filter(
+						(file) =>
+							file.basename
+								.toLowerCase()
+								.includes(this.inputEl.value.toLowerCase()) ||
+							file.path
+								.toLowerCase()
+								.includes(this.inputEl.value.toLowerCase())
+					)
+					.slice(0, 20);
+
+				if (filteredFiles[index]) {
+					this.onSelect(filteredFiles[index]);
+					this.close();
+				}
+			}
+		} else if (e.key === "Escape") {
+			this.close();
+		}
+	}
+
+	onClose() {
+		this.contentEl.empty();
+	}
+}
+
 class ActionConfirmationModal extends Modal {
-    private costUi!: { update: () => Promise<string> };
+	private costUi!: { update: () => Promise<string> };
 
-    constructor(
-        private plugin: GatedNotesPlugin,
-        private title: string,
-        private getDynamicInputs: () => {
-            promptText: string;
-            imageCount: number;
-            action: LlmLogEntry["action"];
-        },
-        private onConfirm: () => void
-    ) {
-        super(plugin.app);
-    }
+	constructor(
+		private plugin: GatedNotesPlugin,
+		private title: string,
+		private getDynamicInputs: () => {
+			promptText: string;
+			imageCount: number;
+			action: LlmLogEntry["action"];
+		},
+		private onConfirm: () => void
+	) {
+		super(plugin.app);
+	}
 
-    onOpen() {
-        this.titleEl.setText(this.title);
-        makeModalDraggable(this, this.plugin);
+	onOpen() {
+		this.titleEl.setText(this.title);
+		makeModalDraggable(this, this.plugin);
 
-        const costContainer = this.contentEl.createDiv();
-        this.costUi = this.plugin.createCostEstimatorUI(costContainer, this.getDynamicInputs);
-        this.costUi.update();
+		const costContainer = this.contentEl.createDiv();
+		this.costUi = this.plugin.createCostEstimatorUI(
+			costContainer,
+			this.getDynamicInputs
+		);
+		this.costUi.update();
 
-        new Setting(this.contentEl)
-            .addButton(btn => btn.setButtonText("Cancel").onClick(() => this.close()))
-            .addButton(btn => btn.setButtonText("Confirm").setCta().onClick(async () => {
-                this.onConfirm();
-                this.close();
-            }));
-    }
+		new Setting(this.contentEl)
+			.addButton((btn) =>
+				btn.setButtonText("Cancel").onClick(() => this.close())
+			)
+			.addButton((btn) =>
+				btn
+					.setButtonText("Confirm")
+					.setCta()
+					.onClick(async () => {
+						this.onConfirm();
+						this.close();
+					})
+			);
+	}
 
-    onClose() {
-        this.contentEl.empty();
-    }
+	onClose() {
+		this.contentEl.empty();
+	}
 }
 
 class EditModal extends Modal {
@@ -3170,7 +3910,7 @@ class EditModal extends Modal {
 		private deck: TFile,
 		private onDone: (actionTaken: boolean, newCards?: Flashcard[]) => void,
 		private reviewContext?: { index: number; total: number },
-		private parentContext?: 'edit' | 'review'
+		private parentContext?: "edit" | "review"
 	) {
 		super(plugin.app);
 	}
@@ -3424,24 +4164,6 @@ class EditModal extends Modal {
 		);
 	}
 
-	private returnToParentContext() {
-		
-		if (this.parentContext === 'review') {
-			this.onDone(false);
-		} else {
-			setTimeout(() => {
-				this.plugin.openEditModal(
-					this.card,
-					this.graph,
-					this.deck,
-					this.onDone,
-					this.reviewContext,
-					this.parentContext
-				);
-			}, 100);
-		}
-	}
-
 	private async handleRefocus(evt: MouseEvent) {
 		new RefocusOptionsModal(this.plugin, (result) => {
 			if (!result) return;
@@ -3449,71 +4171,111 @@ class EditModal extends Modal {
 			const { quantity, preventDuplicates } = result;
 			const buttonEl = evt.target as HTMLButtonElement;
 	
+			const getDynamicInputsForCost = () => {
+				let contextPrompt = "";
+				if (preventDuplicates) {
+					const otherCards = Object.values(this.graph).filter(
+						(c) => c.chapter === this.card.chapter && c.id !== this.card.id
+					);
+					if (otherCards.length > 0) {
+						const simplified = otherCards.map((c) => ({
+							front: c.front,
+							back: c.back,
+						}));
+						contextPrompt = `To avoid duplicates, do not create cards that cover the same information as the following existing cards:\nExisting Cards:\n${JSON.stringify(simplified)}\n\n`;
+					}
+				}
+				
+				const cardJson = JSON.stringify({
+					front: this.card.front,
+					back: this.card.back,
+				});
+	
+				// RESTORED: Full original prompt
+				const basePrompt = `You are an AI assistant that creates a new, insightful flashcard by "refocusing" an existing one.
+	
+	**Core Rule:** Your new card MUST be created by inverting the information **explicitly present** in the original card's "front" and "back" fields. The "Source Text" is provided only for context and should NOT be used to introduce new facts into the new card.
+	
+	**Thought Process:**
+	1.  **Deconstruct the Original Card:** Identify the key subject in the "back" and the key detail in the "front".
+	2.  **Invert & Refocus:** Create a new card where the original detail becomes the subject of the question, and the original subject becomes the answer.
+	
+	---
+	**Example 1:**
+	* **Original Card:**
+		* "front": "What was the outcome of the War of Fakery in 1653?"
+		* "back": "Country A decisively defeated Country B."
+	* **Refocused Card (testing the date, which is in the front):**
+		* "front": "In what year did the War of Fakery take place?"
+		* "back": "1653"
+	
+	**Example 2:**
+	* **Original Card:**
+		* "front": "Who is said to have lived circa 365–circa 270 BC?"
+		* "back": "Pyrrho"
+	* **Refocused Card (testing the date, which is in the front):**
+		* "front": "What were the approximate years of Pyrrho's life?"
+		* "back": "circa 365–circa 270 BC"
+	---
+	
+	**Your Task:**
+	Now, apply this process to the following card.`;
+	
+				const quantityInstruction = quantity === "one" 
+					? `Return ONLY valid JSON of this shape: [{"front":"...","back":"..."}]`
+					: `Create one or more cards and return ONLY valid JSON of this shape: [{"front":"...","back":"..."}]`;
+	
+				const sourceText = JSON.stringify(this.card.tag);
+				const promptText = `${contextPrompt}${basePrompt}
+	
+	**Original Card:**
+	${cardJson}
+	
+	**Source Text for Context (use only to understand the card, not to add new facts):**
+	${sourceText}
+	
+	${quantityInstruction}`;
+	
+				return {
+					promptText,
+					imageCount: 0,
+					action: "refocus" as const,
+				};
+			};
+	
 			new ActionConfirmationModal(
 				this.plugin,
 				"Confirm Refocus",
-				() => {
-					let contextPrompt = "";
-					if (preventDuplicates) {
-						const otherCards = Object.values(this.graph).filter(
-							c => c.chapter === this.card.chapter && c.id !== this.card.id
-						);
-						if (otherCards.length > 0) {
-							const simplified = otherCards.map(c => ({ front: c.front, back: c.back }));
-							contextPrompt = `To avoid duplicates...:\n${JSON.stringify(simplified)}\n\n`;
-						}
-					}
-					const cardJson = JSON.stringify({ front: this.card.front, back: this.card.back });
-					const basePrompt = `You are an AI assistant that creates new, insightful flashcards by "refocusing" an existing one...`;
-					const quantityInstruction = quantity === "one" ? `...create a **single** new card.` : `...create **one or more** new, distinct cards.`;
-					const sourceText = JSON.stringify(this.card.tag);
-					const promptText = `${contextPrompt}${basePrompt}${quantityInstruction}${cardJson}${sourceText}`;
-					
-					return { promptText, imageCount: 0, action: 'refocus' };
-				},
+				getDynamicInputsForCost,
 				async () => {
 					buttonEl.disabled = true;
 					buttonEl.setText("Refocusing...");
 					new Notice("🤖 Generating alternative card(s)...");
 	
 					try {
-						let contextPrompt = "";
-						if (preventDuplicates) {
-							 const otherCards = Object.values(this.graph).filter(c => c.chapter === this.card.chapter && c.id !== this.card.id);
-							if (otherCards.length > 0) {
-								const simplifiedCards = otherCards.map(c => ({ front: c.front, back: c.back }));
-								contextPrompt = `To avoid duplicates...:\n${JSON.stringify(simplifiedCards)}\n\n`;
-							}
-						}
-						const cardJson = JSON.stringify({ front: this.card.front, back: this.card.back });
-						const basePrompt = `You are an AI assistant that creates new, insightful flashcards by "refocusing" an existing one.
+						const { promptText } = getDynamicInputsForCost();
+						const { content: response, usage } = await this.plugin.sendToLlm(promptText);
 	
-	**Core Rule:** Your new card(s) MUST be created by inverting the information **explicitly present** in the original card's "front" and "back" fields. The "Source Text" is provided only for context and should NOT be used to introduce new facts.`;
-						const quantityInstruction = quantity === "one" ? `**Your Task:** Apply this process to create a **single** new card.` : `**Your Task:** Apply this process to create **one or more** new, distinct cards.`;
-						const prompt = `${contextPrompt}${basePrompt}\n\n${quantityInstruction}\n\n**Original Card:**\n${cardJson}\n\n**Source Text for Context...**\n${JSON.stringify(this.card.tag)}`;
-	
-						const { content: response, usage } = await this.plugin.sendToLlm(prompt);
 						if (!response) throw new Error("LLM returned an empty response.");
-						
 						const newCards = this._createCardsFromLlmResponse(response);
 						if (newCards.length === 0) throw new Error("Could not parse new cards from LLM response.");
 	
 						if (usage) {
 							await logLlmCall(this.plugin, {
-								action: 'refocus',
+								action: "refocus",
 								model: this.plugin.settings.openaiModel,
 								inputTokens: usage.prompt_tokens,
 								outputTokens: usage.completion_tokens,
+								cardsGenerated: newCards.length,
 							});
 						}
-						
-						newCards.forEach(card => (this.graph[card.id] = card));
+	
+						newCards.forEach((card) => (this.graph[card.id] = card));
 						await this.plugin.writeDeck(this.deck.path, this.graph);
-						new Notice(`✅ Added ${newCards.length} new alternative card(s).`);
-						this.plugin.refreshAllStatuses();
-						
-						this.close();  
-						this.onDone(true, newCards); 
+	
+						this.close();
+						await this.plugin.promptToReviewNewCards(newCards, this.deck, this.graph);
+						this.onDone(true);
 					} catch (e: unknown) {
 						new Notice(`Failed to generate cards: ${(e as Error).message}`);
 					} finally {
@@ -3522,52 +4284,7 @@ class EditModal extends Modal {
 					}
 				}
 			).open();
-		});
-	}
-
-	private startNewCardReviewSequence(
-		newCards: Flashcard[],
-		currentIndex: number
-	) {
-		if (currentIndex >= newCards.length) {
-			new Notice("Finished reviewing all new cards.");
-			setTimeout(() => {
-				this.returnToParentContext();
-			}, 100);
-			return;
-		}
-
-		const card = newCards[currentIndex];
-
-		this.plugin.openEditModal(
-			card,
-			this.graph,
-			this.deck,
-			(continueReview: boolean) => {
-				if (continueReview && currentIndex + 1 < newCards.length) {
-					setTimeout(() => {
-						this.startNewCardReviewSequence(
-							newCards,
-							currentIndex + 1
-						);
-					}, 100);
-				} else if (!continueReview) {
-					new Notice("Review session ended.");
-					setTimeout(() => {
-						this.returnToParentContext();
-					}, 100);
-				} else {
-					new Notice("Finished reviewing all new cards.");
-					setTimeout(() => {
-						this.returnToParentContext();
-					}, 100);
-				}
-			},
-			{
-				index: currentIndex + 1,
-				total: newCards.length,
-			}
-		);
+		}).open();
 	}
 
 	private async handleSplit(evt: MouseEvent) {
@@ -3576,66 +4293,73 @@ class EditModal extends Modal {
 	
 			const { preventDuplicates } = result;
 			const buttonEl = evt.target as HTMLButtonElement;
-			
+	
+			const getDynamicInputsForCost = () => {
+				let contextPrompt = "";
+				if (preventDuplicates) {
+					const otherCards = Object.values(this.graph).filter(
+						(c) => c.chapter === this.card.chapter && c.id !== this.card.id
+					);
+					if (otherCards.length > 0) {
+						const simplified = otherCards.map((c) => ({
+							front: c.front,
+							back: c.back,
+						}));
+						contextPrompt = `To avoid duplicates, do not create cards that cover the same information as the following existing cards:\nExisting Cards:\n${JSON.stringify(simplified)}\n\n`;
+					}
+				}
+				
+				const cardJson = JSON.stringify({
+					front: this.card.front,
+					back: this.card.back,
+				});
+	
+				const promptText = `${contextPrompt}Take the following flashcard and split it into one or more new, simpler, more atomic flashcards. The original card may be too complex or cover multiple ideas.
+	
+	Return ONLY valid JSON of this shape: [{"front":"...","back":"..."}]
+	
+	---
+	**Original Card:**
+	${cardJson}
+	---`;
+	
+				return { promptText, imageCount: 0, action: "split" as const };
+			};
+	
 			new ActionConfirmationModal(
 				this.plugin,
 				"Confirm Split",
-				() => {
-					let contextPrompt = "";
-					if (preventDuplicates) {
-						const otherCards = Object.values(this.graph).filter(c => c.chapter === this.card.chapter && c.id !== this.card.id);
-						if (otherCards.length > 0) {
-							const simplified = otherCards.map(c => ({ front: c.front, back: c.back }));
-							contextPrompt = `...Existing Cards in this Note:\n${JSON.stringify(simplified)}\n\n`;
-						}
-					}
-					const cardJson = JSON.stringify({ front: this.card.front, back: this.card.back });
-					const promptText = `${contextPrompt}Take the following flashcard and split it...${cardJson}`;
-					return { promptText, imageCount: 0, action: 'split' };
-				},
+				getDynamicInputsForCost,
 				async () => {
 					buttonEl.disabled = true;
 					buttonEl.setText("Splitting...");
 					new Notice("🤖 Splitting card with AI...");
 	
 					try {
-						let contextPrompt = "";
-						if (preventDuplicates) {
-							 const otherCards = Object.values(this.graph).filter(c => c.chapter === this.card.chapter && c.id !== this.card.id);
-							if (otherCards.length > 0) {
-								const simplifiedCards = otherCards.map(c => ({ front: c.front, back: c.back }));
-								contextPrompt = `To avoid creating cards similar to existing ones...:\n${JSON.stringify(simplifiedCards)}\n\n`;
-							}
-						}
-						const cardJson = JSON.stringify({ front: this.card.front, back: this.card.back });
-						const prompt = `${contextPrompt}Take the following flashcard and split it into one or more new, simpler, more atomic flashcards...Return ONLY valid JSON...\n\n**Original Card:**\n${cardJson}`;
+						const { promptText } = getDynamicInputsForCost();
+						const { content: response, usage } = await this.plugin.sendToLlm(promptText);
 	
-						const { content: response, usage } = await this.plugin.sendToLlm(prompt);
 						if (!response) throw new Error("LLM returned an empty response.");
-						
 						const newCards = this._createCardsFromLlmResponse(response);
 						if (newCards.length === 0) throw new Error("Could not parse new cards from LLM response.");
 	
 						if (usage) {
-						   await logLlmCall(this.plugin, {
-								action: 'split',
+							await logLlmCall(this.plugin, {
+								action: "split",
 								model: this.plugin.settings.openaiModel,
 								inputTokens: usage.prompt_tokens,
 								outputTokens: usage.completion_tokens,
+								cardsGenerated: newCards.length,
 							});
 						}
 	
-						delete this.graph[this.card.id]; 
-						newCards.forEach(newCard => (this.graph[newCard.id] = newCard));
+						delete this.graph[this.card.id];
+						newCards.forEach((newCard) => (this.graph[newCard.id] = newCard));
 						await this.plugin.writeDeck(this.deck.path, this.graph);
-						new Notice(`✅ Split card into ${newCards.length} new card(s).`);
 	
-						this.plugin.refreshReading();
-						this.plugin.refreshAllStatuses();
-						
-						this.close(); 
-						this.onDone(true, newCards); 
-	
+						this.close();
+						await this.plugin.promptToReviewNewCards(newCards, this.deck, this.graph);
+						this.onDone(true);
 					} catch (e: unknown) {
 						new Notice(`Error splitting card: ${(e as Error).message}`);
 					} finally {
@@ -3644,122 +4368,118 @@ class EditModal extends Modal {
 					}
 				}
 			).open();
-		});
+		}).open();
 	}
 }
 
 class RefocusOptionsModal extends Modal {
-    constructor(
-        private plugin: GatedNotesPlugin,
-        private onDone: (
-            result: {
-                quantity: "one" | "many";
-                preventDuplicates: boolean;
-            } | null
-        ) => void
-    ) {
-        super(plugin.app);
-    }
+	constructor(
+		private plugin: GatedNotesPlugin,
+		private onDone: (
+			result: {
+				quantity: "one" | "many";
+				preventDuplicates: boolean;
+			} | null
+		) => void
+	) {
+		super(plugin.app);
+	}
 
-    onOpen() {
-        this.titleEl.setText("Refocus Card");
-        makeModalDraggable(this, this.plugin);
+	onOpen() {
+		this.titleEl.setText("Refocus Card");
+		makeModalDraggable(this, this.plugin);
 
-        let preventDuplicates = true;
-        let choiceMade = false;
+		let preventDuplicates = true;
+		let choiceMade = false;
 
-        this.contentEl.createEl("p", {
-            text: "How many alternative cards would you like to generate?",
-        });
+		this.contentEl.createEl("p", {
+			text: "How many alternative cards would you like to generate?",
+		});
 
-        new Setting(this.contentEl)
-            .setName("Prevent creating duplicate cards")
-            .setDesc(
-                "Sends existing cards to the AI for context to avoid creating similar ones."
-            )
-            .addToggle((toggle) => {
-                toggle
-                    .setValue(preventDuplicates)
-                    .onChange((value) => (preventDuplicates = value));
-            });
+		new Setting(this.contentEl)
+			.setName("Prevent creating duplicate cards")
+			.setDesc(
+				"Sends existing cards to the AI for context to avoid creating similar ones."
+			)
+			.addToggle((toggle) => {
+				toggle
+					.setValue(preventDuplicates)
+					.onChange((value) => (preventDuplicates = value));
+			});
 
-        const btnRow = this.contentEl.createDiv({ cls: "gn-edit-btnrow" });
-        
-        new ButtonComponent(btnRow)
-            .setButtonText("Cancel")
-            .onClick(() => {
-                choiceMade = true;
-                this.close();
-                this.onDone(null);
-            });
+		const btnRow = this.contentEl.createDiv({ cls: "gn-edit-btnrow" });
 
-        new ButtonComponent(btnRow)
-            .setButtonText("Just One")
-            .onClick(() => {
-                choiceMade = true;
-                this.close();
-                this.onDone({ quantity: "one", preventDuplicates });
-            });
-            
-        new ButtonComponent(btnRow)
-            .setButtonText("One or More")
-            .setCta()
-            .onClick(() => {
-                choiceMade = true;
-                this.close();
-                this.onDone({ quantity: "many", preventDuplicates });
-            });
+		new ButtonComponent(btnRow).setButtonText("Cancel").onClick(() => {
+			choiceMade = true;
+			this.close();
+			this.onDone(null);
+		});
 
-        this.onClose = () => {
-            if (!choiceMade) {
-                this.onDone(null);
-            }
-        };
-    }
+		new ButtonComponent(btnRow).setButtonText("Just One").onClick(() => {
+			choiceMade = true;
+			this.close();
+			this.onDone({ quantity: "one", preventDuplicates });
+		});
+
+		new ButtonComponent(btnRow)
+			.setButtonText("One or More")
+			.setCta()
+			.onClick(() => {
+				choiceMade = true;
+				this.close();
+				this.onDone({ quantity: "many", preventDuplicates });
+			});
+
+		this.onClose = () => {
+			if (!choiceMade) {
+				this.onDone(null);
+			}
+		};
+	}
 }
 
 class SplitOptionsModal extends Modal {
-    constructor(
-        private plugin: GatedNotesPlugin,
-        private onDone: (result: { preventDuplicates: boolean } | null) => void
-    ) {
-        super(plugin.app);
-    }
+	constructor(
+		private plugin: GatedNotesPlugin,
+		private onDone: (result: { preventDuplicates: boolean } | null) => void
+	) {
+		super(plugin.app);
+	}
 
-    onOpen() {
-        this.titleEl.setText("Split Card");
-        makeModalDraggable(this, this.plugin);
-        
-        let preventDuplicates = true;
+	onOpen() {
+		this.titleEl.setText("Split Card");
+		makeModalDraggable(this, this.plugin);
 
-        new Setting(this.contentEl)
-            .setName("Prevent creating duplicate cards")
-            .setDesc(
-                "Sends existing cards to the AI for context to avoid creating similar ones."
-            )
-            .addToggle((toggle) => {
-                toggle
-                    .setValue(preventDuplicates)
-                    .onChange((value) => (preventDuplicates = value));
-            });
+		let preventDuplicates = true;
 
-        new Setting(this.contentEl)
-            .addButton((btn) =>
-                btn.setButtonText("Cancel").onClick(() => {
-                    this.close();
-                    this.onDone(null);
-                })
-            )
-            .addButton((btn) =>
-                btn
-                    .setButtonText("Split")
-                    .setCta()
-                    .onClick(() => {
-                        this.close();
-                        this.onDone({ preventDuplicates });
-                    })
-            );
-    }
+		new Setting(this.contentEl)
+			.setName("Prevent creating duplicate cards")
+			.setDesc(
+				"Sends existing cards to the AI for context to avoid creating similar ones."
+			)
+			.addToggle((toggle) => {
+				toggle
+					.setValue(preventDuplicates)
+					.onChange((value) => (preventDuplicates = value));
+			});
+
+		new Setting(this.contentEl)
+			.addButton((btn) =>
+				btn.setButtonText("Cancel").onClick(() => {
+					this.close();
+					this.onDone(null);
+				})
+			)
+			.addButton((btn) =>
+				btn
+					.setButtonText("Split")
+					.setCta()
+					.onClick(() => {
+						this.close();
+						this.onDone({ preventDuplicates });
+					})
+			);
+	}
 }
 
 class CardBrowser extends Modal {
@@ -4043,7 +4763,7 @@ class GenerateCardsModal extends Modal {
 	private countInput!: TextComponent;
 	private guidanceInput?: TextAreaComponent;
 	private defaultCardCount: number = 1;
-    private costUi!: { update: () => Promise<string> };
+	private costUi!: { update: () => Promise<string> };
 
 	constructor(
 		private plugin: GatedNotesPlugin,
@@ -4086,41 +4806,46 @@ class GenerateCardsModal extends Modal {
 				new Setting(guidanceContainer)
 					.setName("Custom Guidance")
 					.setDesc(
-						"Provide specific instructions for the AI (e.g., 'Create cloze deletion cards', 'All answers must be a single word')."
+						"Provide specific instructions for the AI (e.g., 'All answers must be a single word')."
 					)
 					.addTextArea((text) => {
 						this.guidanceInput = text;
 						text.setPlaceholder("Your custom instructions...");
 						text.inputEl.rows = 4;
 						text.inputEl.style.width = "100%";
-                        text.onChange(() => this.costUi.update());
+						text.onChange(() => this.costUi.update());
 					});
 			});
 		const costContainer = this.contentEl.createDiv();
-			this.costUi = this.plugin.createCostEstimatorUI(costContainer, () => {
-				const count = Number(this.countInput.getValue()) || this.defaultCardCount;
-				const guidance = this.guidanceInput?.getValue() || "";
-				
-				const promptText = `Create ${count} new, distinct Anki-style flashcards...${guidance}...Here is the article:\n${plainText}`;
-				return {
-					promptText: promptText,
-					imageCount: 0, 
-					action: "generate",
-					details: { cardCount: count },
-				};
-			});
-			this.costUi.update();
+		this.costUi = this.plugin.createCostEstimatorUI(costContainer, () => {
+			const count =
+				Number(this.countInput.getValue()) || this.defaultCardCount;
+			const guidance = this.guidanceInput?.getValue() || "";
+
+			const promptText = `Create ${count} new, distinct Anki-style flashcards...${guidance}...Here is the article:\n${plainText}`;
+			return {
+				promptText: promptText,
+				imageCount: 0,
+				action: "generate",
+				details: { cardCount: count },
+			};
+		});
+		this.costUi.update();
 
 		new Setting(this.contentEl)
 			.addButton((button) =>
 				button
 					.setButtonText("Generate")
 					.setCta()
-					.onClick(async () => { 
-                        const finalCost = await this.costUi.update();
-                        if (!confirm(`This will generate ${this.countInput.getValue()} card(s).\n${finalCost}\n\nProceed?`)) {
-                            return;
-                        }
+					.onClick(async () => {
+						const finalCost = await this.costUi.update();
+						if (
+							!confirm(
+								`This will generate ${this.countInput.getValue()} card(s).\n${finalCost}\n\nProceed?`
+							)
+						) {
+							return;
+						}
 
 						const count = Number(this.countInput.getValue());
 						this.callback({
@@ -4144,83 +4869,91 @@ class GenerateCardsModal extends Modal {
 }
 
 class CountModal extends Modal {
-    private costUi!: { update: () => Promise<string> };
-    private countInput!: TextComponent;
+	private costUi!: { update: () => Promise<string> };
+	private countInput!: TextComponent;
 
-    constructor(
-        private plugin: GatedNotesPlugin,
-        private defaultValue: number,
-        private selectionText: string, 
-        private sourcePath: string,   
-        private callback: (num: number) => void
-    ) {
-        super(plugin.app);
-    }
+	constructor(
+		private plugin: GatedNotesPlugin,
+		private defaultValue: number,
+		private selectionText: string,
+		private sourcePath: string,
+		private callback: (num: number) => void
+	) {
+		super(plugin.app);
+	}
 
-    onOpen() {
-        this.titleEl.setText("Cards to Generate from Selection");
-        makeModalDraggable(this, this.plugin);
-        this.contentEl.createEl("p", {
-            text: "How many cards should the AI generate for this selection?",
-        });
+	onOpen() {
+		this.titleEl.setText("Cards to Generate from Selection");
+		makeModalDraggable(this, this.plugin);
+		this.contentEl.createEl("p", {
+			text: "How many cards should the AI generate for this selection?",
+		});
 
-        this.countInput = new TextComponent(this.contentEl).setValue(
-            String(this.defaultValue)
-        );
-        this.countInput.inputEl.type = "number";
-        this.countInput.onChange(() => this.costUi.update()); 
+		this.countInput = new TextComponent(this.contentEl).setValue(
+			String(this.defaultValue)
+		);
+		this.countInput.inputEl.type = "number";
+		this.countInput.onChange(() => this.costUi.update());
 
-        this.countInput.inputEl.addEventListener("keydown", (e: KeyboardEvent) => {
-            if (e.key === "Enter") {
-                e.preventDefault();
-                this.submitAndConfirm();
-            }
-        });
+		this.countInput.inputEl.addEventListener(
+			"keydown",
+			(e: KeyboardEvent) => {
+				if (e.key === "Enter") {
+					e.preventDefault();
+					this.submitAndConfirm();
+				}
+			}
+		);
 
-        const costContainer = this.contentEl.createDiv();
-        this.costUi = this.plugin.createCostEstimatorUI(costContainer, () => {
-            const count = Number(this.countInput.getValue()) || this.defaultValue;
-            const promptText = `From the following text, create ${count} concise flashcard(s)...Text:\n"""\n${this.selectionText}\n"""`;
-            return {
-                promptText: promptText,
-                imageCount: 0,
-                action: "generate_from_selection_many",
+		const costContainer = this.contentEl.createDiv();
+		this.costUi = this.plugin.createCostEstimatorUI(costContainer, () => {
+			const count =
+				Number(this.countInput.getValue()) || this.defaultValue;
+			const promptText = `From the following text, create ${count} concise flashcard(s)...Text:\n"""\n${this.selectionText}\n"""`;
+			return {
+				promptText: promptText,
+				imageCount: 0,
+				action: "generate_from_selection_many",
 				details: { cardCount: count },
-            };
-        });
-        this.costUi.update(); 
+			};
+		});
+		this.costUi.update();
 
-        new Setting(this.contentEl)
-            .addButton((button) =>
-                button.setButtonText("Cancel").onClick(() => this.close())
-            )
-            .addButton((button) =>
-                button
-                    .setButtonText("Generate")
-                    .setCta()
-                    .onClick(() => this.submitAndConfirm())
-            );
+		new Setting(this.contentEl)
+			.addButton((button) =>
+				button.setButtonText("Cancel").onClick(() => this.close())
+			)
+			.addButton((button) =>
+				button
+					.setButtonText("Generate")
+					.setCta()
+					.onClick(() => this.submitAndConfirm())
+			);
 
-        setTimeout(() => this.countInput.inputEl.focus(), 50);
-    }
+		setTimeout(() => this.countInput.inputEl.focus(), 50);
+	}
 
-    private async submitAndConfirm() {
-        const finalCost = await this.costUi.update();
-        if (!confirm(`This will generate ${this.countInput.getValue()} card(s).\n${finalCost}\n\nProceed?`)) {
-            return;
-        }
+	private async submitAndConfirm() {
+		const finalCost = await this.costUi.update();
+		if (
+			!confirm(
+				`This will generate ${this.countInput.getValue()} card(s).\n${finalCost}\n\nProceed?`
+			)
+		) {
+			return;
+		}
 
-        const num = Number(this.countInput.getValue());
-        this.close();
-        this.callback(num > 0 ? num : this.defaultValue);
-    }
+		const num = Number(this.countInput.getValue());
+		this.close();
+		this.callback(num > 0 ? num : this.defaultValue);
+	}
 }
 
 class GenerateAdditionalCardsModal extends Modal {
 	private countInput!: TextComponent;
 	private preventDuplicatesToggle!: ToggleComponent;
 	private guidanceInput?: TextAreaComponent;
-    private costUi!: { update: () => Promise<string> };
+	private costUi!: { update: () => Promise<string> };
 
 	constructor(
 		private plugin: GatedNotesPlugin,
@@ -4257,7 +4990,7 @@ class GenerateAdditionalCardsModal extends Modal {
 				this.countInput = text;
 				text.setValue(String(defaultCardCount));
 				text.inputEl.type = "number";
-                text.onChange(() => this.costUi.update());
+				text.onChange(() => this.costUi.update());
 			});
 
 		new Setting(this.contentEl)
@@ -4268,7 +5001,7 @@ class GenerateAdditionalCardsModal extends Modal {
 			.addToggle((toggle) => {
 				this.preventDuplicatesToggle = toggle;
 				toggle.setValue(true);
-                toggle.onChange(() => this.costUi.update());
+				toggle.onChange(() => this.costUi.update());
 			});
 
 		const guidanceContainer = this.contentEl.createDiv();
@@ -4291,24 +5024,30 @@ class GenerateAdditionalCardsModal extends Modal {
 			});
 
 		const costContainer = this.contentEl.createDiv();
-			this.costUi = this.plugin.createCostEstimatorUI(costContainer, () => {
-				let contextPrompt = "";
-				if (this.preventDuplicatesToggle.getValue()) {
-					const simplifiedCards = this.existingCards.map(c => ({ front: c.front, back: c.back }));
-					contextPrompt = `To avoid duplicates...:\n${JSON.stringify(simplifiedCards)}\n\n`;
-				}
-				const guidance = this.guidanceInput?.getValue() || "";
-				const count = Number(this.countInput.getValue()) || defaultCardCount;
-	
-				const promptText = `Create ${count} new...${guidance}...${contextPrompt}Here is the article:\n${plainText}`;
-				return {
-					promptText: promptText,
-					imageCount: 0,
-					action: "generate_additional",
-					details: { cardCount: count },
-				};
-			});
-			this.costUi.update();
+		this.costUi = this.plugin.createCostEstimatorUI(costContainer, () => {
+			let contextPrompt = "";
+			if (this.preventDuplicatesToggle.getValue()) {
+				const simplifiedCards = this.existingCards.map((c) => ({
+					front: c.front,
+					back: c.back,
+				}));
+				contextPrompt = `To avoid duplicates...:\n${JSON.stringify(
+					simplifiedCards
+				)}\n\n`;
+			}
+			const guidance = this.guidanceInput?.getValue() || "";
+			const count =
+				Number(this.countInput.getValue()) || defaultCardCount;
+
+			const promptText = `Create ${count} new...${guidance}...${contextPrompt}Here is the article:\n${plainText}`;
+			return {
+				promptText: promptText,
+				imageCount: 0,
+				action: "generate_additional",
+				details: { cardCount: count },
+			};
+		});
+		this.costUi.update();
 
 		new Setting(this.contentEl)
 			.addButton((button) =>
@@ -4316,10 +5055,14 @@ class GenerateAdditionalCardsModal extends Modal {
 					.setButtonText("Generate")
 					.setCta()
 					.onClick(async () => {
-                        const finalCost = await this.costUi.update();
-                        if (!confirm(`This will generate ${this.countInput.getValue()} additional card(s).\n${finalCost}\n\nProceed?`)) {
-                            return;
-                        }
+						const finalCost = await this.costUi.update();
+						if (
+							!confirm(
+								`This will generate ${this.countInput.getValue()} additional card(s).\n${finalCost}\n\nProceed?`
+							)
+						) {
+							return;
+						}
 						const count = Number(this.countInput.getValue());
 						this.callback({
 							count: count > 0 ? count : defaultCardCount,
@@ -4755,6 +5498,7 @@ async function waitForEl<T extends HTMLElement>(
 }
 
 function findTextRange(tag: string, container: HTMLElement): Range {
+
 	const normalize = (s: string) =>
 		s
 			.toLowerCase()
@@ -4762,20 +5506,34 @@ function findTextRange(tag: string, container: HTMLElement): Range {
 			.replace(/\s+/g, " ")
 			.trim();
 
-	const rawFullText = container.textContent ?? "";
+	const convertMarkdownToText = (text: string): string => {
+		const converted = text
+			.replace(/\*\*(.*?)\*\*/g, '$1')  
+			.replace(/\*(.*?)\*/g, '$1')     
+			.replace(/_(.*?)_/g, '$1')       
+			.replace(/`(.*?)`/g, '$1')       
+			;
+		return converted;
+	};
 
-	const normalizedTag = normalize(tag);
+	const rawFullText = container.textContent ?? "";
+	const convertedTag = convertMarkdownToText(tag);
+
+	const normalizedTag = normalize(convertedTag);
 	const normalizedFullText = normalize(rawFullText);
+
 
 	let startIndexInNormalized = -1;
 	let endIndexInNormalized = -1;
 
 	const perfectMatchIndex = normalizedFullText.indexOf(normalizedTag);
+
 	if (perfectMatchIndex !== -1) {
 		startIndexInNormalized = perfectMatchIndex;
 		endIndexInNormalized = perfectMatchIndex + normalizedTag.length;
 	} else {
 		const tagWords = normalizedTag.split(/\s+/).filter(Boolean);
+
 		let prefixMatch: { index: number; text: string } | null = null;
 		let suffixMatch: { index: number; text: string } | null = null;
 
@@ -4797,6 +5555,7 @@ function findTextRange(tag: string, container: HTMLElement): Range {
 			}
 		}
 
+
 		if (prefixMatch && suffixMatch) {
 			const prefixEndIndex = prefixMatch.index + prefixMatch.text.length;
 			const suffixEndIndex = suffixMatch.index + suffixMatch.text.length;
@@ -4813,6 +5572,7 @@ function findTextRange(tag: string, container: HTMLElement): Range {
 
 	const trimOffset = rawFullText.search(/\S/);
 	if (trimOffset === -1) throw new Error("Container has no text.");
+
 
 	const trimmedFullText = rawFullText.trim();
 	let startInTrimmed = -1;
@@ -4850,15 +5610,18 @@ function findTextRange(tag: string, container: HTMLElement): Range {
 	const originalStartIndex = startInTrimmed + trimOffset;
 	const originalEndIndex = endInTrimmed + trimOffset;
 
+
 	const walker = document.createTreeWalker(container, NodeFilter.SHOW_TEXT);
 	let charCount = 0;
 	let startNode: Node | undefined, endNode: Node | undefined;
 	let startOffset: number | undefined, endOffset: number | undefined;
 	let currentNode;
 
+
 	while ((currentNode = walker.nextNode())) {
 		const nodeTextLength = currentNode.textContent?.length || 0;
 		const nextCharCount = charCount + nodeTextLength;
+
 
 		if (startNode === undefined && nextCharCount > originalStartIndex) {
 			startNode = currentNode;
@@ -4882,9 +5645,12 @@ function findTextRange(tag: string, container: HTMLElement): Range {
 		throw new Error("Could not map string indices to DOM nodes.");
 	}
 
+
 	const range = document.createRange();
 	range.setStart(startNode, startOffset);
 	range.setEnd(endNode, endOffset);
+
+
 	return range;
 }
 
@@ -4976,69 +5742,109 @@ async function getLineForParagraph(
 }
 
 function extractJsonArray<T>(s: string): T[] {
-	try {
-		const parsed = JSON.parse(s);
-		return Array.isArray(parsed) ? parsed : [parsed];
-	} catch {
-	}
+    const fixJsonString = (str: string) => {
+        return str
+            .replace(/```json\s*|\s*```/g, '')
+            .trim()
+            .replace(/\\(?!["\\/bfnrtu])/g, '\\\\');
+    };
 
-	const fence = s.match(/```(?:json)?\s*([\s\S]*?)```/i);
-	if (fence && fence[1]) {
-		try {
-			const parsed = JSON.parse(fence[1]);
-			return Array.isArray(parsed) ? parsed : [parsed];
-		} catch {
-		}
-	}
+    try {
+        const parsed = JSON.parse(s.trim());
+        return Array.isArray(parsed) ? parsed : [parsed];
+    } catch (e1) {
+        try {
+            const fixed = fixJsonString(s);
+            const parsed = JSON.parse(fixed);
+            return Array.isArray(parsed) ? parsed : [parsed];
+        } catch (e2) {
+            try {
+                const arrayMatch = s.match(/\[[\s\S]*\]/);
+                if (arrayMatch) {
+                    const fixed = fixJsonString(arrayMatch[0]);
+                    const parsed = JSON.parse(fixed);
+                    return Array.isArray(parsed) ? parsed : [parsed];
+                }
+            } catch (e3) {
+                console.log("All JSON parsing methods failed");
+            }
+        }
+    }
 
-	const arr = s.match(/\[\s*[\s\S]*?\s*\]/);
-	if (arr && arr[0]) {
-		try {
-			const parsed = JSON.parse(arr[0]);
-			return Array.isArray(parsed) ? parsed : [parsed];
-		} catch {
-		}
-	}
-
-	const objMatch = s.match(/\{\s*[\s\S]*?\s*\}/);
-	if (objMatch && objMatch[0]) {
-		try {
-			return [JSON.parse(objMatch[0])];
-		} catch {
-		}
-	}
-
-	throw new Error("No valid JSON array or object found in the string.");
+    throw new Error("Could not parse JSON from LLM response");
 }
 
 function extractJsonObjects<T>(s: string): T[] {
-	try {
-		const j = JSON.parse(s);
-		return Array.isArray(j) ? j : [j];
-	} catch {
-	}
+    const fixJsonString = (str: string) => {
+        return str
+            .replace(/```json\s*|\s*```/g, '')
+            .trim()
+            .replace(/\\(?!["\\/bfnrtu])/g, '\\\\');
+    };
 
-	const fence = s.match(/```(?:json)?\s*([\s\S]*?)```/i);
-	if (fence && fence[1]) {
-		try {
-			const j = JSON.parse(fence[1]);
-			return Array.isArray(j) ? j : [j];
-		} catch {
-		}
-	}
+    try {
+        const j = JSON.parse(s);
+        return Array.isArray(j) ? j : [j];
+    } catch {}
 
-	const obj = s.match(/\{\s*[\s\S]*?\s*\}/);
-	if (obj && obj[0]) {
-		try {
-			const j = JSON.parse(obj[0]);
-			return Array.isArray(j) ? j : [j];
-		} catch {
-		}
-	}
+    try {
+        const fixed = fixJsonString(s);
+        const j = JSON.parse(fixed);
+        return Array.isArray(j) ? j : [j];
+    } catch {}
 
-	throw new Error("No valid JSON object or array found in the string.");
+    const fence = s.match(/```(?:json)?\s*([\s\S]*?)```/i);
+    if (fence && fence[1]) {
+        try {
+            const j = JSON.parse(fence[1]);
+            return Array.isArray(j) ? j : [j];
+        } catch {}
+        
+        try {
+            const fixed = fixJsonString(fence[1]);
+            const j = JSON.parse(fixed);
+            return Array.isArray(j) ? j : [j];
+        } catch {}
+    }
+
+    const arr = s.match(/\[\s*[\s\S]*?\s*\]/);
+    if (arr && arr[0]) {
+        try {
+            const parsed = JSON.parse(arr[0]);
+            return Array.isArray(parsed) ? parsed : [parsed];
+        } catch {}
+        
+        try {
+            const fixed = fixJsonString(arr[0]);
+            const parsed = JSON.parse(fixed);
+            return Array.isArray(parsed) ? parsed : [parsed];
+        } catch {}
+    }
+
+    const objMatch = s.match(/\{\s*[\s\S]*?\s*\}/);
+    if (objMatch && objMatch[0]) {
+        try {
+            return [JSON.parse(objMatch[0])];
+        } catch {}
+        
+        try {
+            const fixed = fixJsonString(objMatch[0]);
+            return [JSON.parse(fixed)];
+        } catch {}
+    }
+
+    const frontBackRegex = /^\s*Front:\s*(?<front>[\s\S]+?)\s*Back:\s*(?<back>[\s\S]+?)\s*$/im;
+    const match = s.match(frontBackRegex);
+
+    if (match && match.groups) {
+        const { front, back } = match.groups;
+        if (front && back) {
+            return [{ front: front.trim(), back: back.trim() }] as T[];
+        }
+    }
+
+    throw new Error("No valid JSON object, array, or Front/Back structure found in the string.");
 }
-
 
 function countTextTokens(text: string): number {
 	if (!text) return 0;
@@ -5048,7 +5854,6 @@ function countTextTokens(text: string): number {
 function calculateImageTokens(imageCount: number): number {
 	return imageCount * IMAGE_TOKEN_COST;
 }
-
 
 async function getLlmLog(plugin: GatedNotesPlugin): Promise<LlmLogEntry[]> {
 	const logPath = normalizePath(
@@ -5070,38 +5875,67 @@ async function estimateOutputTokens(
 	plugin: GatedNotesPlugin,
 	action: LlmLogEntry["action"],
 	model: string,
-	details: { cardCount?: number } = {}
+	details: { cardCount?: number; textContentTokens?: number } = {}
 ): Promise<number> {
-
 	const log = await getLlmLog(plugin);
 
-	if (action === 'generate' || action === 'generate_additional') {
+	if (action === "generate" || action === "generate_additional") {
 		const relevantEntries = log.filter(
 			(entry) =>
-				(entry.action === 'generate' || entry.action === 'generate_additional') &&
+				(entry.action === "generate" ||
+					entry.action === "generate_additional") &&
 				entry.model === model &&
-				entry.cardsGenerated && entry.cardsGenerated > 0
+				entry.cardsGenerated &&
+				entry.cardsGenerated > 0
 		);
 
+		if (relevantEntries.length < 1) return 0;
 
-		if (relevantEntries.length < 1) return 0; 
+		const totalTokens = relevantEntries.reduce(
+			(sum, entry) => sum + entry.outputTokens,
+			0
+		);
+		const totalCards = relevantEntries.reduce(
+			(sum, entry) => sum + entry.cardsGenerated!,
+			0
+		);
 
-		const totalTokens = relevantEntries.reduce((sum, entry) => sum + entry.outputTokens, 0);
-		const totalCards = relevantEntries.reduce((sum, entry) => sum + entry.cardsGenerated!, 0);
-		
 		const avgTokensPerCard = totalCards > 0 ? totalTokens / totalCards : 0;
-		
 
 		return Math.round(avgTokensPerCard * (details.cardCount || 1));
+	} else if (action === "pdf_to_note") {
+		const relevantEntries = log.filter(
+			(entry) =>
+				entry.action === "pdf_to_note" &&
+				entry.model === model &&
+				entry.textContentTokens &&
+				entry.textContentTokens > 0
+		);
+
+		if (relevantEntries.length < 1) {
+			return details.textContentTokens || 0;
+		}
+
+		const totalOutputTokens = relevantEntries.reduce(
+			(sum, entry) => sum + entry.outputTokens,
+			0
+		);
+		const totalTextTokens = relevantEntries.reduce(
+			(sum, entry) => sum + entry.textContentTokens!,
+			0
+		);
+
+		const outputToTextRatio =
+			totalTextTokens > 0 ? totalOutputTokens / totalTextTokens : 1;
+		return Math.round((details.textContentTokens || 0) * outputToTextRatio);
 	}
 
 	const relevantEntries = log.filter(
 		(entry) => entry.action === action && entry.model === model
 	);
 
-
 	if (relevantEntries.length < 1) {
-		return 0; 
+		return 0;
 	}
 
 	const totalOutputTokens = relevantEntries.reduce(
@@ -5133,7 +5967,12 @@ async function getEstimatedCost(
 		};
 	}
 
-	const estimatedOutput = await estimateOutputTokens(plugin, action, model, details);
+	const estimatedOutput = await estimateOutputTokens(
+		plugin,
+		action,
+		model,
+		details
+	);
 
 	const costResult = await aicostCalculate({
 		provider: "openai",
@@ -5163,7 +6002,6 @@ async function getEstimatedCost(
 		formattedString += ` (for prompt)`;
 	}
 
-
 	return { totalCost, inputCost, outputCost, formattedString };
 }
 
@@ -5182,8 +6020,10 @@ async function logLlmCall(
 		inputAmount: data.inputTokens,
 		outputAmount: data.outputTokens,
 	});
-    
-	const totalCost = costResult ? costResult.inputCost + costResult.outputCost : null;
+
+	const totalCost = costResult
+		? costResult.inputCost + costResult.outputCost
+		: null;
 
 	const newEntry: LlmLogEntry = {
 		...data,
@@ -5193,8 +6033,5 @@ async function logLlmCall(
 
 	log.push(newEntry);
 
-	await plugin.app.vault.adapter.write(
-		logPath,
-		JSON.stringify(log, null, 2)
-	);
+	await plugin.app.vault.adapter.write(logPath, JSON.stringify(log, null, 2));
 }
