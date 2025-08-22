@@ -23,6 +23,10 @@ import {
 
 import { Buffer } from "buffer";
 
+import { encode } from "gpt-tokenizer";
+import { calculateCost as aicostCalculate } from "aicost";
+import OpenAI from "openai";
+
 const DECK_FILE_NAME = "_flashcards.json";
 const SPLIT_TAG = '<div class="gn-split-placeholder"></div>';
 const PARA_CLASS = "gn-paragraph";
@@ -149,9 +153,31 @@ interface CardBrowserState {
 	isFirstRender: boolean;
 }
 
+interface LlmLogEntry {
+	timestamp: number;
+	action:
+		| "generate"
+		| "generate_additional"
+		| "refocus"
+		| "split"
+		| "correct_tag"
+		| "analyze_image"
+		| "generate_from_selection_single"
+		| "generate_from_selection_many";
+	model: string;
+	inputTokens: number;
+	outputTokens: number;
+	cost: number | null;
+    cardsGenerated?: number;
+}
+
+const LLM_LOG_FILE = "_llm_log.json";
+const IMAGE_TOKEN_COST = 1105;
+
 export default class GatedNotesPlugin extends Plugin {
 	settings!: Settings;
 	public lastModalTransform: string | null = null;
+    private openai: OpenAI | null = null;
 	private cardBrowserState: CardBrowserState = {
 		openSubjects: new Set(),
 		activeChapterPath: null,
@@ -169,6 +195,7 @@ export default class GatedNotesPlugin extends Plugin {
 
 	async onload(): Promise<void> {
 		await this.loadSettings();
+		this.initializeOpenAIClient();
 
 		this.setupStatusBar();
 		this.addSettingTab(new GNSettingsTab(this.app, this));
@@ -200,6 +227,54 @@ export default class GatedNotesPlugin extends Plugin {
 				console.log(prefix, message, ...optionalParams);
 			}
 		}
+	}
+
+	public createCostEstimatorUI(
+		container: HTMLElement,
+		getDynamicInputs: () => {
+			promptText: string;
+			imageCount: number;
+			action: LlmLogEntry["action"];
+			details?: { cardCount?: number };
+		}
+	): { update: () => Promise<string> } {
+		const costEl = container.createEl("small", {
+			text: "Calculating cost...",
+			cls: "gn-cost-estimator",
+		});
+		costEl.style.display = "block";
+		costEl.style.marginTop = "10px";
+		costEl.style.opacity = "0.7";
+	
+		let lastCostString = "";
+	
+		const update = async () => {
+			const { promptText, imageCount, action, details } = getDynamicInputs();
+	
+			const model =
+				imageCount > 0
+					? this.settings.openaiMultimodalModel
+					: this.settings.openaiModel;
+	
+			const textTokens = countTextTokens(promptText);
+			const imageTokens = calculateImageTokens(imageCount);
+			const inputTokens = textTokens + imageTokens;
+	
+			const { formattedString } = await getEstimatedCost(
+				this,
+				this.settings.apiProvider,
+				model,
+				action,
+				inputTokens,
+				details
+			);
+	
+			costEl.setText(formattedString);
+			lastCostString = formattedString;
+			return formattedString;
+		};
+	
+		return { update };
 	}
 
 	private setupStatusBar(): void {
@@ -594,6 +669,27 @@ export default class GatedNotesPlugin extends Plugin {
 			);
 			menu.showAtMouseEvent(evt);
 		});
+	}
+
+	private initializeOpenAIClient(): void {
+		const { apiProvider, openaiApiKey, lmStudioUrl } = this.settings;
+	
+		if (apiProvider === 'openai') {
+			if (!openaiApiKey) {
+				this.openai = null;
+				return;
+			}
+			this.openai = new OpenAI({
+				apiKey: openaiApiKey,
+				dangerouslyAllowBrowser: true,
+			});
+		} else { 
+			this.openai = new OpenAI({
+				baseURL: `${lmStudioUrl.replace(/\/$/, "")}/v1`,
+				apiKey: 'lm-studio', 
+				dangerouslyAllowBrowser: true,
+			});
+		}
 	}
 
 	private async reviewDue(): Promise<void> {
@@ -1125,7 +1221,7 @@ ${contextPrompt}Here is the article:
 ${plainTextForLlm}`;
 
 		notice.setMessage(`🤖 Generating ${count} flashcard(s)...`);
-		const response = await this.sendToLlm(initialPrompt);
+		const { content: response, usage } = await this.sendToLlm(initialPrompt);
 		notice.hide();
 		if (!response) {
 			new Notice("LLM generation failed. See console for details.");
@@ -1200,6 +1296,15 @@ ${plainTextForLlm}`;
 				(this.app.vault.getAbstractFileByPath(deckPath) as TFile) ||
 				(await this.app.vault.create(deckPath, "{}"));
 			await this.writeDeck(deckPath, graph);
+			if (usage) {
+				await logLlmCall(this, {
+					action: existingCardsForContext ? "generate_additional" : "generate",
+					model: this.settings.openaiModel,
+					inputTokens: usage.prompt_tokens,
+					outputTokens: usage.completion_tokens,
+					cardsGenerated: goodCards.length,
+				});
+			}
 			await this.promptToReviewNewCards(goodCards, deckFile, graph);
 		}
 
@@ -1241,7 +1346,7 @@ ${cardJson}
 ${JSON.stringify(sourceText)}
 ---`;
 
-			const fixResponse = await this.sendToLlm(correctionPrompt);
+			const { content: fixResponse, usage } = await this.sendToLlm(correctionPrompt);
 			if (fixResponse) {
 				try {
 					const fixedItems = extractJsonObjects<{
@@ -1256,6 +1361,14 @@ ${JSON.stringify(sourceText)}
 							paragraphs
 						);
 						if (paraIdx !== undefined) {
+							if (usage) {
+								await logLlmCall(this, {
+									action: 'correct_tag',
+									model: this.settings.openaiModel,
+									inputTokens: usage.prompt_tokens,
+									outputTokens: usage.completion_tokens,
+								});
+							}
 							return this.createCardObject({
 								...cardData,
 								...fixedItem,
@@ -1291,7 +1404,7 @@ ${selection}
 """`;
 
 		try {
-			const response = await this.sendToLlm(prompt);
+			const { content: response, usage } = await this.sendToLlm(prompt);
 			if (!response) throw new Error("AI returned an empty response.");
 
 			const jsonMatch = response.match(/\{[\s\S]*\}/);
@@ -1318,6 +1431,14 @@ ${selection}
 			});
 
 			await this.saveCards(file, [card]);
+			if (usage) {
+				await logLlmCall(this, {
+					action: 'generate_from_selection_single',
+					model: this.settings.openaiModel,
+					inputTokens: usage.prompt_tokens,
+					outputTokens: usage.completion_tokens,
+				});
+			}
 			new Notice("✅ AI-generated card added!");
 			this.refreshAllStatuses();
 			this.refreshReading();
@@ -1334,7 +1455,7 @@ ${selection}
 		file: TFile,
 		paraIdx: number
 	): Promise<void> {
-		new CountModal(this, 1, async (count) => {
+		new CountModal(this, 1, selection, file.path, async (count) => {
 			if (count <= 0) return;
 			const notice = new Notice(
 				`🤖 Generating ${count} card(s) from selection...`,
@@ -1350,7 +1471,7 @@ ${selection}
 """`;
 
 			try {
-				const response = await this.sendToLlm(prompt);
+				const { content: response, usage } = await this.sendToLlm(prompt);
 				if (!response)
 					throw new Error("AI returned an empty response.");
 
@@ -1373,6 +1494,15 @@ ${selection}
 						paraIdx,
 					})
 				);
+
+				if (usage) { 
+					await logLlmCall(this, {
+						action: 'generate_from_selection_many',
+						model: this.settings.openaiModel,
+						inputTokens: usage.prompt_tokens,
+						outputTokens: usage.completion_tokens,
+					});
+				}
 
 				await this.saveCards(file, cards);
 				notice.setMessage(
@@ -2212,7 +2342,7 @@ ${selection}
 	
 	Your final output must be ONLY the JSON object.`;
 
-			const response = await this.sendToLlm(prompt, imageUrl);
+			const { content: response, usage } = await this.sendToLlm(prompt, imageUrl);
 			if (!response) throw new Error("LLM returned an empty response.");
 
 			const analysis = extractJsonObjects<any>(response)[0];
@@ -2220,6 +2350,14 @@ ${selection}
 				throw new Error(
 					"LLM response was not in the expected JSON format."
 				);
+			}
+			if (usage) {
+				await logLlmCall(this, {
+					action: 'analyze_image',
+					model: this.settings.openaiMultimodalModel,
+					inputTokens: usage.prompt_tokens,
+					outputTokens: usage.completion_tokens,
+				});
 			}
 
 			return {
@@ -2735,96 +2873,71 @@ ${selection}
 		return "done";
 	}
 
-	public async sendToLlm(prompt: string, imageUrl?: string): Promise<string> {
+	public async sendToLlm(
+		prompt: string,
+		imageUrl?: string
+	): Promise<{ content: string; usage?: OpenAI.CompletionUsage }> {
+		if (!this.openai) {
+			new Notice("AI client is not configured. Check plugin settings.");
+			return { content: "" };
+		}
+	
 		const {
 			apiProvider,
-			lmStudioUrl,
 			lmStudioModel,
-			openaiApiKey,
 			openaiTemperature,
 		} = this.settings;
-
+	
 		if (apiProvider === "lmstudio" && imageUrl) {
 			new Notice("Image analysis is not supported with LM Studio.");
-			return "";
+			return { content: "" };
 		}
-
-		let apiUrl: string;
-		const headers: Record<string, string> = {
-			"Content-Type": "application/json",
-		};
-		let model: string;
-
-		if (apiProvider === "lmstudio") {
-			apiUrl = `${lmStudioUrl.replace(/\/$/, "")}/v1/chat/completions`;
-			model = lmStudioModel;
-		} else {
-			if (!openaiApiKey) {
-				new Notice("OpenAI API key is not set in plugin settings.");
-				return "";
-			}
-			apiUrl = API_URL_COMPLETIONS;
-			model = imageUrl
-				? this.settings.openaiMultimodalModel
-				: this.settings.openaiModel;
-			headers["Authorization"] = `Bearer ${openaiApiKey}`;
-		}
-
+	
+		const model = imageUrl
+			? this.settings.openaiMultimodalModel
+			: apiProvider === "openai"
+			? this.settings.openaiModel
+			: lmStudioModel;
+	
 		try {
-			const messageContent: any = imageUrl
-				? [
-						{ type: "text", text: prompt },
-						{ type: "image_url", image_url: { url: imageUrl } },
-				  ]
-				: prompt;
-
-			const payload = {
+			const messageContent: OpenAI.Chat.Completions.ChatCompletionContentPart[] = [
+				{ type: "text", text: prompt },
+			];
+			if (imageUrl) {
+				messageContent.push({
+					type: "image_url",
+					image_url: { url: imageUrl },
+				});
+			}
+	
+			const payload: OpenAI.Chat.Completions.ChatCompletionCreateParams = {
 				model,
 				temperature: openaiTemperature,
 				messages: [{ role: "user", content: messageContent }],
 			};
-
-			if (imageUrl) {
-				this.logger(
-					LogLevel.VERBOSE,
-					"Sending multimodal payload to LLM:",
-					payload
-				);
-			} else {
-				this.logger(
-					LogLevel.VERBOSE,
-					"Sending payload to LLM:",
-					payload
-				);
-			}
-
-			const response = await requestUrl({
-				url: apiUrl,
-				method: "POST",
-				headers,
-				body: JSON.stringify(payload),
-			});
-
-			if (imageUrl) {
-				this.logger(
-					LogLevel.VERBOSE,
-					"Received multimodal payload from LLM:",
-					response.json
-				);
-			}
-
-			const responseText =
-				response.json.choices?.[0]?.message?.content ?? "";
+	
+			this.logger(LogLevel.VERBOSE, "Sending payload to LLM:", payload);
+	
+			const response = await this.openai.chat.completions.create(payload);
+	
+			this.logger(LogLevel.VERBOSE, "Received payload from LLM:", response);
+	
+			const responseText = response.choices?.[0]?.message?.content ?? "";
 			this.logger(
 				LogLevel.VERBOSE,
 				"Received response content from LLM:",
 				responseText
 			);
-			return responseText;
+	
+			return {
+				content: responseText,
+				usage: response.usage,
+			};
+	
 		} catch (e: unknown) {
 			this.logger(LogLevel.NORMAL, `API Error for ${apiProvider}:`, e);
 			new Notice(`${apiProvider} API error – see developer console.`);
-			return "";
+			return { content: "" };
 		}
 	}
 
@@ -2898,6 +3011,7 @@ ${selection}
 
 	async saveSettings(): Promise<void> {
 		await this.saveData(this.settings);
+		this.initializeOpenAIClient();
 	}
 
 	public async readDeck(deckPath: string): Promise<FlashcardGraph> {
@@ -3009,6 +3123,43 @@ ${selection}
 			? bestMatch.paraId
 			: undefined;
 	}
+}
+
+class ActionConfirmationModal extends Modal {
+    private costUi!: { update: () => Promise<string> };
+
+    constructor(
+        private plugin: GatedNotesPlugin,
+        private title: string,
+        private getDynamicInputs: () => {
+            promptText: string;
+            imageCount: number;
+            action: LlmLogEntry["action"];
+        },
+        private onConfirm: () => void
+    ) {
+        super(plugin.app);
+    }
+
+    onOpen() {
+        this.titleEl.setText(this.title);
+        makeModalDraggable(this, this.plugin);
+
+        const costContainer = this.contentEl.createDiv();
+        this.costUi = this.plugin.createCostEstimatorUI(costContainer, this.getDynamicInputs);
+        this.costUi.update();
+
+        new Setting(this.contentEl)
+            .addButton(btn => btn.setButtonText("Cancel").onClick(() => this.close()))
+            .addButton(btn => btn.setButtonText("Confirm").setCta().onClick(async () => {
+                this.onConfirm();
+                this.close();
+            }));
+    }
+
+    onClose() {
+        this.contentEl.empty();
+    }
 }
 
 class EditModal extends Modal {
@@ -3274,7 +3425,6 @@ class EditModal extends Modal {
 	}
 
 	private returnToParentContext() {
-		console.log("🔧 DEBUG: returnToParentContext, parentContext:", this.parentContext);
 		
 		if (this.parentContext === 'review') {
 			this.onDone(false);
@@ -3293,217 +3443,86 @@ class EditModal extends Modal {
 	}
 
 	private async handleRefocus(evt: MouseEvent) {
-		this.plugin.logger(LogLevel.VERBOSE, "handleRefocus triggered.");
-
-		const result = await new Promise<{
-			quantity: "one" | "many";
-			preventDuplicates: boolean;
-		} | null>((resolve) => {
-			let choiceMade = false;
-			let preventDuplicates = true;
-
-			const modal = new Modal(this.plugin.app);
-			modal.titleEl.setText("Refocus Card");
-			modal.contentEl.createEl("p", {
-				text: "How many alternative cards would you like to generate?",
-			});
-
-			new Setting(modal.contentEl)
-				.setName("Prevent creating duplicate cards")
-				.setDesc(
-					"Sends existing cards to the AI for context to avoid creating similar ones."
-				)
-				.addToggle((toggle) => {
-					toggle
-						.setValue(preventDuplicates)
-						.onChange((value) => (preventDuplicates = value));
-				});
-
-			const btnRow = modal.contentEl.createDiv({ cls: "gn-edit-btnrow" });
-			new ButtonComponent(btnRow)
-				.setButtonText("Just One")
-				.onClick(() => {
-					choiceMade = true;
-					modal.close();
-					resolve({ quantity: "one", preventDuplicates });
-				});
-			new ButtonComponent(btnRow)
-				.setButtonText("One or More")
-				.setCta()
-				.onClick(() => {
-					choiceMade = true;
-					modal.close();
-					resolve({ quantity: "many", preventDuplicates });
-				});
-
-			modal.onClose = () => {
-				if (!choiceMade) {
-					resolve(null);
-				}
-			};
-			modal.open();
-		});
-
-		if (!result) {
-			this.plugin.logger(LogLevel.VERBOSE, "User cancelled selection.");
-			return;
-		}
-
-		const { quantity, preventDuplicates } = result;
-		this.plugin.logger(
-			LogLevel.VERBOSE,
-			`User selected quantity: ${quantity}, Prevent Duplicates: ${preventDuplicates}`
-		);
-
-		const buttonEl = evt.target as HTMLButtonElement;
-		buttonEl.disabled = true;
-		buttonEl.setText("Refocusing...");
-		new Notice("🤖 Generating alternative card(s)...");
-
-		try {
-			let contextPrompt = "";
-			if (preventDuplicates) {
-				this.plugin.logger(
-					LogLevel.VERBOSE,
-					"Building context prompt..."
-				);
-				const otherCards = Object.values(this.graph).filter(
-					(c) =>
-						c.chapter === this.card.chapter && c.id !== this.card.id
-				);
-
-				if (otherCards.length > 0) {
-					const simplifiedCards = otherCards.map((c) => ({
-						front: c.front,
-						back: c.back,
-					}));
-					contextPrompt = `To avoid duplicates, do not create cards that cover the same information as the following existing cards:\nExisting Cards:\n${JSON.stringify(
-						simplifiedCards
-					)}\n\n`;
-				}
-				this.plugin.logger(LogLevel.VERBOSE, "Context prompt built.");
-			}
-
-			const cardJson = JSON.stringify({
-				front: this.card.front,
-				back: this.card.back,
-			});
-
-			const basePrompt = `You are an AI assistant that creates new, insightful flashcards by "refocusing" an existing one.
+		new RefocusOptionsModal(this.plugin, (result) => {
+			if (!result) return;
 	
-	**Core Rule:** Your new card(s) MUST be created by inverting the information **explicitly present** in the original card's "front" and "back" fields. The "Source Text" is provided only for context and should NOT be used to introduce new facts.
+			const { quantity, preventDuplicates } = result;
+			const buttonEl = evt.target as HTMLButtonElement;
 	
-	**Thought Process:**
-	1.  **Deconstruct the Original Card:** Identify all key subjects, details, and relationships.
-	2.  **Invert & Refocus:** Create new card(s) where an original detail becomes the subject of a question, and an original subject becomes the answer.
-	
-	---
-	**Example (Original Card):**
-	{ "front": "What was the outcome of the War of Fakery in 1653?", "back": "Country A decisively defeated Country B." }
-	**Possible Refocused Cards:**
-	- { "front": "In what year did the War of Fakery take place?", "back": "1653" }
-	- { "front": "Who was defeated by Country A in the War of Fakery?", "back": "Country B" }
-	---`;
-
-			const quantityInstruction =
-				quantity === "one"
-					? `**Your Task:** Apply this process to create a **single** new card.`
-					: `**Your Task:** Apply this process to create **one or more** new, distinct cards. If the original card contains multiple facts, create a separate card for each.`;
-
-			const prompt = `${contextPrompt}${basePrompt}
-	
-	${quantityInstruction}
-	
-	**Original Card:**
-	${cardJson}
-	
-	**Source Text for Context (use only to understand the card, not to add new facts):**
-	${JSON.stringify(this.card.tag)}
-	
-	Return ONLY valid JSON of this shape: [{"front":"...","back":"..."}]`;
-
-			this.plugin.logger(
-				LogLevel.VERBOSE,
-				"Sending prompt to LLM:",
-				prompt
-			);
-			const response = await this.plugin.sendToLlm(prompt);
-			if (!response) throw new Error("LLM returned an empty response.");
-			this.plugin.logger(
-				LogLevel.VERBOSE,
-				"Received LLM response:",
-				response
-			);
-
-			const newCards = this._createCardsFromLlmResponse(response);
-			if (newCards.length === 0)
-				throw new Error(
-					"Could not parse any new cards from the LLM response."
-				);
-			this.plugin.logger(
-				LogLevel.VERBOSE,
-				`Parsed ${newCards.length} new cards.`
-			);
-
-			newCards.forEach((card) => (this.graph[card.id] = card));
-			await this.plugin.writeDeck(this.deck.path, this.graph);
-			new Notice(`✅ Added ${newCards.length} new alternative card(s).`);
-
-			this.plugin.refreshAllStatuses();
-
-			const userWantsToReview = await new Promise<boolean>((resolve) => {
-				let choiceMade = false;
-
-				const modal = new Modal(this.plugin.app);
-				modal.titleEl.setText("Review New Cards?");
-				modal.contentEl.createEl("p", {
-					text: `You've created ${newCards.length} new card(s). Would you like to review and edit them now?`,
-				});
-				const btnRow = modal.contentEl.createDiv({
-					cls: "gn-edit-btnrow",
-				});
-				new ButtonComponent(btnRow)
-					.setButtonText("No, I'll do it later")
-					.onClick(() => {
-						choiceMade = true;
-						modal.close();
-						resolve(false);
-					});
-				new ButtonComponent(btnRow)
-					.setButtonText("Yes, Review Now")
-					.setCta()
-					.onClick(() => {
-						choiceMade = true;
-						modal.close();
-						resolve(true);
-					});
-
-				modal.onClose = () => {
-					if (!choiceMade) {
-						resolve(false);
+			new ActionConfirmationModal(
+				this.plugin,
+				"Confirm Refocus",
+				() => {
+					let contextPrompt = "";
+					if (preventDuplicates) {
+						const otherCards = Object.values(this.graph).filter(
+							c => c.chapter === this.card.chapter && c.id !== this.card.id
+						);
+						if (otherCards.length > 0) {
+							const simplified = otherCards.map(c => ({ front: c.front, back: c.back }));
+							contextPrompt = `To avoid duplicates...:\n${JSON.stringify(simplified)}\n\n`;
+						}
 					}
-				};
-				modal.open();
-			});
-
-			this.close();
-
-			if (userWantsToReview) {
-				setTimeout(() => {
-					this.startNewCardReviewSequence(newCards, 0);
-				}, 100);
-				this.onDone(true);
-			} else {
-				this.returnToParentContext();
-			}
-		} catch (e: unknown) {
-			new Notice(`Failed to generate cards: ${(e as Error).message}`);
-			this.plugin.logger(LogLevel.NORMAL, "Failed to refocus card:", e);
-		} finally {
-			buttonEl.disabled = false;
-			buttonEl.setText("Refocus with AI");
-			this.plugin.logger(LogLevel.VERBOSE, "handleRefocus finished.");
-		}
+					const cardJson = JSON.stringify({ front: this.card.front, back: this.card.back });
+					const basePrompt = `You are an AI assistant that creates new, insightful flashcards by "refocusing" an existing one...`;
+					const quantityInstruction = quantity === "one" ? `...create a **single** new card.` : `...create **one or more** new, distinct cards.`;
+					const sourceText = JSON.stringify(this.card.tag);
+					const promptText = `${contextPrompt}${basePrompt}${quantityInstruction}${cardJson}${sourceText}`;
+					
+					return { promptText, imageCount: 0, action: 'refocus' };
+				},
+				async () => {
+					buttonEl.disabled = true;
+					buttonEl.setText("Refocusing...");
+					new Notice("🤖 Generating alternative card(s)...");
+	
+					try {
+						let contextPrompt = "";
+						if (preventDuplicates) {
+							 const otherCards = Object.values(this.graph).filter(c => c.chapter === this.card.chapter && c.id !== this.card.id);
+							if (otherCards.length > 0) {
+								const simplifiedCards = otherCards.map(c => ({ front: c.front, back: c.back }));
+								contextPrompt = `To avoid duplicates...:\n${JSON.stringify(simplifiedCards)}\n\n`;
+							}
+						}
+						const cardJson = JSON.stringify({ front: this.card.front, back: this.card.back });
+						const basePrompt = `You are an AI assistant that creates new, insightful flashcards by "refocusing" an existing one.
+	
+	**Core Rule:** Your new card(s) MUST be created by inverting the information **explicitly present** in the original card's "front" and "back" fields. The "Source Text" is provided only for context and should NOT be used to introduce new facts.`;
+						const quantityInstruction = quantity === "one" ? `**Your Task:** Apply this process to create a **single** new card.` : `**Your Task:** Apply this process to create **one or more** new, distinct cards.`;
+						const prompt = `${contextPrompt}${basePrompt}\n\n${quantityInstruction}\n\n**Original Card:**\n${cardJson}\n\n**Source Text for Context...**\n${JSON.stringify(this.card.tag)}`;
+	
+						const { content: response, usage } = await this.plugin.sendToLlm(prompt);
+						if (!response) throw new Error("LLM returned an empty response.");
+						
+						const newCards = this._createCardsFromLlmResponse(response);
+						if (newCards.length === 0) throw new Error("Could not parse new cards from LLM response.");
+	
+						if (usage) {
+							await logLlmCall(this.plugin, {
+								action: 'refocus',
+								model: this.plugin.settings.openaiModel,
+								inputTokens: usage.prompt_tokens,
+								outputTokens: usage.completion_tokens,
+							});
+						}
+						
+						newCards.forEach(card => (this.graph[card.id] = card));
+						await this.plugin.writeDeck(this.deck.path, this.graph);
+						new Notice(`✅ Added ${newCards.length} new alternative card(s).`);
+						this.plugin.refreshAllStatuses();
+						
+						this.close();  
+						this.onDone(true, newCards); 
+					} catch (e: unknown) {
+						new Notice(`Failed to generate cards: ${(e as Error).message}`);
+					} finally {
+						buttonEl.disabled = false;
+						buttonEl.setText("Refocus with AI");
+					}
+				}
+			).open();
+		});
 	}
 
 	private startNewCardReviewSequence(
@@ -3552,153 +3571,195 @@ class EditModal extends Modal {
 	}
 
 	private async handleSplit(evt: MouseEvent) {
-		const result = await new Promise<{ preventDuplicates: boolean } | null>(
-			(resolve) => {
-				let preventDuplicates = true;
-				const modal = new Modal(this.plugin.app);
-				modal.titleEl.setText("Split Card");
-
-				new Setting(modal.contentEl)
-					.setName("Prevent creating duplicate cards")
-					.setDesc(
-						"Sends existing cards to the AI for context to avoid creating similar ones."
-					)
-					.addToggle((toggle) => {
-						toggle
-							.setValue(preventDuplicates)
-							.onChange((value) => (preventDuplicates = value));
-					});
-
-				new Setting(modal.contentEl)
-					.addButton((btn) =>
-						btn.setButtonText("Cancel").onClick(() => {
-							modal.close();
-							resolve(null);
-						})
-					)
-					.addButton((btn) =>
-						btn
-							.setButtonText("Split")
-							.setCta()
-							.onClick(() => {
-								modal.close();
-								resolve({ preventDuplicates });
-							})
-					);
-
-				modal.open();
-			}
-		);
-
-		if (!result) return;
-		const { preventDuplicates } = result;
-
-		const buttonEl = evt.target as HTMLButtonElement;
-		buttonEl.disabled = true;
-		buttonEl.setText("Splitting...");
-		new Notice("🤖 Splitting card with AI...");
-
-		try {
-			let contextPrompt = "";
-			if (preventDuplicates) {
-				const otherCards = Object.values(this.graph).filter(
-					(c) =>
-						c.chapter === this.card.chapter && c.id !== this.card.id
-				);
-				if (otherCards.length > 0) {
-					const simplifiedCards = otherCards.map((c) => ({
-						front: c.front,
-						back: c.back,
-					}));
-					contextPrompt = `To avoid creating cards similar to existing ones, please review this context:\nExisting Cards in this Note:\n${JSON.stringify(
-						simplifiedCards
-					)}\n\n`;
-				}
-			}
-
-			const cardJson = JSON.stringify({
-				front: this.card.front,
-				back: this.card.back,
-			});
-			const prompt = `${contextPrompt}Take the following flashcard and split it into one or more new, simpler, more atomic flashcards. The original card may be too complex or cover multiple ideas.
+		new SplitOptionsModal(this.plugin, (result) => {
+			if (!result) return;
 	
-	Return ONLY valid JSON of this shape: [{"front":"...","back":"..."}]
-	
-	---
-	**Original Card:**
-	${cardJson}
-	---`;
-			const response = await this.plugin.sendToLlm(prompt);
-			if (!response) throw new Error("LLM returned an empty response.");
-
-			const newCards = this._createCardsFromLlmResponse(response);
-			if (newCards.length === 0)
-				throw new Error(
-					"Could not parse any new cards from LLM response."
-				);
-
-			delete this.graph[this.card.id];
-			newCards.forEach((newCard) => (this.graph[newCard.id] = newCard));
-
-			await this.plugin.writeDeck(this.deck.path, this.graph);
-			new Notice(`✅ Split card into ${newCards.length} new card(s).`);
-
-			this.plugin.refreshReading();
-			this.plugin.refreshAllStatuses();
-
-			const userWantsToReview = await new Promise<boolean>((resolve) => {
-				let choiceMade = false;
-
-				const modal = new Modal(this.plugin.app);
-				modal.titleEl.setText("Review New Cards?");
-				modal.contentEl.createEl("p", {
-					text: `You've created ${newCards.length} new card(s). Would you like to review and edit them now?`,
-				});
-				const btnRow = modal.contentEl.createDiv({
-					cls: "gn-edit-btnrow",
-				});
-				new ButtonComponent(btnRow)
-					.setButtonText("No, I'll do it later")
-					.onClick(() => {
-						choiceMade = true;
-						modal.close();
-						resolve(false);
-					});
-				new ButtonComponent(btnRow)
-					.setButtonText("Yes, Review Now")
-					.setCta()
-					.onClick(() => {
-						choiceMade = true;
-						modal.close();
-						resolve(true);
-					});
-
-				modal.onClose = () => {
-					if (!choiceMade) {
-						resolve(false);
+			const { preventDuplicates } = result;
+			const buttonEl = evt.target as HTMLButtonElement;
+			
+			new ActionConfirmationModal(
+				this.plugin,
+				"Confirm Split",
+				() => {
+					let contextPrompt = "";
+					if (preventDuplicates) {
+						const otherCards = Object.values(this.graph).filter(c => c.chapter === this.card.chapter && c.id !== this.card.id);
+						if (otherCards.length > 0) {
+							const simplified = otherCards.map(c => ({ front: c.front, back: c.back }));
+							contextPrompt = `...Existing Cards in this Note:\n${JSON.stringify(simplified)}\n\n`;
+						}
 					}
-				};
-				modal.open();
-			});
-
-			this.close();
-
-			if (userWantsToReview) {
-				setTimeout(() => {
-					this.startNewCardReviewSequence(newCards, 0);
-				}, 100);
-				this.onDone(true);
-			} else {
-				this.returnToParentContext();
-			}
-		} catch (e: unknown) {
-			new Notice(`Error splitting card: ${(e as Error).message}`);
-			this.plugin.logger(LogLevel.NORMAL, "Failed to split card:", e);
-		} finally {
-			buttonEl.disabled = false;
-			buttonEl.setText("Split with AI");
-		}
+					const cardJson = JSON.stringify({ front: this.card.front, back: this.card.back });
+					const promptText = `${contextPrompt}Take the following flashcard and split it...${cardJson}`;
+					return { promptText, imageCount: 0, action: 'split' };
+				},
+				async () => {
+					buttonEl.disabled = true;
+					buttonEl.setText("Splitting...");
+					new Notice("🤖 Splitting card with AI...");
+	
+					try {
+						let contextPrompt = "";
+						if (preventDuplicates) {
+							 const otherCards = Object.values(this.graph).filter(c => c.chapter === this.card.chapter && c.id !== this.card.id);
+							if (otherCards.length > 0) {
+								const simplifiedCards = otherCards.map(c => ({ front: c.front, back: c.back }));
+								contextPrompt = `To avoid creating cards similar to existing ones...:\n${JSON.stringify(simplifiedCards)}\n\n`;
+							}
+						}
+						const cardJson = JSON.stringify({ front: this.card.front, back: this.card.back });
+						const prompt = `${contextPrompt}Take the following flashcard and split it into one or more new, simpler, more atomic flashcards...Return ONLY valid JSON...\n\n**Original Card:**\n${cardJson}`;
+	
+						const { content: response, usage } = await this.plugin.sendToLlm(prompt);
+						if (!response) throw new Error("LLM returned an empty response.");
+						
+						const newCards = this._createCardsFromLlmResponse(response);
+						if (newCards.length === 0) throw new Error("Could not parse new cards from LLM response.");
+	
+						if (usage) {
+						   await logLlmCall(this.plugin, {
+								action: 'split',
+								model: this.plugin.settings.openaiModel,
+								inputTokens: usage.prompt_tokens,
+								outputTokens: usage.completion_tokens,
+							});
+						}
+	
+						delete this.graph[this.card.id]; 
+						newCards.forEach(newCard => (this.graph[newCard.id] = newCard));
+						await this.plugin.writeDeck(this.deck.path, this.graph);
+						new Notice(`✅ Split card into ${newCards.length} new card(s).`);
+	
+						this.plugin.refreshReading();
+						this.plugin.refreshAllStatuses();
+						
+						this.close(); 
+						this.onDone(true, newCards); 
+	
+					} catch (e: unknown) {
+						new Notice(`Error splitting card: ${(e as Error).message}`);
+					} finally {
+						buttonEl.disabled = false;
+						buttonEl.setText("Split with AI");
+					}
+				}
+			).open();
+		});
 	}
+}
+
+class RefocusOptionsModal extends Modal {
+    constructor(
+        private plugin: GatedNotesPlugin,
+        private onDone: (
+            result: {
+                quantity: "one" | "many";
+                preventDuplicates: boolean;
+            } | null
+        ) => void
+    ) {
+        super(plugin.app);
+    }
+
+    onOpen() {
+        this.titleEl.setText("Refocus Card");
+        makeModalDraggable(this, this.plugin);
+
+        let preventDuplicates = true;
+        let choiceMade = false;
+
+        this.contentEl.createEl("p", {
+            text: "How many alternative cards would you like to generate?",
+        });
+
+        new Setting(this.contentEl)
+            .setName("Prevent creating duplicate cards")
+            .setDesc(
+                "Sends existing cards to the AI for context to avoid creating similar ones."
+            )
+            .addToggle((toggle) => {
+                toggle
+                    .setValue(preventDuplicates)
+                    .onChange((value) => (preventDuplicates = value));
+            });
+
+        const btnRow = this.contentEl.createDiv({ cls: "gn-edit-btnrow" });
+        
+        new ButtonComponent(btnRow)
+            .setButtonText("Cancel")
+            .onClick(() => {
+                choiceMade = true;
+                this.close();
+                this.onDone(null);
+            });
+
+        new ButtonComponent(btnRow)
+            .setButtonText("Just One")
+            .onClick(() => {
+                choiceMade = true;
+                this.close();
+                this.onDone({ quantity: "one", preventDuplicates });
+            });
+            
+        new ButtonComponent(btnRow)
+            .setButtonText("One or More")
+            .setCta()
+            .onClick(() => {
+                choiceMade = true;
+                this.close();
+                this.onDone({ quantity: "many", preventDuplicates });
+            });
+
+        this.onClose = () => {
+            if (!choiceMade) {
+                this.onDone(null);
+            }
+        };
+    }
+}
+
+class SplitOptionsModal extends Modal {
+    constructor(
+        private plugin: GatedNotesPlugin,
+        private onDone: (result: { preventDuplicates: boolean } | null) => void
+    ) {
+        super(plugin.app);
+    }
+
+    onOpen() {
+        this.titleEl.setText("Split Card");
+        makeModalDraggable(this, this.plugin);
+        
+        let preventDuplicates = true;
+
+        new Setting(this.contentEl)
+            .setName("Prevent creating duplicate cards")
+            .setDesc(
+                "Sends existing cards to the AI for context to avoid creating similar ones."
+            )
+            .addToggle((toggle) => {
+                toggle
+                    .setValue(preventDuplicates)
+                    .onChange((value) => (preventDuplicates = value));
+            });
+
+        new Setting(this.contentEl)
+            .addButton((btn) =>
+                btn.setButtonText("Cancel").onClick(() => {
+                    this.close();
+                    this.onDone(null);
+                })
+            )
+            .addButton((btn) =>
+                btn
+                    .setButtonText("Split")
+                    .setCta()
+                    .onClick(() => {
+                        this.close();
+                        this.onDone({ preventDuplicates });
+                    })
+            );
+    }
 }
 
 class CardBrowser extends Modal {
@@ -3982,6 +4043,7 @@ class GenerateCardsModal extends Modal {
 	private countInput!: TextComponent;
 	private guidanceInput?: TextAreaComponent;
 	private defaultCardCount: number = 1;
+    private costUi!: { update: () => Promise<string> };
 
 	constructor(
 		private plugin: GatedNotesPlugin,
@@ -4013,6 +4075,7 @@ class GenerateCardsModal extends Modal {
 				this.countInput = text;
 				text.setValue(String(this.defaultCardCount));
 				text.inputEl.type = "number";
+				text.onChange(() => this.costUi.update());
 			});
 
 		const guidanceContainer = this.contentEl.createDiv();
@@ -4030,15 +4093,35 @@ class GenerateCardsModal extends Modal {
 						text.setPlaceholder("Your custom instructions...");
 						text.inputEl.rows = 4;
 						text.inputEl.style.width = "100%";
+                        text.onChange(() => this.costUi.update());
 					});
 			});
+		const costContainer = this.contentEl.createDiv();
+			this.costUi = this.plugin.createCostEstimatorUI(costContainer, () => {
+				const count = Number(this.countInput.getValue()) || this.defaultCardCount;
+				const guidance = this.guidanceInput?.getValue() || "";
+				
+				const promptText = `Create ${count} new, distinct Anki-style flashcards...${guidance}...Here is the article:\n${plainText}`;
+				return {
+					promptText: promptText,
+					imageCount: 0, 
+					action: "generate",
+					details: { cardCount: count },
+				};
+			});
+			this.costUi.update();
 
 		new Setting(this.contentEl)
 			.addButton((button) =>
 				button
 					.setButtonText("Generate")
 					.setCta()
-					.onClick(() => {
+					.onClick(async () => { 
+                        const finalCost = await this.costUi.update();
+                        if (!confirm(`This will generate ${this.countInput.getValue()} card(s).\n${finalCost}\n\nProceed?`)) {
+                            return;
+                        }
+
 						const count = Number(this.countInput.getValue());
 						this.callback({
 							count: count > 0 ? count : this.defaultCardCount,
@@ -4061,51 +4144,83 @@ class GenerateCardsModal extends Modal {
 }
 
 class CountModal extends Modal {
-	constructor(
-		private plugin: GatedNotesPlugin,
-		private defaultValue: number,
-		private callback: (num: number) => void
-	) {
-		super(plugin.app);
-	}
+    private costUi!: { update: () => Promise<string> };
+    private countInput!: TextComponent;
 
-	onOpen() {
-		this.titleEl.setText("Cards to Generate");
-		makeModalDraggable(this, this.plugin);
-		this.contentEl.createEl("p", {
-			text: "How many cards should the AI generate for this note?",
-		});
+    constructor(
+        private plugin: GatedNotesPlugin,
+        private defaultValue: number,
+        private selectionText: string, 
+        private sourcePath: string,   
+        private callback: (num: number) => void
+    ) {
+        super(plugin.app);
+    }
 
-		const input = new TextComponent(this.contentEl).setValue(
-			String(this.defaultValue)
-		);
-		input.inputEl.type = "number";
-		input.inputEl.addEventListener("keydown", (e: KeyboardEvent) => {
-			if (e.key === "Enter") {
-				e.preventDefault();
-				this.submit(input.getValue());
-			}
-		});
+    onOpen() {
+        this.titleEl.setText("Cards to Generate from Selection");
+        makeModalDraggable(this, this.plugin);
+        this.contentEl.createEl("p", {
+            text: "How many cards should the AI generate for this selection?",
+        });
 
-		new ButtonComponent(this.contentEl)
-			.setButtonText("Generate")
-			.setCta()
-			.onClick(() => this.submit(input.getValue()));
+        this.countInput = new TextComponent(this.contentEl).setValue(
+            String(this.defaultValue)
+        );
+        this.countInput.inputEl.type = "number";
+        this.countInput.onChange(() => this.costUi.update()); 
 
-		setTimeout(() => input.inputEl.focus(), 50);
-	}
+        this.countInput.inputEl.addEventListener("keydown", (e: KeyboardEvent) => {
+            if (e.key === "Enter") {
+                e.preventDefault();
+                this.submitAndConfirm();
+            }
+        });
 
-	private submit(value: string) {
-		const num = Number(value);
-		this.close();
-		this.callback(num > 0 ? num : this.defaultValue);
-	}
+        const costContainer = this.contentEl.createDiv();
+        this.costUi = this.plugin.createCostEstimatorUI(costContainer, () => {
+            const count = Number(this.countInput.getValue()) || this.defaultValue;
+            const promptText = `From the following text, create ${count} concise flashcard(s)...Text:\n"""\n${this.selectionText}\n"""`;
+            return {
+                promptText: promptText,
+                imageCount: 0,
+                action: "generate_from_selection_many",
+				details: { cardCount: count },
+            };
+        });
+        this.costUi.update(); 
+
+        new Setting(this.contentEl)
+            .addButton((button) =>
+                button.setButtonText("Cancel").onClick(() => this.close())
+            )
+            .addButton((button) =>
+                button
+                    .setButtonText("Generate")
+                    .setCta()
+                    .onClick(() => this.submitAndConfirm())
+            );
+
+        setTimeout(() => this.countInput.inputEl.focus(), 50);
+    }
+
+    private async submitAndConfirm() {
+        const finalCost = await this.costUi.update();
+        if (!confirm(`This will generate ${this.countInput.getValue()} card(s).\n${finalCost}\n\nProceed?`)) {
+            return;
+        }
+
+        const num = Number(this.countInput.getValue());
+        this.close();
+        this.callback(num > 0 ? num : this.defaultValue);
+    }
 }
 
 class GenerateAdditionalCardsModal extends Modal {
 	private countInput!: TextComponent;
 	private preventDuplicatesToggle!: ToggleComponent;
 	private guidanceInput?: TextAreaComponent;
+    private costUi!: { update: () => Promise<string> };
 
 	constructor(
 		private plugin: GatedNotesPlugin,
@@ -4142,6 +4257,7 @@ class GenerateAdditionalCardsModal extends Modal {
 				this.countInput = text;
 				text.setValue(String(defaultCardCount));
 				text.inputEl.type = "number";
+                text.onChange(() => this.costUi.update());
 			});
 
 		new Setting(this.contentEl)
@@ -4152,6 +4268,7 @@ class GenerateAdditionalCardsModal extends Modal {
 			.addToggle((toggle) => {
 				this.preventDuplicatesToggle = toggle;
 				toggle.setValue(true);
+                toggle.onChange(() => this.costUi.update());
 			});
 
 		const guidanceContainer = this.contentEl.createDiv();
@@ -4169,15 +4286,40 @@ class GenerateAdditionalCardsModal extends Modal {
 						text.setPlaceholder("Your custom instructions...");
 						text.inputEl.rows = 4;
 						text.inputEl.style.width = "100%";
+						text.onChange(() => this.costUi.update());
 					});
 			});
+
+		const costContainer = this.contentEl.createDiv();
+			this.costUi = this.plugin.createCostEstimatorUI(costContainer, () => {
+				let contextPrompt = "";
+				if (this.preventDuplicatesToggle.getValue()) {
+					const simplifiedCards = this.existingCards.map(c => ({ front: c.front, back: c.back }));
+					contextPrompt = `To avoid duplicates...:\n${JSON.stringify(simplifiedCards)}\n\n`;
+				}
+				const guidance = this.guidanceInput?.getValue() || "";
+				const count = Number(this.countInput.getValue()) || defaultCardCount;
+	
+				const promptText = `Create ${count} new...${guidance}...${contextPrompt}Here is the article:\n${plainText}`;
+				return {
+					promptText: promptText,
+					imageCount: 0,
+					action: "generate_additional",
+					details: { cardCount: count },
+				};
+			});
+			this.costUi.update();
 
 		new Setting(this.contentEl)
 			.addButton((button) =>
 				button
 					.setButtonText("Generate")
 					.setCta()
-					.onClick(() => {
+					.onClick(async () => {
+                        const finalCost = await this.costUi.update();
+                        if (!confirm(`This will generate ${this.countInput.getValue()} additional card(s).\n${finalCost}\n\nProceed?`)) {
+                            return;
+                        }
 						const count = Number(this.countInput.getValue());
 						this.callback({
 							count: count > 0 ? count : defaultCardCount,
@@ -4895,4 +5037,164 @@ function extractJsonObjects<T>(s: string): T[] {
 	}
 
 	throw new Error("No valid JSON object or array found in the string.");
+}
+
+
+function countTextTokens(text: string): number {
+	if (!text) return 0;
+	return encode(text).length;
+}
+
+function calculateImageTokens(imageCount: number): number {
+	return imageCount * IMAGE_TOKEN_COST;
+}
+
+
+async function getLlmLog(plugin: GatedNotesPlugin): Promise<LlmLogEntry[]> {
+	const logPath = normalizePath(
+		plugin.app.vault.getRoot().path + LLM_LOG_FILE
+	);
+	if (!(await plugin.app.vault.adapter.exists(logPath))) {
+		return [];
+	}
+	try {
+		const content = await plugin.app.vault.adapter.read(logPath);
+		return JSON.parse(content) as LlmLogEntry[];
+	} catch (e) {
+		plugin.logger(LogLevel.NORMAL, "Failed to read LLM Log", e);
+		return [];
+	}
+}
+
+async function estimateOutputTokens(
+	plugin: GatedNotesPlugin,
+	action: LlmLogEntry["action"],
+	model: string,
+	details: { cardCount?: number } = {}
+): Promise<number> {
+
+	const log = await getLlmLog(plugin);
+
+	if (action === 'generate' || action === 'generate_additional') {
+		const relevantEntries = log.filter(
+			(entry) =>
+				(entry.action === 'generate' || entry.action === 'generate_additional') &&
+				entry.model === model &&
+				entry.cardsGenerated && entry.cardsGenerated > 0
+		);
+
+
+		if (relevantEntries.length < 1) return 0; 
+
+		const totalTokens = relevantEntries.reduce((sum, entry) => sum + entry.outputTokens, 0);
+		const totalCards = relevantEntries.reduce((sum, entry) => sum + entry.cardsGenerated!, 0);
+		
+		const avgTokensPerCard = totalCards > 0 ? totalTokens / totalCards : 0;
+		
+
+		return Math.round(avgTokensPerCard * (details.cardCount || 1));
+	}
+
+	const relevantEntries = log.filter(
+		(entry) => entry.action === action && entry.model === model
+	);
+
+
+	if (relevantEntries.length < 1) {
+		return 0; 
+	}
+
+	const totalOutputTokens = relevantEntries.reduce(
+		(sum, entry) => sum + entry.outputTokens,
+		0
+	);
+	return Math.round(totalOutputTokens / relevantEntries.length);
+}
+
+async function getEstimatedCost(
+	plugin: GatedNotesPlugin,
+	provider: "openai" | "lmstudio",
+	model: string,
+	action: LlmLogEntry["action"],
+	inputTokens: number,
+	details: { cardCount?: number } = {}
+): Promise<{
+	totalCost: number;
+	inputCost: number;
+	outputCost: number;
+	formattedString: string;
+}> {
+	if (provider === "lmstudio") {
+		return {
+			totalCost: 0,
+			inputCost: 0,
+			outputCost: 0,
+			formattedString: "Cost: $0.00 (local model)",
+		};
+	}
+
+	const estimatedOutput = await estimateOutputTokens(plugin, action, model, details);
+
+	const costResult = await aicostCalculate({
+		provider: "openai",
+		model: model as any,
+		inputAmount: inputTokens,
+		outputAmount: estimatedOutput,
+	});
+
+	if (costResult === null) {
+		return {
+			totalCost: 0,
+			inputCost: 0,
+			outputCost: 0,
+			formattedString: "Cost: N/A (unknown model)",
+		};
+	}
+
+	const { inputCost, outputCost } = costResult;
+	const totalCost = inputCost + outputCost;
+
+	let formattedString = `Est. Cost: ~$${totalCost.toFixed(4)}`;
+	if (estimatedOutput > 0) {
+		formattedString += ` (Prompt: $${inputCost.toFixed(
+			4
+		)} + Est. Response: $${outputCost.toFixed(4)})`;
+	} else {
+		formattedString += ` (for prompt)`;
+	}
+
+
+	return { totalCost, inputCost, outputCost, formattedString };
+}
+
+async function logLlmCall(
+	plugin: GatedNotesPlugin,
+	data: Omit<LlmLogEntry, "timestamp" | "cost">
+) {
+	const logPath = normalizePath(
+		plugin.app.vault.getRoot().path + LLM_LOG_FILE
+	);
+	const log = await getLlmLog(plugin);
+
+	const costResult = await aicostCalculate({
+		provider: "openai",
+		model: data.model as any,
+		inputAmount: data.inputTokens,
+		outputAmount: data.outputTokens,
+	});
+    
+	const totalCost = costResult ? costResult.inputCost + costResult.outputCost : null;
+
+	const newEntry: LlmLogEntry = {
+		...data,
+		timestamp: Date.now(),
+		cost: totalCost,
+	};
+
+	log.push(newEntry);
+
+	await plugin.app.vault.adapter.write(
+		logPath,
+		JSON.stringify(log, null, 2)
+	);
 }
