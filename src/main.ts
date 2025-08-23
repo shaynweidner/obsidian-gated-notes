@@ -30,7 +30,7 @@ import OpenAI from "openai";
 import * as JSZip from "jszip";
 
 const DECK_FILE_NAME = "_flashcards.json";
-const SPLIT_TAG = '<div class="gn-split-placeholder"></div>';
+const SPLIT_TAG = '---GATED-NOTES-SPLIT---';
 const PARA_CLASS = "gn-paragraph";
 const PARA_ID_ATTR = "data-para-id";
 const PARA_MD_ATTR = "data-gn-md";
@@ -372,35 +372,23 @@ export default class GatedNotesPlugin extends Plugin {
 				return true;
 			},
 		});
-		this.addCommand({
-			id: "gn-remove-all-breakpoints",
-			name: "Remove all paragraph breakpoints",
-			checkCallback: (checking: boolean) => {
-				const view =
-					this.app.workspace.getActiveViewOfType(MarkdownView);
-				if (!view?.file) return false;
-
-				const content = view.editor.getValue();
-				if (!content.includes(SPLIT_TAG)) return false;
-
-				if (!checking) {
-					const newContent = content.replace(
-						new RegExp(SPLIT_TAG, "g"),
-						""
-					);
-					view.editor.setValue(newContent);
-					new Notice("All paragraph breakpoints removed.");
-				}
-				return true;
-			},
-		});
 
 		this.addCommand({
 			id: "gn-insert-split",
 			name: "Insert paragraph split marker",
 			hotkeys: [{ modifiers: ["Mod", "Shift"], key: "Enter" }],
-			editorCallback: (editor: Editor) =>
-				editor.replaceSelection(`\n${SPLIT_TAG}\n`),
+			editorCallback: (editor: Editor) => {
+				const cursor = editor.getCursor();
+				const currentLine = editor.getLine(cursor.line);
+				
+				// If we're on an empty line, just replace it with the split tag
+				if (currentLine.trim() === '') {
+					editor.setLine(cursor.line, SPLIT_TAG);
+				} else {
+					// Otherwise, insert the split tag with proper spacing
+					editor.replaceSelection(`\n${SPLIT_TAG}\n`);
+				}
+			},
 		});
 
 		this.addCommand({
@@ -575,6 +563,24 @@ export default class GatedNotesPlugin extends Plugin {
 			id: "gn-epub-to-note",
 			name: "Convert EPUB to Note (Experimental)",
 			callback: () => new EpubToNoteModal(this).open(),
+		});
+		this.addCommand({
+			id: "gn-remove-all-split-tags",
+			name: "Remove all manual split tags from current note",
+			checkCallback: (checking: boolean) => {
+				const view = this.app.workspace.getActiveViewOfType(MarkdownView);
+				if (!view?.file) return false;
+		
+				const content = view.editor.getValue();
+				if (!content.includes(SPLIT_TAG)) return false;
+		
+				if (!checking) {
+					const newContent = this.cleanupAfterSplitRemoval(content);
+					view.editor.setValue(newContent);
+					new Notice("All manual split tags removed.");
+				}
+				return true;
+			},
 		});
 	}
 
@@ -985,22 +991,33 @@ export default class GatedNotesPlugin extends Plugin {
 			new Notice("Note is already finalized.");
 			return;
 		}
-
+	
 		if (content.includes(SPLIT_TAG)) {
 			const userChoice = await this.showSplitMarkerConflictModal();
-
+	
 			if (userChoice === "manual") {
 				await this.manualFinalizeNote(file);
 				return;
+			} else if (userChoice === "remove") {
+				// Remove split tags and proceed with auto-finalization
+				const contentWithoutSplits = content.replace(
+					new RegExp(escapeRegExp(SPLIT_TAG), "g"), 
+					""
+				);
+				return this.performAutoFinalize(file, contentWithoutSplits);
 			} else if (userChoice === null) {
 				return;
 			}
+		} else {
+			return this.performAutoFinalize(file, content);
 		}
+	}
 
+	private async performAutoFinalize(file: TFile, content: string): Promise<void> {
 		const paragraphs: string[] = [];
 		let inFence = false;
 		let buffer: string[] = [];
-
+	
 		for (const line of content.split("\n")) {
 			if (line.trim().startsWith("```")) inFence = !inFence;
 			buffer.push(line);
@@ -1014,7 +1031,7 @@ export default class GatedNotesPlugin extends Plugin {
 			const lastParagraph = buffer.join("\n").trim();
 			if (lastParagraph) paragraphs.push(lastParagraph);
 		}
-
+	
 		const wrappedContent = paragraphs
 			.map(
 				(md, i) =>
@@ -1037,33 +1054,56 @@ export default class GatedNotesPlugin extends Plugin {
 			new Notice("Note is already finalized.");
 			return;
 		}
-
-		const chunks = content.split(SPLIT_TAG);
+	
+		// Normalize the content before splitting to ensure consistent spacing
+		const normalizedContent = this.normalizeSplitContent(content);
+		const chunks = normalizedContent.split(SPLIT_TAG);
+		
 		const wrappedContent = chunks
-			.map(
-				(md, i) =>
-					`<br class="gn-sentinel"><div class="${PARA_CLASS}" ${PARA_ID_ATTR}="${
-						i + 1
-					}" ${PARA_MD_ATTR}="${md2attr(md.trim())}"></div>`
-			)
+			.map((md, i) => {
+				const trimmedMd = md.trim();
+				return `<br class="gn-sentinel"><div class="${PARA_CLASS}" ${PARA_ID_ATTR}="${
+					i + 1
+				}" ${PARA_MD_ATTR}="${md2attr(trimmedMd)}"></div>`;
+			})
 			.join("\n\n");
+		
 		await this.app.vault.modify(file, wrappedContent);
 		new Notice("Note manually finalized. Gating is now active.");
+	}
+
+	private normalizeSplitContent(content: string): string {
+		// First, normalize all line endings and excessive whitespace
+		let normalized = content.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
+		
+		// Replace sequences of 3+ newlines with exactly 2 newlines (paragraph break)
+		normalized = normalized.replace(/\n{3,}/g, '\n\n');
+		
+		// Ensure split tags are properly isolated with single newlines on each side
+		// This handles cases where split tags might have inconsistent spacing
+		normalized = normalized.replace(new RegExp(`\\s*${escapeRegExp(SPLIT_TAG)}\\s*`, 'g'), `\n${SPLIT_TAG}\n`);
+		
+		// Clean up any duplicate newlines that might have been created
+		normalized = normalized.replace(/\n{3,}/g, '\n\n');
+		
+		return normalized.trim();
 	}
 
 	private async unfinalize(file: TFile): Promise<void> {
 		const htmlContent = await this.app.vault.read(file);
 		const paragraphs = getParagraphsFromFinalizedNote(htmlContent);
-
+	
 		if (paragraphs.length === 0) {
 			new Notice("This note does not appear to be finalized.");
 			return;
 		}
-
+	
+		// Join with split tags, using single newlines around split tags to avoid accumulation
 		const mdContent = paragraphs
 			.map((p) => p.markdown)
-			.join(`\n\n${SPLIT_TAG}\n\n`)
+			.join(`\n${SPLIT_TAG}\n`)
 			.trim();
+		
 		await this.app.vault.modify(file, mdContent);
 		this.refreshReading();
 		this.refreshAllStatuses();
@@ -1098,50 +1138,61 @@ export default class GatedNotesPlugin extends Plugin {
 		}
 	}
 
-	private showSplitMarkerConflictModal(): Promise<"auto" | "manual" | null> {
+	private cleanupAfterSplitRemoval(content: string): string {
+		// Remove the split tags first
+		let cleaned = content.replace(new RegExp(escapeRegExp(SPLIT_TAG), "g"), "");
+		
+		// Now normalize paragraph spacing:
+		// 1. Replace 3+ consecutive newlines with exactly 2 (double newline = paragraph break)
+		cleaned = cleaned.replace(/\n{3,}/g, '\n\n');
+		
+		// 2. Trim any leading/trailing whitespace
+		cleaned = cleaned.trim();
+		
+		return cleaned;
+	}
+
+	private showSplitMarkerConflictModal(): Promise<"auto" | "manual" | "remove" | null> {
 		return new Promise((resolve) => {
 			const modal = new Modal(this.app);
-			let choice: "auto" | "manual" | null = null;
-
+			let choice: "auto" | "manual" | "remove" | null = null;
+	
 			modal.titleEl.setText("Manual Split Markers Detected");
 			modal.contentEl.createEl("p", {
-				text: "This note contains manual paragraph split markers. The 'auto-finalize' action normally ignores these and splits paragraphs based on blank lines.",
+				text: "This note contains manual paragraph split markers. How would you like to proceed?",
 			});
-			modal.contentEl.createEl("p", {
-				text: "How would you like to proceed?",
-			});
-
+	
 			const buttonContainer = modal.contentEl.createDiv({
 				cls: "gn-edit-btnrow",
 			});
-
+	
 			new ButtonComponent(buttonContainer)
 				.setButtonText("Cancel")
 				.onClick(() => {
 					choice = null;
 					modal.close();
 				});
-
+	
 			new ButtonComponent(buttonContainer)
-				.setButtonText("Ignore and Auto-Split")
+				.setButtonText("Remove Splits & Auto-Finalize")
 				.setWarning()
 				.onClick(() => {
-					choice = "auto";
+					choice = "remove";
 					modal.close();
 				});
-
+	
 			new ButtonComponent(buttonContainer)
-				.setButtonText("Use Manual Breaks")
+				.setButtonText("Use Manual Splits")
 				.setCta()
 				.onClick(() => {
 					choice = "manual";
 					modal.close();
 				});
-
+	
 			modal.onClose = () => {
 				resolve(choice);
 			};
-
+	
 			modal.open();
 		});
 	}
@@ -6682,6 +6733,10 @@ async function waitForEl<T extends HTMLElement>(
 			resolve(null);
 		}, 3000);
 	});
+}
+
+function escapeRegExp(string: string): string {
+	return string.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 
 function findTextRange(tag: string, container: HTMLElement): Range {
