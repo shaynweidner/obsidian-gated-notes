@@ -27,6 +27,8 @@ import { encode } from "gpt-tokenizer";
 import { calculateCost as aicostCalculate } from "aicost";
 import OpenAI from "openai";
 
+import * as JSZip from "jszip";
+
 const DECK_FILE_NAME = "_flashcards.json";
 const SPLIT_TAG = '<div class="gn-split-placeholder"></div>';
 const PARA_CLASS = "gn-paragraph";
@@ -178,6 +180,23 @@ interface GetDynamicInputsResult {
 	imageCount: number;
 	action: LlmLogEntry["action"];
 	details?: { cardCount?: number; textContentTokens?: number };
+}
+
+interface EpubSection {
+	id: string;
+	title: string;
+	level: number;
+	href: string;
+	children: EpubSection[];
+	content?: string;
+	selected: boolean;
+}
+
+interface EpubStructure {
+	title: string;
+	author?: string;
+	sections: EpubSection[];
+	manifest: { [id: string]: { href: string; mediaType: string } };
 }
 
 const LLM_LOG_FILE = "_llm_log.json";
@@ -551,6 +570,11 @@ export default class GatedNotesPlugin extends Plugin {
 			id: "gn-pdf-to-note",
 			name: "Convert PDF to Note (Experimental)",
 			callback: () => new PdfToNoteModal(this).open(),
+		});
+		this.addCommand({
+			id: "gn-epub-to-note",
+			name: "Convert EPUB to Note (Experimental)",
+			callback: () => new EpubToNoteModal(this).open(),
 		});
 	}
 
@@ -1802,25 +1826,26 @@ ${selection}
 					} else {
 						try {
 							const range = findTextRange(card.tag, wrapper);
-							
+
 							const startContainer = range.startContainer;
 							const endContainer = range.endContainer;
-							
-							if (startContainer !== endContainer || 
-								startContainer.parentElement !== endContainer.parentElement) {
-								
-								
-								
+
+							if (
+								startContainer !== endContainer ||
+								startContainer.parentElement !==
+									endContainer.parentElement
+							) {
 								wrapper.scrollIntoView({
 									behavior: "smooth",
 								});
-								
+
 								const selection = window.getSelection();
 								if (selection) {
 									selection.removeAllRanges();
 									selection.addRange(range);
-									
-									const style = document.createElement('style');
+
+									const style =
+										document.createElement("style");
 									style.textContent = `
 										::selection {
 											background-color: ${highlightColor} !important;
@@ -1832,13 +1857,12 @@ ${selection}
 										}
 									`;
 									document.head.appendChild(style);
-									
+
 									setTimeout(() => {
 										selection.removeAllRanges();
 										document.head.removeChild(style);
 									}, 1500);
 								}
-								
 							} else {
 								const mark = document.createElement("mark");
 								range.surroundContents(mark);
@@ -1858,7 +1882,6 @@ ${selection}
 									}
 								}, 1500);
 							}
-							
 						} catch (e) {
 							this.logger(
 								LogLevel.NORMAL,
@@ -1978,6 +2001,33 @@ ${selection}
 			.gn-info-table { width: 100%; text-align: left; }
 			.gn-info-table th { border-bottom: 1px solid var(--background-modifier-border); }
 			.gn-info-table td { padding-top: 4px; }
+			.gn-epub-modal {
+				width: 80vw;
+				height: 80vh;
+				max-width: 1200px;
+				max-height: 800px;
+			}
+			
+			.gn-epub-modal .modal-content {
+				height: 100%;
+				display: flex;
+				flex-direction: column;
+			}
+			
+			.gn-epub-section {
+				display: flex;
+				align-items: center;
+				padding: 2px 0;
+				cursor: pointer;
+			}
+			
+			.gn-epub-section:hover {
+				background-color: var(--background-modifier-hover);
+			}
+			
+			.gn-epub-section input[type="checkbox"] {
+				margin-right: 8px;
+			}
 		`;
 		document.head.appendChild(styleEl);
 		this.register(() => styleEl.remove());
@@ -2740,7 +2790,7 @@ ${selection}
 
 		const userWantsToReview = await new Promise<boolean>((resolve) => {
 			const modal = new Modal(this.app);
-			let choiceMade = false; 
+			let choiceMade = false;
 
 			modal.titleEl.setText("Review New Cards?");
 			modal.contentEl.createEl("p", {
@@ -3210,6 +3260,1099 @@ ${selection}
 	}
 }
 
+class EpubToNoteModal extends Modal {
+	private fileInput!: HTMLInputElement;
+	private chapterNameInput!: TextComponent;
+	private folderSelect!: HTMLSelectElement;
+	private newFolderInput!: TextComponent;
+	private treeContainer!: HTMLElement;
+	private previewContainer!: HTMLElement;
+	private viewModeSelect!: HTMLSelectElement;
+
+	private selectedFile: File | null = null;
+	private epubStructure: EpubStructure | null = null;
+	private selectedSections: Set<string> = new Set();
+	private zipData: JSZip | null = null;
+	private epubBasePath: string = "";
+
+	constructor(private plugin: GatedNotesPlugin) {
+		super(plugin.app);
+	}
+
+	async onOpen() {
+		this.titleEl.setText("Convert EPUB to Note (EXPERIMENTAL)");
+		this.modalEl.addClass("gn-epub-modal");
+		makeModalDraggable(this, this.plugin);
+
+		const warningEl = this.contentEl.createDiv({
+			attr: {
+				style: "background: var(--background-modifier-error); padding: 10px; border-radius: 5px; margin-bottom: 15px;",
+			},
+		});
+		warningEl.createEl("strong", { text: "⚠️ Experimental Feature" });
+		warningEl.createEl("p", {
+			text: "This EPUB conversion feature is experimental. Complex formatting may not convert perfectly.",
+			attr: { style: "margin: 5px 0 0 0; font-size: 0.9em;" },
+		});
+
+		const fileSection = this.contentEl.createDiv();
+		fileSection.createEl("h4", { text: "Select EPUB File" });
+
+		const fileButton = fileSection.createEl("button", {
+			text: "Choose EPUB File",
+			cls: "mod-cta",
+		});
+
+		this.fileInput = fileSection.createEl("input", {
+			type: "file",
+			attr: { accept: ".epub", style: "display: none;" },
+		}) as HTMLInputElement;
+
+		fileButton.onclick = () => this.fileInput.click();
+		this.fileInput.onchange = (e) => this.handleFileSelection(e);
+
+		new Setting(this.contentEl)
+			.setName("Chapter Name")
+			.setDesc("Name for the new note")
+			.addText((text) => {
+				this.chapterNameInput = text;
+				text.setPlaceholder("Enter chapter name...");
+			});
+
+		const folderSection = this.contentEl.createDiv();
+		folderSection.createEl("h4", { text: "Destination Folder" });
+
+		this.folderSelect = folderSection.createEl("select");
+		await this.populateFolderOptions();
+
+		this.folderSelect.onchange = () => {
+			const isNewFolder = this.folderSelect.value === "__new__";
+			this.newFolderInput.inputEl.style.display = isNewFolder
+				? "block"
+				: "none";
+		};
+
+		this.newFolderInput = new TextComponent(folderSection);
+		this.newFolderInput.setPlaceholder("Enter new folder name...");
+		this.newFolderInput.inputEl.style.display = "none";
+
+		const contentArea = this.contentEl.createDiv({
+			attr: {
+				style: "display: flex; height: 400px; gap: 10px; margin: 20px 0;",
+			},
+		});
+
+		const leftPanel = contentArea.createDiv({
+			attr: {
+				style: "width: 40%; border-right: 1px solid var(--background-modifier-border); padding-right: 10px;",
+			},
+		});
+		leftPanel.createEl("h4", { text: "Structure" });
+
+		this.viewModeSelect = leftPanel.createEl("select", {
+			attr: { style: "width: 100%; margin-bottom: 10px;" },
+		});
+		this.viewModeSelect.createEl("option", {
+			value: "toc",
+			text: "📖 Table of Contents",
+		});
+		this.viewModeSelect.createEl("option", {
+			value: "files",
+			text: "📁 File Structure",
+		});
+		this.viewModeSelect.createEl("option", {
+			value: "spine",
+			text: "📋 Reading Order",
+		});
+		this.viewModeSelect.onchange = () => this.updateTreeView();
+
+		this.treeContainer = leftPanel.createDiv({
+			attr: {
+				style: "height: 300px; overflow-y: auto; border: 1px solid var(--background-modifier-border); padding: 5px;",
+			},
+		});
+		this.treeContainer.setText("No EPUB loaded");
+
+		const rightPanel = contentArea.createDiv({
+			attr: { style: "width: 60%; padding-left: 10px;" },
+		});
+		rightPanel.createEl("h4", { text: "Preview" });
+
+		this.previewContainer = rightPanel.createDiv({
+			attr: {
+				style: "height: 300px; overflow-y: auto; border: 1px solid var(--background-modifier-border); padding: 10px; background: var(--background-secondary);",
+			},
+		});
+		this.previewContainer.setText("Select sections to preview content");
+
+		new Setting(this.contentEl)
+			.addButton((btn) =>
+				btn.setButtonText("Cancel").onClick(() => this.close())
+			)
+			.addButton((btn) =>
+				btn
+					.setButtonText("Extract Selected Content")
+					.setCta()
+					.onClick(() => this.handleExtract())
+			);
+	}
+
+	private async handleFileSelection(event: Event): Promise<void> {
+		const target = event.target as HTMLInputElement;
+		const file = target.files?.[0];
+		if (!file) return;
+
+		this.selectedFile = file;
+		this.treeContainer.setText("Processing EPUB...");
+
+		try {
+			this.epubStructure = await this.parseEpub(file);
+
+			if (!this.chapterNameInput.getValue() && this.epubStructure.title) {
+				this.chapterNameInput.setValue(this.epubStructure.title);
+			}
+
+			this.updateTreeView();
+			new Notice(
+				`✅ EPUB processed: ${this.epubStructure.sections.length} sections found`
+			);
+		} catch (error: unknown) {
+			const errorMessage =
+				error instanceof Error
+					? error.message
+					: "Unknown error occurred";
+			this.treeContainer.setText(
+				`Error processing EPUB: ${errorMessage}`
+			);
+			console.error("EPUB processing error:", error);
+		}
+	}
+
+	private async parseEpub(file: File): Promise<EpubStructure> {
+		this.zipData = await JSZip.loadAsync(file);
+
+		const containerFile = this.zipData.file("META-INF/container.xml");
+		if (!containerFile)
+			throw new Error("Invalid EPUB: No container.xml found");
+
+		const containerXml = await containerFile.async("text");
+		const containerDoc = new DOMParser().parseFromString(
+			containerXml,
+			"application/xml"
+		);
+		const opfPath = containerDoc
+			.querySelector("rootfile")
+			?.getAttribute("full-path");
+		if (!opfPath) throw new Error("Invalid EPUB: No OPF path found");
+
+		this.epubBasePath = opfPath.substring(0, opfPath.lastIndexOf("/") + 1);
+
+		const opfFile = this.zipData.file(opfPath);
+		if (!opfFile) throw new Error("Invalid EPUB: OPF file not found");
+
+		const opfXml = await opfFile.async("text");
+		const opfDoc = new DOMParser().parseFromString(
+			opfXml,
+			"application/xml"
+		);
+
+		const title = opfDoc.querySelector("title")?.textContent || "Untitled";
+		const author =
+			opfDoc.querySelector("creator")?.textContent || undefined;
+
+		const manifest: { [id: string]: { href: string; mediaType: string } } =
+			{};
+		opfDoc.querySelectorAll("manifest item").forEach((item) => {
+			const id = item.getAttribute("id");
+			const href = item.getAttribute("href");
+			const mediaType = item.getAttribute("media-type");
+			if (id && href && mediaType) {
+				manifest[id] = { href, mediaType };
+			}
+		});
+
+		const spine = Array.from(opfDoc.querySelectorAll("spine itemref"))
+			.map((item) => item.getAttribute("idref"))
+			.filter(Boolean) as string[];
+
+		let sections: EpubSection[] = [];
+
+		const ncxId = Array.from(opfDoc.querySelectorAll("manifest item"))
+			.find(
+				(item) =>
+					item.getAttribute("media-type") ===
+					"application/x-dtbncx+xml"
+			)
+			?.getAttribute("id");
+
+		if (ncxId && manifest[ncxId]) {
+			sections = await this.parseNcxToc(
+				this.zipData,
+				manifest[ncxId].href,
+				opfPath
+			);
+		}
+
+		if (sections.length === 0) {
+			sections = await this.createSectionsFromSpine(
+				this.zipData,
+				spine,
+				manifest,
+				opfPath
+			);
+		}
+
+		return { title, author, sections, manifest };
+	}
+
+	private async parseNcxToc(
+		zip: JSZip,
+		ncxPath: string,
+		opfPath: string
+	): Promise<EpubSection[]> {
+		const basePath = opfPath.substring(0, opfPath.lastIndexOf("/") + 1);
+		const fullNcxPath = basePath + ncxPath;
+
+		const ncxFile = zip.file(fullNcxPath);
+		if (!ncxFile) return [];
+
+		const ncxXml = await ncxFile.async("text");
+		const ncxDoc = new DOMParser().parseFromString(
+			ncxXml,
+			"application/xml"
+		);
+
+		const parseNavPoint = (
+			navPoint: Element,
+			level: number = 1
+		): EpubSection => {
+			const id =
+				navPoint.getAttribute("id") || Math.random().toString(36);
+			const title =
+				navPoint.querySelector("navLabel text")?.textContent ||
+				"Untitled";
+			const href =
+				navPoint.querySelector("content")?.getAttribute("src") || "";
+
+			const children: EpubSection[] = [];
+			navPoint.querySelectorAll(":scope > navPoint").forEach((child) => {
+				children.push(parseNavPoint(child, level + 1));
+			});
+
+			return {
+				id,
+				title,
+				level,
+				href,
+				children,
+				selected: false,
+			};
+		};
+
+		const sections: EpubSection[] = [];
+		ncxDoc.querySelectorAll("navMap > navPoint").forEach((navPoint) => {
+			sections.push(parseNavPoint(navPoint));
+		});
+
+		return sections;
+	}
+
+	private async createSectionsFromSpine(
+		zip: JSZip,
+		spine: string[],
+		manifest: { [id: string]: { href: string; mediaType: string } },
+		opfPath: string
+	): Promise<EpubSection[]> {
+		const sections: EpubSection[] = [];
+		const basePath = opfPath.substring(0, opfPath.lastIndexOf("/") + 1);
+
+		for (let i = 0; i < spine.length; i++) {
+			const spineId = spine[i];
+			const manifestItem = manifest[spineId];
+			if (
+				!manifestItem ||
+				manifestItem.mediaType !== "application/xhtml+xml"
+			)
+				continue;
+
+			const filePath = basePath + manifestItem.href;
+			const file = zip.file(filePath);
+			if (!file) continue;
+
+			try {
+				const content = await file.async("text");
+				const doc = new DOMParser().parseFromString(
+					content,
+					"application/xhtml+xml"
+				);
+				const title =
+					doc.querySelector("title")?.textContent ||
+					doc.querySelector("h1")?.textContent ||
+					`Chapter ${i + 1}`;
+
+				sections.push({
+					id: spineId,
+					title,
+					level: 1,
+					href: manifestItem.href,
+					children: [],
+					selected: false,
+					content,
+				});
+			} catch (error) {
+				console.warn(`Failed to parse ${filePath}:`, error);
+			}
+		}
+
+		return sections;
+	}
+
+	private updateTreeView(): void {
+		if (!this.epubStructure) return;
+
+		this.treeContainer.empty();
+		this.renderSectionTree(this.epubStructure.sections, this.treeContainer);
+	}
+
+	private renderSectionTree(
+		sections: EpubSection[],
+		container: HTMLElement
+	): void {
+		sections.forEach((section) => {
+			const sectionEl = container.createDiv({
+				cls: "gn-epub-section",
+				attr: {
+					style: `margin-left: ${
+						(section.level - 1) * 20
+					}px; padding: 2px 0;`,
+				},
+			});
+
+			const checkbox = sectionEl.createEl("input", {
+				type: "checkbox",
+				attr: { style: "margin-right: 8px;" },
+			});
+			checkbox.checked = section.selected;
+			checkbox.onchange = async () => {
+				section.selected = checkbox.checked;
+				this.updateSelectionState(section, checkbox.checked);
+				await this.updatePreview();
+			};
+
+			sectionEl.createSpan({ text: section.title });
+
+			if (section.children.length > 0) {
+				this.renderSectionTree(section.children, container);
+			}
+		});
+	}
+
+	private updateSelectionState(
+		section: EpubSection,
+		selected: boolean
+	): void {
+		section.selected = selected;
+
+		if (selected) {
+			this.selectedSections.add(section.id);
+		} else {
+			this.selectedSections.delete(section.id);
+		}
+
+		section.children.forEach((child) => {
+			this.updateSelectionState(child, selected);
+		});
+	}
+
+	private async updatePreview(): Promise<void> {
+		if (this.selectedSections.size === 0) {
+			this.previewContainer.setText("Select sections to preview content");
+			return;
+		}
+
+		this.previewContainer.setText("Loading preview...");
+
+		try {
+			const selectedSectionsList = Array.from(this.selectedSections);
+			const sectionsToProcess: EpubSection[] = [];
+
+			for (const sectionId of selectedSectionsList) {
+				const section = this.findSectionById(sectionId);
+				if (section) {
+					sectionsToProcess.push(section);
+				}
+			}
+
+			const previewStructure = await this.buildPreviewStructure(
+				sectionsToProcess
+			);
+
+			this.previewContainer.empty();
+			const previewEl = this.previewContainer.createEl("div", {
+				attr: {
+					style: "font-family: var(--font-text); line-height: 1.4;",
+				},
+			});
+
+			previewEl.innerHTML = previewStructure.content;
+
+			this.previewContainer.createEl("div", {
+				text: `Estimated words: ~${previewStructure.wordCount}`,
+				attr: {
+					style: "margin-top: 15px; padding-top: 10px; border-top: 1px solid var(--background-modifier-border); font-style: italic; color: var(--text-muted);",
+				},
+			});
+		} catch (error) {
+			console.error("Error generating preview:", error);
+			this.previewContainer.setText("Error generating preview");
+		}
+	}
+
+	private async buildPreviewStructure(
+		sections: EpubSection[]
+	): Promise<{ content: string; wordCount: number }> {
+		if (sections.length === 0) {
+			return { content: "", wordCount: 0 };
+		}
+
+		let previewHtml = "";
+		let totalWordCount = 0;
+
+		if (sections.length === 1) {
+			const section = sections[0];
+			previewHtml += `<div style="font-size: 1.3em; font-weight: bold; color: var(--text-accent); border-bottom: 2px solid var(--text-accent); padding-bottom: 8px; margin-bottom: 15px;">📝 Note Title: ${section.title}</div>`;
+
+			const contentSnippet = await this.getContentSnippet(section);
+			if (contentSnippet.content) {
+				previewHtml += `<p style="margin: 10px 0; font-style: italic; color: var(--text-muted);">${contentSnippet.content}</p>`;
+				totalWordCount += contentSnippet.wordCount;
+			}
+
+			const childrenPreview = await this.processChildrenForPreview(
+				section.children,
+				1
+			);
+			previewHtml += childrenPreview.content;
+			totalWordCount += childrenPreview.wordCount;
+		} else {
+			previewHtml += `<p style="font-weight: bold; color: var(--text-accent); margin-bottom: 15px;">📝 Note will contain ${sections.length} main sections:</p>`;
+
+			for (const section of sections) {
+				previewHtml += `<h2 style="color: var(--text-normal); margin-top: 20px;"># ${section.title}</h2>`;
+
+				const contentSnippet = await this.getContentSnippet(section);
+				if (contentSnippet.content) {
+					previewHtml += `<p style="margin: 8px 0 8px 20px; font-style: italic; color: var(--text-muted);">${contentSnippet.content}</p>`;
+					totalWordCount += contentSnippet.wordCount;
+				}
+
+				if (section.children.length > 0) {
+					const childrenPreview =
+						await this.processChildrenForPreview(
+							section.children,
+							2,
+							4
+						); // Show max X children
+					previewHtml += childrenPreview.content;
+					totalWordCount += childrenPreview.wordCount;
+				}
+			}
+		}
+
+		return { content: previewHtml, wordCount: totalWordCount };
+	}
+
+	private async processChildrenForPreview(
+		children: EpubSection[],
+		headingLevel: number,
+		maxChildren = 10
+	): Promise<{ content: string; wordCount: number }> {
+		let html = "";
+		let wordCount = 0;
+		const childrenToShow = children.slice(0, maxChildren);
+
+		for (const child of childrenToShow) {
+			const headingStyle =
+				headingLevel === 1
+					? "color: var(--text-normal); margin-top: 15px;"
+					: "color: var(--text-muted); margin-top: 10px; font-size: 0.9em;";
+
+			const prefix = "#".repeat(headingLevel);
+			html += `<h${Math.min(
+				headingLevel + 2,
+				6
+			)} style="${headingStyle}">${prefix} ${child.title}</h${Math.min(
+				headingLevel + 2,
+				6
+			)}>`;
+
+			const contentSnippet = await this.getContentSnippet(child);
+			if (contentSnippet.content) {
+				const indent = headingLevel * 15;
+				html += `<p style="margin: 5px 0 5px ${indent}px; font-style: italic; color: var(--text-muted); font-size: 0.85em;">${contentSnippet.content}</p>`;
+				wordCount += contentSnippet.wordCount;
+			}
+		}
+
+		if (children.length > maxChildren) {
+			html += `<p style="margin-left: ${
+				headingLevel * 15
+			}px; color: var(--text-muted); font-style: italic;">... and ${
+				children.length - maxChildren
+			} more sections</p>`;
+		}
+
+		return { content: html, wordCount };
+	}
+
+	private async getContentSnippet(
+		section: EpubSection
+	): Promise<{ content: string; wordCount: number }> {
+		if (!this.zipData || !this.epubStructure) {
+			return { content: "", wordCount: 0 };
+		}
+
+		try {
+			const basePath = this.getBasePath();
+			const fullPath = basePath + section.href;
+
+			console.log(`Trying to access: ${fullPath}`);
+
+			const file = this.zipData.file(fullPath);
+			if (!file) {
+				const alternativePath = section.href;
+				console.log(`Trying alternative path: ${alternativePath}`);
+				const altFile = this.zipData.file(alternativePath);
+				if (!altFile) {
+					const availableFiles = Object.keys(
+						this.zipData.files
+					).slice(0, 10);
+					console.log(
+						`Available files (first 10): ${availableFiles.join(
+							", "
+						)}`
+					);
+					return {
+						content: `[File not found: ${fullPath}]`,
+						wordCount: 3,
+					};
+				}
+				return await this.extractContentFromFile(altFile);
+			}
+
+			return await this.extractContentFromFile(file);
+		} catch (error) {
+			console.error(
+				`Error getting content snippet for ${section.title}:`,
+				error
+			);
+			return { content: "[Error reading content]", wordCount: 3 };
+		}
+	}
+
+	private async extractContentFromFile(
+		file: any
+	): Promise<{ content: string; wordCount: number }> {
+		const xhtmlContent = await file.async("text");
+		const doc = new DOMParser().parseFromString(
+			xhtmlContent,
+			"application/xhtml+xml"
+		);
+		const body = doc.querySelector("body");
+
+		if (!body) {
+			return { content: "[No content found]", wordCount: 3 };
+		}
+
+		const paragraphs = Array.from(body.querySelectorAll("p, div"))
+			.map((el) => el.textContent?.trim())
+			.filter((text) => text && text.length > 20);
+
+		if (paragraphs.length === 0) {
+			const allText = body.textContent?.trim() || "";
+			const words = allText.split(/\s+/).filter(Boolean);
+			if (words.length > 0) {
+				const snippet = words.slice(0, 15).join(" ");
+				return {
+					content: snippet + (words.length > 15 ? "..." : ""),
+					wordCount: words.length,
+				};
+			}
+			return { content: "[No readable content]", wordCount: 3 };
+		}
+
+		const firstParagraph = paragraphs[0];
+		if (!firstParagraph) {
+			return { content: "[No readable content]", wordCount: 3 };
+		}
+
+		const words = firstParagraph.split(/\s+/).filter(Boolean);
+		const snippet = words.slice(0, 20).join(" ");
+
+		return {
+			content: snippet + (words.length > 20 ? "..." : ""),
+			wordCount: paragraphs.reduce(
+				(count, para) =>
+					count + (para?.split(/\s+/).filter(Boolean).length || 0),
+				0
+			),
+		};
+	}
+
+	private extractTextSnippet(content: string): string {
+		const doc = new DOMParser().parseFromString(
+			content,
+			"application/xhtml+xml"
+		);
+		const textContent = doc.body?.textContent || "";
+		const sentences = textContent
+			.split(/[.!?]+/)
+			.filter((s) => s.trim().length > 0);
+		return (
+			sentences.slice(0, 2).join(". ") +
+			(sentences.length > 2 ? "..." : "")
+		);
+	}
+
+	private findSectionById(id: string): EpubSection | null {
+		if (!this.epubStructure) return null;
+
+		const search = (sections: EpubSection[]): EpubSection | null => {
+			for (const section of sections) {
+				if (section.id === id) return section;
+				const found = search(section.children);
+				if (found) return found;
+			}
+			return null;
+		};
+
+		return search(this.epubStructure.sections);
+	}
+
+	private async populateFolderOptions(): Promise<void> {
+		const folders = this.app.vault
+			.getAllLoadedFiles()
+			.filter((file) => file.parent?.isRoot() && "children" in file)
+			.map((folder) => folder.name)
+			.sort();
+
+		this.folderSelect.createEl("option", {
+			value: "",
+			text: "📁 Vault Root",
+		});
+		folders.forEach((folderName) => {
+			this.folderSelect.createEl("option", {
+				value: folderName,
+				text: `📁 ${folderName}`,
+			});
+		});
+		this.folderSelect.createEl("option", {
+			value: "__new__",
+			text: "➕ Create New Folder",
+		});
+	}
+
+	private async handleExtract(): Promise<void> {
+		if (
+			!this.selectedFile ||
+			!this.epubStructure ||
+			this.selectedSections.size === 0
+		) {
+			new Notice(
+				"Please select an EPUB file and choose sections to extract."
+			);
+			return;
+		}
+
+		const chapterName = this.chapterNameInput.getValue().trim();
+		if (!chapterName) {
+			new Notice("Please enter a chapter name.");
+			return;
+		}
+
+		const notice = new Notice("📖 Converting EPUB to note...", 0);
+
+		try {
+			const markdownContent = await this.extractSelectedContent();
+
+			let folderPath = this.folderSelect.value;
+			if (folderPath === "__new__") {
+				const newFolderName = this.newFolderInput.getValue().trim();
+				if (!newFolderName) {
+					new Notice("Please enter a new folder name.");
+					return;
+				}
+				folderPath = newFolderName;
+				if (!this.app.vault.getAbstractFileByPath(folderPath)) {
+					await this.app.vault.createFolder(folderPath);
+				}
+			}
+
+			const fileName = chapterName.endsWith(".md")
+				? chapterName
+				: `${chapterName}.md`;
+			const notePath = folderPath
+				? `${folderPath}/${fileName}`
+				: fileName;
+
+			await this.app.vault.create(notePath, markdownContent);
+
+			notice.setMessage(`✅ Successfully created note: ${notePath}`);
+			setTimeout(() => notice.hide(), 3000);
+
+			const newFile = this.app.vault.getAbstractFileByPath(notePath);
+			if (newFile instanceof TFile) {
+				const leaf = this.app.workspace.getLeaf(false);
+				await leaf.openFile(newFile);
+			}
+
+			this.close();
+		} catch (error: unknown) {
+			notice.hide();
+			const errorMessage =
+				error instanceof Error
+					? error.message
+					: "Unknown error occurred";
+			new Notice(`Failed to convert EPUB: ${errorMessage}`);
+			console.error("EPUB conversion error:", error);
+		}
+	}
+
+	private async extractSelectedContent(): Promise<string> {
+		if (!this.epubStructure || !this.zipData) {
+			throw new Error("No EPUB data available");
+		}
+
+		const selectedSectionsList = Array.from(this.selectedSections);
+		const sectionsToProcess: EpubSection[] = [];
+
+		for (const sectionId of selectedSectionsList) {
+			const section = this.findSectionById(sectionId);
+			if (section) {
+				sectionsToProcess.push(section);
+			}
+		}
+
+		let markdownContent = "";
+
+		if (sectionsToProcess.length === 1) {
+			const section = sectionsToProcess[0];
+
+			console.log(`Processing main section: ${section.title}`);
+			console.log(
+				`Section has ${section.children.length} children:`,
+				section.children.map((c) => c.title)
+			);
+
+			const sectionContent = await this.processSectionContent(section);
+			console.log(
+				`Main section content length: ${sectionContent.length}`
+			);
+			console.log(
+				`Main section content preview: ${sectionContent.substring(
+					0,
+					200
+				)}...`
+			);
+
+			if (sectionContent.trim()) {
+				markdownContent += sectionContent + "\n\n";
+			}
+
+			const sortedChildren = [...section.children].sort((a, b) => {
+				const aNum = parseInt(a.title.match(/^\d+/)?.[0] || "999");
+				const bNum = parseInt(b.title.match(/^\d+/)?.[0] || "999");
+				if (aNum !== bNum) return aNum - bNum;
+				return a.title.localeCompare(b.title);
+			});
+
+			console.log(
+				`Processing children in order:`,
+				sortedChildren.map((c) => c.title)
+			);
+
+			for (const child of sortedChildren) {
+				console.log(`Processing child: ${child.title}`);
+				markdownContent += `# ${child.title}\n\n`;
+				const childContent = await this.processSectionContent(child);
+				if (childContent.trim()) {
+					markdownContent += childContent + "\n\n";
+				}
+			}
+		} else {
+			for (const section of sectionsToProcess) {
+				markdownContent += `# ${section.title}\n\n`;
+				const sectionContent = await this.processSectionContent(
+					section
+				);
+				if (sectionContent.trim()) {
+					markdownContent += sectionContent + "\n\n";
+				}
+			}
+		}
+
+		return markdownContent.trim();
+	}
+
+	private determineHeadingLevel(sections: EpubSection[]): number {
+		if (sections.length === 1) {
+			return 1;
+		} else {
+			return 1;
+		}
+	}
+
+	private async processSectionContent(section: EpubSection): Promise<string> {
+		if (!this.zipData || !this.epubStructure) {
+			return "[Content extraction failed]";
+		}
+
+		const basePath = this.getBasePath();
+		const fullPath = basePath + section.href;
+
+		const file = this.zipData.file(fullPath);
+		if (!file) {
+			return "[File not found in EPUB]";
+		}
+
+		try {
+			const xhtmlContent = await file.async("text");
+			return await this.convertXhtmlToMarkdown(
+				xhtmlContent,
+				section.href
+			);
+		} catch (error) {
+			console.error(`Error processing section ${section.title}:`, error);
+			return `[Error processing content: ${error}]`;
+		}
+	}
+
+	private getBasePath(): string {
+		return this.epubBasePath || "";
+	}
+
+	private async convertXhtmlToMarkdown(
+		xhtmlContent: string,
+		href: string
+	): Promise<string> {
+		const doc = new DOMParser().parseFromString(
+			xhtmlContent,
+			"application/xhtml+xml"
+		);
+		const body = doc.querySelector("body");
+
+		if (!body) {
+			return "[No body content found]";
+		}
+
+		const results: string[] = [];
+
+		for (const node of Array.from(body.childNodes)) {
+			const nodeResult = await this.processNode(node, href);
+			if (nodeResult.trim()) {
+				results.push(nodeResult.trim());
+			}
+		}
+
+		let markdown = results.join("\n\n");
+
+		markdown = markdown.replace(/\n{3,}/g, "\n\n");
+
+		return markdown.trim();
+	}
+
+	private async processNode(node: Node, href: string): Promise<string> {
+		if (node.nodeType === Node.TEXT_NODE) {
+			return node.textContent?.trim() || "";
+		}
+
+		if (node.nodeType !== Node.ELEMENT_NODE) {
+			return "";
+		}
+
+		const element = node as Element;
+		const tagName = element.tagName.toLowerCase();
+
+		switch (tagName) {
+			case "h1":
+			case "h2":
+			case "h3":
+			case "h4":
+			case "h5":
+			case "h6":
+				const level = parseInt(tagName.charAt(1));
+				const prefix = "#".repeat(level);
+				return `${prefix} ${element.textContent?.trim() || ""}`;
+
+			case "p":
+				return element.textContent?.trim() || "";
+
+			case "em":
+			case "i":
+				return `*${element.textContent?.trim() || ""}*`;
+
+			case "strong":
+			case "b":
+				return `**${element.textContent?.trim() || ""}**`;
+
+			case "code":
+				return `\`${element.textContent?.trim() || ""}\``;
+
+			case "pre":
+				return `\`\`\`\n${element.textContent?.trim() || ""}\n\`\`\``;
+
+			case "blockquote":
+				const lines = (element.textContent?.trim() || "").split("\n");
+				return lines.map((line) => `> ${line}`).join("\n");
+
+			case "ul":
+			case "ol":
+				let listContent = "";
+				const listItems = element.querySelectorAll("li");
+				listItems.forEach((li, index) => {
+					const bullet = tagName === "ul" ? "-" : `${index + 1}.`;
+					listContent += `${bullet} ${
+						li.textContent?.trim() || ""
+					}\n`;
+				});
+				return listContent.trim();
+
+			case "img":
+				return await this.processImage(element, href);
+
+			case "br":
+				return "\n";
+
+			case "div":
+			case "span":
+			case "section":
+			case "article":
+				let childContent = "";
+				const childResults: string[] = [];
+
+				for (const child of Array.from(element.childNodes)) {
+					const childResult = await this.processNode(child, href);
+					if (childResult.trim()) {
+						childResults.push(childResult.trim());
+					}
+				}
+
+				if (tagName === "span") {
+					return childResults.join(" ");
+				} else {
+					return childResults.join("\n\n");
+				}
+
+			default:
+				let unknownContent = "";
+				for (const child of Array.from(element.childNodes)) {
+					const childResult = await this.processNode(child, href);
+					if (childResult.trim()) {
+						unknownContent += childResult.trim() + " ";
+					}
+				}
+				return unknownContent.trim();
+		}
+	}
+
+	private async processImage(
+		imgElement: Element,
+		href: string
+	): Promise<string> {
+		const src = imgElement.getAttribute("src");
+		if (!src || !this.zipData) {
+			return "![IMAGE_PLACEHOLDER]";
+		}
+
+		try {
+			const allFiles = Object.keys(this.zipData.files);
+			const imageFiles = allFiles.filter((f) =>
+				/\.(jpg|jpeg|png|gif|bmp|svg)$/i.test(f)
+			);
+			console.log(
+				`Found ${imageFiles.length} image files:`,
+				imageFiles.slice(0, 5)
+			);
+			console.log(`Looking for image with src: "${src}"`);
+
+			let imageFile = null;
+			const pathsToTry = [];
+
+			pathsToTry.push(src);
+			imageFile = this.zipData.file(src);
+
+			if (!imageFile && !src.startsWith("/") && !src.startsWith("http")) {
+				const hrefDir = href.substring(0, href.lastIndexOf("/") + 1);
+				const relativePath = hrefDir + src;
+				pathsToTry.push(relativePath);
+				imageFile = this.zipData.file(relativePath);
+
+				if (!imageFile) {
+					const basePathImage = this.getBasePath() + src;
+					pathsToTry.push(basePathImage);
+					imageFile = this.zipData.file(basePathImage);
+				}
+
+				if (!imageFile) {
+					const filename = src.split("/").pop();
+					if (filename) {
+						const foundFile = imageFiles.find((f) =>
+							f.endsWith(filename)
+						);
+						if (foundFile) {
+							pathsToTry.push(foundFile);
+							imageFile = this.zipData.file(foundFile);
+						}
+					}
+				}
+			}
+
+			if (!imageFile) {
+				console.warn(`Image not found. Tried paths:`, pathsToTry);
+				console.log(`Available image files:`, imageFiles);
+				return `![IMAGE_PLACEHOLDER - Image not found: ${src}]`;
+			}
+
+			console.log(
+				`Successfully found image at: ${
+					pathsToTry[pathsToTry.length - 1]
+				}`
+			);
+
+			const imageData = await imageFile.async("blob");
+			const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
+			const extension = src.split(".").pop()?.toLowerCase() || "png";
+			const imageName = `epub-image-${timestamp}.${extension}`;
+
+			let targetPath = imageName;
+
+			try {
+				const attachmentFolder = (this.app as any).vault.getConfig?.(
+					"attachmentFolderPath"
+				);
+				if (attachmentFolder && typeof attachmentFolder === "string") {
+					targetPath = `${attachmentFolder}/${imageName}`;
+				}
+			} catch (e) {
+				targetPath = imageName;
+			}
+
+			const arrayBuffer = await imageData.arrayBuffer();
+			await this.app.vault.createBinary(targetPath, arrayBuffer);
+
+			console.log(`Image saved as: ${targetPath}`);
+			return `![[${imageName}]]`;
+		} catch (error) {
+			console.error("Error processing image:", error);
+			return "![IMAGE_PLACEHOLDER - Processing error]";
+		}
+	}
+
+	onClose() {
+		this.contentEl.empty();
+	}
+}
+
 class PdfToNoteModal extends Modal {
 	private fileInput!: HTMLInputElement;
 	private chapterNameInput!: TextComponent;
@@ -3232,12 +4375,14 @@ class PdfToNoteModal extends Modal {
 		makeModalDraggable(this, this.plugin);
 
 		const warningEl = this.contentEl.createDiv({
-			attr: { style: "background: var(--background-modifier-error); padding: 10px; border-radius: 5px; margin-bottom: 15px;" }
+			attr: {
+				style: "background: var(--background-modifier-error); padding: 10px; border-radius: 5px; margin-bottom: 15px;",
+			},
 		});
 		warningEl.createEl("strong", { text: "⚠️ Experimental Feature" });
-		warningEl.createEl("p", { 
+		warningEl.createEl("p", {
 			text: "This PDF conversion feature is experimental. Results may vary depending on PDF complexity and formatting. Always review the generated content carefully.",
-			attr: { style: "margin: 5px 0 0 0; font-size: 0.9em;" }
+			attr: { style: "margin: 5px 0 0 0; font-size: 0.9em;" },
 		});
 
 		const fileSection = this.contentEl.createDiv();
@@ -3315,16 +4460,22 @@ class PdfToNoteModal extends Modal {
 			this.openExampleNoteSelector(exampleDisplay);
 
 		const costContainer = this.contentEl.createDiv();
-		this.costUi = this.plugin.createCostEstimatorUI(costContainer, (): GetDynamicInputsResult => {
-			const promptText = this.buildPrompt(this.extractedText, this.exampleNoteContent);
-			const textContentTokens = countTextTokens(this.extractedText); 
-			return {
-				promptText,
-				imageCount: 0,
-				action: "pdf_to_note",
-				details: { textContentTokens },
-			};
-		});
+		this.costUi = this.plugin.createCostEstimatorUI(
+			costContainer,
+			(): GetDynamicInputsResult => {
+				const promptText = this.buildPrompt(
+					this.extractedText,
+					this.exampleNoteContent
+				);
+				const textContentTokens = countTextTokens(this.extractedText);
+				return {
+					promptText,
+					imageCount: 0,
+					action: "pdf_to_note",
+					details: { textContentTokens },
+				};
+			}
+		);
 
 		new Setting(this.contentEl)
 			.addButton((btn) =>
@@ -3457,7 +4608,7 @@ class PdfToNoteModal extends Modal {
 						lastLineY !== null &&
 						Math.abs(y - lastLineY) > paragraphGapThreshold
 					) {
-						lines.push(""); 
+						lines.push("");
 					}
 					lines.push(lineText);
 					lastLineY = lastY;
@@ -3748,7 +4899,7 @@ class ExampleNoteSuggester extends Modal {
 					file.basename.toLowerCase().includes(query) ||
 					file.path.toLowerCase().includes(query)
 			)
-			.slice(0, 20); 
+			.slice(0, 20);
 
 		this.suggestionsEl.empty();
 
@@ -4167,31 +5318,34 @@ class EditModal extends Modal {
 	private async handleRefocus(evt: MouseEvent) {
 		new RefocusOptionsModal(this.plugin, (result) => {
 			if (!result) return;
-	
+
 			const { quantity, preventDuplicates } = result;
 			const buttonEl = evt.target as HTMLButtonElement;
-	
+
 			const getDynamicInputsForCost = () => {
 				let contextPrompt = "";
 				if (preventDuplicates) {
 					const otherCards = Object.values(this.graph).filter(
-						(c) => c.chapter === this.card.chapter && c.id !== this.card.id
+						(c) =>
+							c.chapter === this.card.chapter &&
+							c.id !== this.card.id
 					);
 					if (otherCards.length > 0) {
 						const simplified = otherCards.map((c) => ({
 							front: c.front,
 							back: c.back,
 						}));
-						contextPrompt = `To avoid duplicates, do not create cards that cover the same information as the following existing cards:\nExisting Cards:\n${JSON.stringify(simplified)}\n\n`;
+						contextPrompt = `To avoid duplicates, do not create cards that cover the same information as the following existing cards:\nExisting Cards:\n${JSON.stringify(
+							simplified
+						)}\n\n`;
 					}
 				}
-				
+
 				const cardJson = JSON.stringify({
 					front: this.card.front,
 					back: this.card.back,
 				});
-	
-				// RESTORED: Full original prompt
+
 				const basePrompt = `You are an AI assistant that creates a new, insightful flashcard by "refocusing" an existing one.
 	
 	**Core Rule:** Your new card MUST be created by inverting the information **explicitly present** in the original card's "front" and "back" fields. The "Source Text" is provided only for context and should NOT be used to introduce new facts into the new card.
@@ -4220,11 +5374,12 @@ class EditModal extends Modal {
 	
 	**Your Task:**
 	Now, apply this process to the following card.`;
-	
-				const quantityInstruction = quantity === "one" 
-					? `Return ONLY valid JSON of this shape: [{"front":"...","back":"..."}]`
-					: `Create one or more cards and return ONLY valid JSON of this shape: [{"front":"...","back":"..."}]`;
-	
+
+				const quantityInstruction =
+					quantity === "one"
+						? `Return ONLY valid JSON of this shape: [{"front":"...","back":"..."}]`
+						: `Create one or more cards and return ONLY valid JSON of this shape: [{"front":"...","back":"..."}]`;
+
 				const sourceText = JSON.stringify(this.card.tag);
 				const promptText = `${contextPrompt}${basePrompt}
 	
@@ -4235,14 +5390,14 @@ class EditModal extends Modal {
 	${sourceText}
 	
 	${quantityInstruction}`;
-	
+
 				return {
 					promptText,
 					imageCount: 0,
 					action: "refocus" as const,
 				};
 			};
-	
+
 			new ActionConfirmationModal(
 				this.plugin,
 				"Confirm Refocus",
@@ -4251,15 +5406,21 @@ class EditModal extends Modal {
 					buttonEl.disabled = true;
 					buttonEl.setText("Refocusing...");
 					new Notice("🤖 Generating alternative card(s)...");
-	
+
 					try {
 						const { promptText } = getDynamicInputsForCost();
-						const { content: response, usage } = await this.plugin.sendToLlm(promptText);
-	
-						if (!response) throw new Error("LLM returned an empty response.");
-						const newCards = this._createCardsFromLlmResponse(response);
-						if (newCards.length === 0) throw new Error("Could not parse new cards from LLM response.");
-	
+						const { content: response, usage } =
+							await this.plugin.sendToLlm(promptText);
+
+						if (!response)
+							throw new Error("LLM returned an empty response.");
+						const newCards =
+							this._createCardsFromLlmResponse(response);
+						if (newCards.length === 0)
+							throw new Error(
+								"Could not parse new cards from LLM response."
+							);
+
 						if (usage) {
 							await logLlmCall(this.plugin, {
 								action: "refocus",
@@ -4269,15 +5430,23 @@ class EditModal extends Modal {
 								cardsGenerated: newCards.length,
 							});
 						}
-	
-						newCards.forEach((card) => (this.graph[card.id] = card));
+
+						newCards.forEach(
+							(card) => (this.graph[card.id] = card)
+						);
 						await this.plugin.writeDeck(this.deck.path, this.graph);
-	
+
 						this.close();
-						await this.plugin.promptToReviewNewCards(newCards, this.deck, this.graph);
+						await this.plugin.promptToReviewNewCards(
+							newCards,
+							this.deck,
+							this.graph
+						);
 						this.onDone(true);
 					} catch (e: unknown) {
-						new Notice(`Failed to generate cards: ${(e as Error).message}`);
+						new Notice(
+							`Failed to generate cards: ${(e as Error).message}`
+						);
 					} finally {
 						buttonEl.disabled = false;
 						buttonEl.setText("Refocus with AI");
@@ -4290,30 +5459,34 @@ class EditModal extends Modal {
 	private async handleSplit(evt: MouseEvent) {
 		new SplitOptionsModal(this.plugin, (result) => {
 			if (!result) return;
-	
+
 			const { preventDuplicates } = result;
 			const buttonEl = evt.target as HTMLButtonElement;
-	
+
 			const getDynamicInputsForCost = () => {
 				let contextPrompt = "";
 				if (preventDuplicates) {
 					const otherCards = Object.values(this.graph).filter(
-						(c) => c.chapter === this.card.chapter && c.id !== this.card.id
+						(c) =>
+							c.chapter === this.card.chapter &&
+							c.id !== this.card.id
 					);
 					if (otherCards.length > 0) {
 						const simplified = otherCards.map((c) => ({
 							front: c.front,
 							back: c.back,
 						}));
-						contextPrompt = `To avoid duplicates, do not create cards that cover the same information as the following existing cards:\nExisting Cards:\n${JSON.stringify(simplified)}\n\n`;
+						contextPrompt = `To avoid duplicates, do not create cards that cover the same information as the following existing cards:\nExisting Cards:\n${JSON.stringify(
+							simplified
+						)}\n\n`;
 					}
 				}
-				
+
 				const cardJson = JSON.stringify({
 					front: this.card.front,
 					back: this.card.back,
 				});
-	
+
 				const promptText = `${contextPrompt}Take the following flashcard and split it into one or more new, simpler, more atomic flashcards. The original card may be too complex or cover multiple ideas.
 	
 	Return ONLY valid JSON of this shape: [{"front":"...","back":"..."}]
@@ -4322,10 +5495,10 @@ class EditModal extends Modal {
 	**Original Card:**
 	${cardJson}
 	---`;
-	
+
 				return { promptText, imageCount: 0, action: "split" as const };
 			};
-	
+
 			new ActionConfirmationModal(
 				this.plugin,
 				"Confirm Split",
@@ -4334,15 +5507,21 @@ class EditModal extends Modal {
 					buttonEl.disabled = true;
 					buttonEl.setText("Splitting...");
 					new Notice("🤖 Splitting card with AI...");
-	
+
 					try {
 						const { promptText } = getDynamicInputsForCost();
-						const { content: response, usage } = await this.plugin.sendToLlm(promptText);
-	
-						if (!response) throw new Error("LLM returned an empty response.");
-						const newCards = this._createCardsFromLlmResponse(response);
-						if (newCards.length === 0) throw new Error("Could not parse new cards from LLM response.");
-	
+						const { content: response, usage } =
+							await this.plugin.sendToLlm(promptText);
+
+						if (!response)
+							throw new Error("LLM returned an empty response.");
+						const newCards =
+							this._createCardsFromLlmResponse(response);
+						if (newCards.length === 0)
+							throw new Error(
+								"Could not parse new cards from LLM response."
+							);
+
 						if (usage) {
 							await logLlmCall(this.plugin, {
 								action: "split",
@@ -4352,16 +5531,24 @@ class EditModal extends Modal {
 								cardsGenerated: newCards.length,
 							});
 						}
-	
+
 						delete this.graph[this.card.id];
-						newCards.forEach((newCard) => (this.graph[newCard.id] = newCard));
+						newCards.forEach(
+							(newCard) => (this.graph[newCard.id] = newCard)
+						);
 						await this.plugin.writeDeck(this.deck.path, this.graph);
-	
+
 						this.close();
-						await this.plugin.promptToReviewNewCards(newCards, this.deck, this.graph);
+						await this.plugin.promptToReviewNewCards(
+							newCards,
+							this.deck,
+							this.graph
+						);
 						this.onDone(true);
 					} catch (e: unknown) {
-						new Notice(`Error splitting card: ${(e as Error).message}`);
+						new Notice(
+							`Error splitting card: ${(e as Error).message}`
+						);
 					} finally {
 						buttonEl.disabled = false;
 						buttonEl.setText("Split with AI");
@@ -5498,7 +6685,6 @@ async function waitForEl<T extends HTMLElement>(
 }
 
 function findTextRange(tag: string, container: HTMLElement): Range {
-
 	const normalize = (s: string) =>
 		s
 			.toLowerCase()
@@ -5508,11 +6694,10 @@ function findTextRange(tag: string, container: HTMLElement): Range {
 
 	const convertMarkdownToText = (text: string): string => {
 		const converted = text
-			.replace(/\*\*(.*?)\*\*/g, '$1')  
-			.replace(/\*(.*?)\*/g, '$1')     
-			.replace(/_(.*?)_/g, '$1')       
-			.replace(/`(.*?)`/g, '$1')       
-			;
+			.replace(/\*\*(.*?)\*\*/g, "$1")
+			.replace(/\*(.*?)\*/g, "$1")
+			.replace(/_(.*?)_/g, "$1")
+			.replace(/`(.*?)`/g, "$1");
 		return converted;
 	};
 
@@ -5521,7 +6706,6 @@ function findTextRange(tag: string, container: HTMLElement): Range {
 
 	const normalizedTag = normalize(convertedTag);
 	const normalizedFullText = normalize(rawFullText);
-
 
 	let startIndexInNormalized = -1;
 	let endIndexInNormalized = -1;
@@ -5555,7 +6739,6 @@ function findTextRange(tag: string, container: HTMLElement): Range {
 			}
 		}
 
-
 		if (prefixMatch && suffixMatch) {
 			const prefixEndIndex = prefixMatch.index + prefixMatch.text.length;
 			const suffixEndIndex = suffixMatch.index + suffixMatch.text.length;
@@ -5572,7 +6755,6 @@ function findTextRange(tag: string, container: HTMLElement): Range {
 
 	const trimOffset = rawFullText.search(/\S/);
 	if (trimOffset === -1) throw new Error("Container has no text.");
-
 
 	const trimmedFullText = rawFullText.trim();
 	let startInTrimmed = -1;
@@ -5610,18 +6792,15 @@ function findTextRange(tag: string, container: HTMLElement): Range {
 	const originalStartIndex = startInTrimmed + trimOffset;
 	const originalEndIndex = endInTrimmed + trimOffset;
 
-
 	const walker = document.createTreeWalker(container, NodeFilter.SHOW_TEXT);
 	let charCount = 0;
 	let startNode: Node | undefined, endNode: Node | undefined;
 	let startOffset: number | undefined, endOffset: number | undefined;
 	let currentNode;
 
-
 	while ((currentNode = walker.nextNode())) {
 		const nodeTextLength = currentNode.textContent?.length || 0;
 		const nextCharCount = charCount + nodeTextLength;
-
 
 		if (startNode === undefined && nextCharCount > originalStartIndex) {
 			startNode = currentNode;
@@ -5645,11 +6824,9 @@ function findTextRange(tag: string, container: HTMLElement): Range {
 		throw new Error("Could not map string indices to DOM nodes.");
 	}
 
-
 	const range = document.createRange();
 	range.setStart(startNode, startOffset);
 	range.setEnd(endNode, endOffset);
-
 
 	return range;
 }
@@ -5742,108 +6919,111 @@ async function getLineForParagraph(
 }
 
 function extractJsonArray<T>(s: string): T[] {
-    const fixJsonString = (str: string) => {
-        return str
-            .replace(/```json\s*|\s*```/g, '')
-            .trim()
-            .replace(/\\(?!["\\/bfnrtu])/g, '\\\\');
-    };
+	const fixJsonString = (str: string) => {
+		return str
+			.replace(/```json\s*|\s*```/g, "")
+			.trim()
+			.replace(/\\(?!["\\/bfnrtu])/g, "\\\\");
+	};
 
-    try {
-        const parsed = JSON.parse(s.trim());
-        return Array.isArray(parsed) ? parsed : [parsed];
-    } catch (e1) {
-        try {
-            const fixed = fixJsonString(s);
-            const parsed = JSON.parse(fixed);
-            return Array.isArray(parsed) ? parsed : [parsed];
-        } catch (e2) {
-            try {
-                const arrayMatch = s.match(/\[[\s\S]*\]/);
-                if (arrayMatch) {
-                    const fixed = fixJsonString(arrayMatch[0]);
-                    const parsed = JSON.parse(fixed);
-                    return Array.isArray(parsed) ? parsed : [parsed];
-                }
-            } catch (e3) {
-                console.log("All JSON parsing methods failed");
-            }
-        }
-    }
+	try {
+		const parsed = JSON.parse(s.trim());
+		return Array.isArray(parsed) ? parsed : [parsed];
+	} catch (e1) {
+		try {
+			const fixed = fixJsonString(s);
+			const parsed = JSON.parse(fixed);
+			return Array.isArray(parsed) ? parsed : [parsed];
+		} catch (e2) {
+			try {
+				const arrayMatch = s.match(/\[[\s\S]*\]/);
+				if (arrayMatch) {
+					const fixed = fixJsonString(arrayMatch[0]);
+					const parsed = JSON.parse(fixed);
+					return Array.isArray(parsed) ? parsed : [parsed];
+				}
+			} catch (e3) {
+				console.log("All JSON parsing methods failed");
+			}
+		}
+	}
 
-    throw new Error("Could not parse JSON from LLM response");
+	throw new Error("Could not parse JSON from LLM response");
 }
 
 function extractJsonObjects<T>(s: string): T[] {
-    const fixJsonString = (str: string) => {
-        return str
-            .replace(/```json\s*|\s*```/g, '')
-            .trim()
-            .replace(/\\(?!["\\/bfnrtu])/g, '\\\\');
-    };
+	const fixJsonString = (str: string) => {
+		return str
+			.replace(/```json\s*|\s*```/g, "")
+			.trim()
+			.replace(/\\(?!["\\/bfnrtu])/g, "\\\\");
+	};
 
-    try {
-        const j = JSON.parse(s);
-        return Array.isArray(j) ? j : [j];
-    } catch {}
+	try {
+		const j = JSON.parse(s);
+		return Array.isArray(j) ? j : [j];
+	} catch {}
 
-    try {
-        const fixed = fixJsonString(s);
-        const j = JSON.parse(fixed);
-        return Array.isArray(j) ? j : [j];
-    } catch {}
+	try {
+		const fixed = fixJsonString(s);
+		const j = JSON.parse(fixed);
+		return Array.isArray(j) ? j : [j];
+	} catch {}
 
-    const fence = s.match(/```(?:json)?\s*([\s\S]*?)```/i);
-    if (fence && fence[1]) {
-        try {
-            const j = JSON.parse(fence[1]);
-            return Array.isArray(j) ? j : [j];
-        } catch {}
-        
-        try {
-            const fixed = fixJsonString(fence[1]);
-            const j = JSON.parse(fixed);
-            return Array.isArray(j) ? j : [j];
-        } catch {}
-    }
+	const fence = s.match(/```(?:json)?\s*([\s\S]*?)```/i);
+	if (fence && fence[1]) {
+		try {
+			const j = JSON.parse(fence[1]);
+			return Array.isArray(j) ? j : [j];
+		} catch {}
 
-    const arr = s.match(/\[\s*[\s\S]*?\s*\]/);
-    if (arr && arr[0]) {
-        try {
-            const parsed = JSON.parse(arr[0]);
-            return Array.isArray(parsed) ? parsed : [parsed];
-        } catch {}
-        
-        try {
-            const fixed = fixJsonString(arr[0]);
-            const parsed = JSON.parse(fixed);
-            return Array.isArray(parsed) ? parsed : [parsed];
-        } catch {}
-    }
+		try {
+			const fixed = fixJsonString(fence[1]);
+			const j = JSON.parse(fixed);
+			return Array.isArray(j) ? j : [j];
+		} catch {}
+	}
 
-    const objMatch = s.match(/\{\s*[\s\S]*?\s*\}/);
-    if (objMatch && objMatch[0]) {
-        try {
-            return [JSON.parse(objMatch[0])];
-        } catch {}
-        
-        try {
-            const fixed = fixJsonString(objMatch[0]);
-            return [JSON.parse(fixed)];
-        } catch {}
-    }
+	const arr = s.match(/\[\s*[\s\S]*?\s*\]/);
+	if (arr && arr[0]) {
+		try {
+			const parsed = JSON.parse(arr[0]);
+			return Array.isArray(parsed) ? parsed : [parsed];
+		} catch {}
 
-    const frontBackRegex = /^\s*Front:\s*(?<front>[\s\S]+?)\s*Back:\s*(?<back>[\s\S]+?)\s*$/im;
-    const match = s.match(frontBackRegex);
+		try {
+			const fixed = fixJsonString(arr[0]);
+			const parsed = JSON.parse(fixed);
+			return Array.isArray(parsed) ? parsed : [parsed];
+		} catch {}
+	}
 
-    if (match && match.groups) {
-        const { front, back } = match.groups;
-        if (front && back) {
-            return [{ front: front.trim(), back: back.trim() }] as T[];
-        }
-    }
+	const objMatch = s.match(/\{\s*[\s\S]*?\s*\}/);
+	if (objMatch && objMatch[0]) {
+		try {
+			return [JSON.parse(objMatch[0])];
+		} catch {}
 
-    throw new Error("No valid JSON object, array, or Front/Back structure found in the string.");
+		try {
+			const fixed = fixJsonString(objMatch[0]);
+			return [JSON.parse(fixed)];
+		} catch {}
+	}
+
+	const frontBackRegex =
+		/^\s*Front:\s*(?<front>[\s\S]+?)\s*Back:\s*(?<back>[\s\S]+?)\s*$/im;
+	const match = s.match(frontBackRegex);
+
+	if (match && match.groups) {
+		const { front, back } = match.groups;
+		if (front && back) {
+			return [{ front: front.trim(), back: back.trim() }] as T[];
+		}
+	}
+
+	throw new Error(
+		"No valid JSON object, array, or Front/Back structure found in the string."
+	);
 }
 
 function countTextTokens(text: string): number {
