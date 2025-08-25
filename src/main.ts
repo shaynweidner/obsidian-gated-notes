@@ -2,6 +2,7 @@ import {
 	App,
 	ButtonComponent,
 	Editor,
+	FileView,
 	MarkdownPostProcessorContext,
 	MarkdownRenderer,
 	MarkdownView,
@@ -859,10 +860,7 @@ export default class GatedNotesPlugin extends Plugin {
 		if (gateAfter > gateBefore) {
 			new Notice("✅ New content unlocked!");
 
-			const leaf = this.app.workspace.getLeaf(false);
-			await leaf.openFile(activeFile, { state: { mode: "preview" } });
-
-			const mdView = this.app.workspace.getActiveViewOfType(MarkdownView);
+			const mdView = await this.navigateToChapter(activeFile);
 			if (!mdView) return;
 
 			await this.findAndScrollToNextContentfulPara(
@@ -885,14 +883,6 @@ export default class GatedNotesPlugin extends Plugin {
 		for (let i = 1; i <= SEARCH_LIMIT; i++) {
 			const currentParaIdx = startIdx + i;
 
-			const targetLine = await getLineForParagraph(
-				this,
-				file,
-				currentParaIdx
-			);
-
-			view.setEphemeralState({ scroll: targetLine });
-
 			const paraSelector = `.${PARA_CLASS}[${PARA_ID_ATTR}="${currentParaIdx}"]`;
 			const wrapper = await waitForEl<HTMLElement>(
 				paraSelector,
@@ -901,6 +891,7 @@ export default class GatedNotesPlugin extends Plugin {
 
 			if (wrapper && wrapper.innerText.trim() !== "") {
 				wrapper.scrollIntoView({
+					// block: "center",
 					behavior: "smooth",
 				});
 				wrapper.classList.add("gn-unlocked-flash");
@@ -912,8 +903,10 @@ export default class GatedNotesPlugin extends Plugin {
 			}
 		}
 
+		// If we get here, we didn't find a contentful paragraph to scroll to.
+		// This is not an error, just means the unlocked content was empty paragraphs.
 		this.logger(
-			LogLevel.NORMAL,
+			LogLevel.VERBOSE,
 			`Could not find a non-empty paragraph to scroll to after index ${startIdx}.`
 		);
 	}
@@ -964,15 +957,15 @@ export default class GatedNotesPlugin extends Plugin {
 				if (card.suspended) continue;
 				if (card.due > now) continue;
 
-				const isNew = isUnseen(card);
 				if (this.studyMode === StudyMode.CHAPTER) {
-					if (
-						isNew &&
-						(card.paraIdx ?? Infinity) > firstBlockedParaIdx
-					) {
+					// In chapter mode, we only want to review cards that are at or before the current content gate.
+					// This includes due review cards and the new cards that are blocking progress.
+					if ((card.paraIdx ?? Infinity) > firstBlockedParaIdx) {
 						continue;
 					}
 				} else {
+					// In other modes (Subject, Review-only), we don't want to see new cards.
+					const isNew = isUnseen(card);
 					if (isNew) continue;
 				}
 				reviewPool.push({ card, deck });
@@ -982,7 +975,21 @@ export default class GatedNotesPlugin extends Plugin {
 		reviewPool.sort((a, b) => {
 			const aIsNew = isUnseen(a.card);
 			const bIsNew = isUnseen(b.card);
-			if (aIsNew !== bIsNew) return aIsNew ? -1 : 1;
+
+			// In chapter focus mode, we want to see review cards first, then new cards.
+			if (this.studyMode === StudyMode.CHAPTER) {
+				if (aIsNew !== bIsNew) {
+					return aIsNew ? 1 : -1; // This sorts non-new cards (reviews) before new cards.
+				}
+			} else {
+				// In other modes, new cards (if they were to be included) would come first.
+				if (aIsNew !== bIsNew) {
+					return aIsNew ? -1 : 1;
+				}
+			}
+
+			// For cards of the same type (e.g., both are review cards), sort by due date.
+			// If due dates are the same, sort by their position in the note.
 			if (a.card.chapter === b.card.chapter) {
 				return (
 					(a.card.paraIdx ?? Infinity) - (b.card.paraIdx ?? Infinity)
@@ -1763,6 +1770,34 @@ ${selection}
 		}
 	}
 
+	private async updateGatingForView(view: MarkdownView): Promise<number> {
+		if (!view.file) return Infinity;
+
+		const paragraphDivs =
+			view.previewMode.containerEl.querySelectorAll<HTMLElement>(
+				`.${PARA_CLASS}`
+			);
+
+		if (!this.settings.gatingEnabled) {
+			for (const div of paragraphDivs) {
+				div.classList.remove("gn-hidden");
+			}
+			return Infinity;
+		}
+
+		const chapterPath = view.file.path;
+		const firstBlockedParaIdx =
+			await this.getFirstBlockedParaIndex(chapterPath);
+
+		for (const div of paragraphDivs) {
+			const paraIdx = Number(div.getAttribute(PARA_ID_ATTR) || 0);
+			if (paraIdx) {
+				div.classList.toggle("gn-hidden", paraIdx > firstBlockedParaIdx);
+			}
+		}
+		return firstBlockedParaIdx;
+	}
+
 	/**
 	 * Rerenders all preview-mode markdown views in the workspace.
 	 * This is used to apply changes to content gating or paragraph rendering.
@@ -1784,23 +1819,17 @@ ${selection}
 		const mdView = this.app.workspace.getActiveViewOfType(MarkdownView);
 
 		if (!mdView) {
-			this.refreshReading();
+			this.refreshReading(); // Fallback for other views
 			return;
 		}
 
 		const state = mdView.getEphemeralState();
 		this.logger(LogLevel.VERBOSE, "Preserving scroll state", state);
 
-		this.refreshReading();
+		await this.updateGatingForView(mdView);
 
-		setTimeout(() => {
-			let newMdView =
-				this.app.workspace.getActiveViewOfType(MarkdownView);
-			if (newMdView) {
-				newMdView.setEphemeralState(state);
-				this.logger(LogLevel.VERBOSE, "Restored scroll state");
-			}
-		}, 50);
+		mdView.setEphemeralState(state);
+		this.logger(LogLevel.VERBOSE, "Restored scroll state");
 	}
 
 	private registerGatingProcessor(): void {
@@ -1897,6 +1926,45 @@ ${selection}
 		}
 	}
 
+	private async navigateToChapter(
+		file: TFile
+	): Promise<MarkdownView | null> {
+		const { workspace } = this.app;
+		const activeView = workspace.getActiveViewOfType(MarkdownView);
+
+		// Case 1: The active view is already showing the correct file.
+		if (activeView && activeView.file?.path === file.path) {
+			if (activeView.getMode() !== "preview") {
+				await activeView.setState(
+					{ ...activeView.getState(), mode: "preview" },
+					{ history: false }
+				);
+			}
+			return activeView;
+		}
+
+		// Case 2: The file is open in another leaf. Find it and activate it.
+		const leaves = workspace.getLeavesOfType("markdown");
+		const leafWithFile = leaves.find((l) => {
+			// Type guard to ensure view has a 'file' property
+			const view = l.view;
+			return view instanceof FileView && view.file?.path === file.path;
+		});
+		if (leafWithFile) {
+			workspace.setActiveLeaf(leafWithFile, { focus: true });
+			const view = leafWithFile.view as MarkdownView;
+			if (view.getMode() !== "preview") {
+				await view.setState({ ...view.getState(), mode: "preview" }, { history: false });
+			}
+			return view;
+		}
+
+		// Case 3: The file is not open. Open it in a leaf.
+		const leaf = workspace.getLeaf(false);
+		await leaf.openFile(file, { state: { mode: "preview" } });
+		return workspace.getActiveViewOfType(MarkdownView);
+	}
+
 	private async jumpToTag(
 		card: Flashcard,
 		highlightColor: string = HIGHLIGHT_COLORS.context
@@ -1907,148 +1975,147 @@ ${selection}
 			return;
 		}
 
+		const mdView = await this.navigateToChapter(file);
+		if (!mdView) {
+			new Notice("Could not open the note for this card.");
+			return;
+		}
+
 		const targetLine = await getLineForParagraph(
 			this,
 			file,
 			card.paraIdx ?? 1
 		);
-		const paraSelector = `.${PARA_CLASS}[${PARA_ID_ATTR}="${
-			card.paraIdx ?? 1
-		}"]`;
+		const paraSelector = `.${PARA_CLASS}[${PARA_ID_ATTR}="${card.paraIdx ?? 1}"]`;
 
 		for (let attempt = 1; attempt <= 3; attempt++) {
-			const leaf = this.app.workspace.getLeaf(false);
-			await leaf.openFile(file, { state: { mode: "preview" } });
+			mdView.setEphemeralState({ scroll: targetLine });
+			const wrapper = await waitForEl<HTMLElement>(
+				paraSelector,
+				mdView.previewMode.containerEl
+			);
 
-			const mdView = this.app.workspace.getActiveViewOfType(MarkdownView);
-			if (mdView && mdView.file?.path === file.path) {
-				mdView.setEphemeralState({ scroll: targetLine });
-				const wrapper = await waitForEl<HTMLElement>(
-					paraSelector,
-					mdView.previewMode.containerEl
-				);
+			if (wrapper) {
+				const applyHighlight = (el: HTMLElement) => {
+					el.style.setProperty(
+						"--highlight-color",
+						highlightColor
+					);
+					el.classList.add("gn-flash-highlight");
+					setTimeout(() => {
+						el.classList.remove("gn-flash-highlight");
+						el.style.removeProperty("--highlight-color");
+					}, 1500);
+				};
 
-				if (wrapper) {
-					const applyHighlight = (el: HTMLElement) => {
-						el.style.setProperty(
-							"--highlight-color",
-							highlightColor
-						);
-						el.classList.add("gn-flash-highlight");
-						setTimeout(() => {
-							el.classList.remove("gn-flash-highlight");
-							el.style.removeProperty("--highlight-color");
-						}, 1500);
-					};
-
-					if (card.tag.startsWith("[[IMAGE HASH=")) {
-						const hashMatch = card.tag.match(
-							/\[\[IMAGE HASH=([a-f0-9]{64})\]\]/
-						);
-						let imageFound = false;
-						if (hashMatch) {
-							const hash = hashMatch[1];
-							const imageDb = await this.getImageDb();
-							const imageInfo = imageDb[hash];
-							if (imageInfo) {
-								const filename = imageInfo.path
-									.split("/")
-									.pop();
-								const imageSelector = `span.internal-embed[src*="${filename}"]`;
-								const imgContainerEl =
-									wrapper.querySelector<HTMLElement>(
-										imageSelector
-									);
-								if (imgContainerEl) {
-									imgContainerEl.scrollIntoView({
-										behavior: "smooth",
-									});
-									applyHighlight(imgContainerEl);
-									imageFound = true;
-								}
-							}
-						}
-						if (!imageFound) {
-							wrapper.scrollIntoView({
-								behavior: "smooth",
-							});
-							applyHighlight(wrapper);
-						}
-					} else {
-						try {
-							const range = findTextRange(card.tag, wrapper);
-
-							const startContainer = range.startContainer;
-							const endContainer = range.endContainer;
-
-							if (
-								startContainer !== endContainer ||
-								startContainer.parentElement !==
-									endContainer.parentElement
-							) {
-								wrapper.scrollIntoView({
+				if (card.tag.startsWith("[[IMAGE HASH=")) {
+					const hashMatch = card.tag.match(
+						/\[\[IMAGE HASH=([a-f0-9]{64})\]\]/
+					);
+					let imageFound = false;
+					if (hashMatch) {
+						const hash = hashMatch[1];
+						const imageDb = await this.getImageDb();
+						const imageInfo = imageDb[hash];
+						if (imageInfo) {
+							const filename = imageInfo.path
+								.split("/")
+								.pop();
+							const imageSelector = `span.internal-embed[src*="${filename}"]`;
+							const imgContainerEl =
+								wrapper.querySelector<HTMLElement>(
+									imageSelector
+								);
+							if (imgContainerEl) {
+								imgContainerEl.scrollIntoView({
 									behavior: "smooth",
 								});
-
-								const selection = window.getSelection();
-								if (selection) {
-									selection.removeAllRanges();
-									selection.addRange(range);
-
-									const style =
-										document.createElement("style");
-									style.textContent = `
-										::selection {
-											background-color: ${highlightColor} !important;
-											color: inherit !important;
-										}
-										::-moz-selection {
-											background-color: ${highlightColor} !important;
-											color: inherit !important;
-										}
-									`;
-									document.head.appendChild(style);
-
-									setTimeout(() => {
-										selection.removeAllRanges();
-										document.head.removeChild(style);
-									}, 1500);
-								}
-							} else {
-								const mark = document.createElement("mark");
-								range.surroundContents(mark);
-								mark.scrollIntoView({
-									behavior: "smooth",
-								});
-								applyHighlight(mark);
-								setTimeout(() => {
-									const parent = mark.parentNode;
-									if (parent) {
-										while (mark.firstChild)
-											parent.insertBefore(
-												mark.firstChild,
-												mark
-											);
-										parent.removeChild(mark);
-									}
-								}, 1500);
+								applyHighlight(imgContainerEl);
+								imageFound = true;
 							}
-						} catch (e) {
-							this.logger(
-								LogLevel.NORMAL,
-								`Tag highlighting failed: ${
-									(e as Error).message
-								}. Flashing paragraph as fallback.`
-							);
-							wrapper.scrollIntoView({
-								behavior: "smooth",
-							});
-							applyHighlight(wrapper);
 						}
 					}
-					return;
+					if (!imageFound) {
+						wrapper.scrollIntoView({
+							behavior: "smooth",
+						});
+						applyHighlight(wrapper);
+					}
+				} else {
+					try {
+						const range = findTextRange(card.tag, wrapper);
+
+						const startContainer = range.startContainer;
+						const endContainer = range.endContainer;
+
+						if (
+							startContainer !== endContainer ||
+							startContainer.parentElement !==
+								endContainer.parentElement
+						) {
+							wrapper.scrollIntoView({
+								behavior: "smooth",
+							});
+
+							const selection = window.getSelection();
+							if (selection) {
+								selection.removeAllRanges();
+								selection.addRange(range);
+
+								const style =
+									document.createElement("style");
+								style.textContent = `
+									::selection {
+										background-color: ${highlightColor} !important;
+										color: inherit !important;
+									}
+									::-moz-selection {
+										background-color: ${highlightColor} !important;
+										color: inherit !important;
+									}
+								`;
+								document.head.appendChild(style);
+
+								setTimeout(() => {
+									selection.removeAllRanges();
+									document.head.removeChild(style);
+								}, 1500);
+							}
+						} else {
+							const mark = document.createElement("mark");
+							range.surroundContents(mark);
+							mark.scrollIntoView({
+								behavior: "smooth",
+							});
+							applyHighlight(mark);
+							setTimeout(() => {
+								const parent = mark.parentNode;
+								if (parent) {
+									while (mark.firstChild)
+										parent.insertBefore(
+											mark.firstChild,
+											mark
+										);
+									parent.removeChild(mark);
+								}
+							}, 1500);
+						}
+					} catch (e) {
+						this.logger(
+							LogLevel.NORMAL,
+							`Tag highlighting failed: ${
+								(e as Error).message
+							}. Flashing paragraph as fallback.`
+						);
+						wrapper.scrollIntoView({
+							behavior: "smooth",
+						});
+						applyHighlight(wrapper);
+					}
 				}
+				return;
 			}
+
 			this.logger(
 				LogLevel.VERBOSE,
 				`Jump to tag failed on attempt ${attempt}. Retrying...`
