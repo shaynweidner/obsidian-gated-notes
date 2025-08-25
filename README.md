@@ -12,14 +12,14 @@ Instead of passively consuming information, you must _earn_ your way through a n
 
 -   **Gated Reading:** Locks later paragraphs in a note until you’ve mastered the flashcards for the current section. When you unlock new content, the plugin **automatically scrolls to the next contentful paragraph and highlights it**.
 
--   **📚 PDF & EPUB Conversion (Experimental):**
-    -   Import PDF or EPUB files directly into Obsidian.
-    -   Use an AI to convert the raw text into well-structured, clean markdown notes.
-    -   Provide an example note to guide the AI's formatting and structure.
-    -   For EPUBs, select specific chapters or sections from the table of contents to include.
+-   **📚 Enhanced PDF & EPUB Conversion (Experimental):**
+    -   **Hybrid PDF Mode:** For complex documents, it can render each page as an image and send it to a vision model alongside the extracted text. This provides superior accuracy for notes with diagrams, formulas, and complex layouts.
+    -   **EPUB Import:** Convert EPUB files directly into Obsidian notes, selecting specific chapters or sections from the table of contents to include.
+    -   **Structural Guidance:** Provide an example note to guide the AI's formatting and structure during conversion.
+    -   **Custom Guidance:** Direct the AI with specific instructions during the PDF conversion process (e.g., "Summarize key points," "Focus only on definitions").
 
 -   **💰 LLM Cost Estimation & Logging:**
-    -   See an **estimated cost** for any AI action *before* you run it.
+    -   See an **estimated cost** for any AI action *before* you run it, with support for complex scenarios like hybrid PDF processing.
     -   The plugin keeps a log of all AI API calls, allowing you to track your token usage and spending over time.
 
 -   **🖼️ Multimodal AI:**
@@ -29,7 +29,7 @@ Instead of passively consuming information, you must _earn_ your way through a n
 
 -   **🤖 Advanced AI Tools:**
     -   **Post-Generation Review:** After generating new cards, you're prompted to immediately review, edit, or delete them in a streamlined workflow.
-    -   **Custom Guidance:** Direct the AI during card generation with specific instructions (e.g., "the answer (back) should only be names of people and places or dates").
+    -   **Custom Guidance (for Cards):** Direct the AI during card generation with specific instructions.
     -   **Split Card:** Break a complex card into smaller, more atomic ones.
     -   **Refocus Card:** Generate alternate phrasings or "reverse" questions for the same fact.
     -   **Auto-Correct Tags:** If the AI generates a tag that isn't a direct quote, it will automatically attempt to fix it.
@@ -102,21 +102,21 @@ Prepare the note for gating by converting paragraphs into trackable units. The p
 
 ## ⚙️ Key Commands
 
-| Command                                                    | Description                                                                    |
-| :--------------------------------------------------------- | :----------------------------------------------------------------------------- |
-| `Review due cards`                                         | Starts a review session for the current mode.                                  |
-| `Toggle content gating`                                    | Enable/disable blur without changing settings.                                 |
-| `Browse cards`                                             | Open the stateful Card Browser with filtering options.                         |
-| `Finalize note (auto/manual)`                              | Prepare note for gating using `---GATED-NOTES-SPLIT---`.                       |
-| `Un-finalize chapter`                                      | Revert to plain Markdown, adding split markers between former paragraphs.      |
-| `Convert PDF to Note (Experimental)`                       | Uses AI to convert a PDF file into a structured markdown note.                 |
-| `Convert EPUB to Note (Experimental)`                      | Extracts selected sections from an EPUB into a markdown note.                  |
-| `Remove all manual split tags...`                          | Deletes all `---GATED-NOTES-SPLIT---` markers from the current note.           |
-| `Reset flashcard review history...`                        | Resets all cards in the chapter to "new," preserving the cards themselves.     |
-| `Recalculate paragraph indexes...`                         | Re-sync all cards with their source text after edits.                          |
-| `Delete all flashcards for this chapter`                   | Remove all cards tied to the active note.                                      |
-| `Remove image analysis for this note`                      | Deletes the cached AI analysis for all images within the current note.         |
-| `Remove all image analysis data`                           | Deletes all cached AI image analysis data across the entire vault.             |
+| Command                                                    | Description                                                                   |
+| :--------------------------------------------------------- | :---------------------------------------------------------------------------- |
+| `Review due cards`                                         | Starts a review session for the current mode.                                 |
+| `Toggle content gating`                                    | Enable/disable blur without changing settings.                                |
+| `Browse cards`                                             | Open the stateful Card Browser with filtering options.                        |
+| `Finalize note (auto/manual)`                              | Prepare note for gating using `---GATED-NOTES-SPLIT---`.                      |
+| `Un-finalize chapter`                                      | Revert to plain Markdown, adding split markers between former paragraphs.     |
+| `Convert PDF to Note (Experimental)`                       | Uses AI to convert a PDF file into a structured markdown note.                |
+| `Convert EPUB to Note (Experimental)`                      | Extracts selected sections from an EPUB into a markdown note.                 |
+| `Remove all manual split tags...`                          | Deletes all `---GATED-NOTES-SPLIT---` markers from the current note.            |
+| `Reset flashcard review history...`                        | Resets all cards in the chapter to "new," preserving the cards themselves.    |
+| `Recalculate paragraph indexes...`                         | Re-sync all cards with their source text after edits.                         |
+| `Delete all flashcards for this chapter`                   | Remove all cards tied to the active note.                                     |
+| `Remove image analysis for this note`                      | Deletes the cached AI analysis for all images within the current note.        |
+| `Remove all image analysis data`                           | Deletes all cached AI image analysis data across the entire vault.            |
 
 ---
 

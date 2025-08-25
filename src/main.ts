@@ -1,7 +1,6 @@
 import {
 	App,
 	ButtonComponent,
-	Component,
 	Editor,
 	MarkdownPostProcessorContext,
 	MarkdownRenderer,
@@ -12,6 +11,7 @@ import {
 	Notice,
 	Plugin,
 	PluginSettingTab,
+	RequestUrlParam,
 	requestUrl,
 	Setting,
 	TAbstractFile,
@@ -30,7 +30,7 @@ import OpenAI from "openai";
 import * as JSZip from "jszip";
 
 const DECK_FILE_NAME = "_flashcards.json";
-const SPLIT_TAG = '---GATED-NOTES-SPLIT---';
+const SPLIT_TAG = "---GATED-NOTES-SPLIT---";
 const PARA_CLASS = "gn-paragraph";
 const PARA_ID_ATTR = "data-para-id";
 const PARA_MD_ATTR = "data-gn-md";
@@ -74,6 +74,9 @@ interface ReviewLog {
 	ease_factor: number;
 }
 
+/**
+ * Represents a single flashcard within the system.
+ */
 interface Flashcard {
 	id: string;
 	front: string;
@@ -97,6 +100,9 @@ interface FlashcardGraph {
 	[id: string]: Flashcard;
 }
 
+/**
+ * Defines the settings for the Gated Notes plugin.
+ */
 interface Settings {
 	openaiApiKey: string;
 	openaiModel: string;
@@ -112,8 +118,18 @@ interface Settings {
 	logLevel: LogLevel;
 	autoCorrectTags: boolean;
 	maxTagCorrectionRetries: number;
+	/** The OpenAI model to use for multimodal (image analysis) tasks. */
 	openaiMultimodalModel: string;
+	/** Whether to analyze images and include their descriptions during card generation. */
 	analyzeImagesOnGenerate: boolean;
+	/** The default processing mode for PDF-to-note conversion. */
+	defaultPdfMode: "text" | "hybrid";
+	/** The default DPI for rendering PDF pages as images in hybrid mode. */
+	defaultPdfDpi: number;
+	/** The default maximum width for rendered PDF page images. */
+	defaultPdfMaxWidth: number;
+	/** The maximum number of tokens the AI should generate per page in PDF hybrid mode. */
+	pdfMaxTokensPerPage: number;
 }
 
 const DEFAULT_SETTINGS: Settings = {
@@ -133,6 +149,10 @@ const DEFAULT_SETTINGS: Settings = {
 	maxTagCorrectionRetries: 2,
 	openaiMultimodalModel: "gpt-4o-mini",
 	analyzeImagesOnGenerate: true,
+	defaultPdfMode: "text",
+	defaultPdfDpi: 200,
+	defaultPdfMaxWidth: 1400,
+	pdfMaxTokensPerPage: 4000,
 };
 
 interface ImageAnalysis {
@@ -155,6 +175,9 @@ interface CardBrowserState {
 	isFirstRender: boolean;
 }
 
+/**
+ * Represents a log entry for a call to a Large Language Model.
+ */
 interface LlmLogEntry {
 	timestamp: number;
 	action:
@@ -179,7 +202,13 @@ interface GetDynamicInputsResult {
 	promptText: string;
 	imageCount: number;
 	action: LlmLogEntry["action"];
-	details?: { cardCount?: number; textContentTokens?: number };
+	details?: {
+		cardCount?: number;
+		textContentTokens?: number;
+		isVariableOutput?: boolean;
+		isHybrid?: boolean;
+		pageCount?: number;
+	};
 }
 
 interface EpubSection {
@@ -202,6 +231,9 @@ interface EpubStructure {
 const LLM_LOG_FILE = "_llm_log.json";
 const IMAGE_TOKEN_COST = 1105;
 
+/**
+ * The main class for the Gated Notes plugin, handling all logic and UI.
+ */
 export default class GatedNotesPlugin extends Plugin {
 	settings!: Settings;
 	public lastModalTransform: string | null = null;
@@ -242,6 +274,12 @@ export default class GatedNotesPlugin extends Plugin {
 		});
 	}
 
+	/**
+	 * Logs a message to the console if the specified log level is met.
+	 * @param level The log level of the message.
+	 * @param message The message to log.
+	 * @param optionalParams Additional data to log with the message.
+	 */
 	public logger(
 		level: LogLevel,
 		message: string,
@@ -257,9 +295,17 @@ export default class GatedNotesPlugin extends Plugin {
 		}
 	}
 
+	/**
+	 * Creates and manages a UI element for estimating the cost of an LLM call.
+	 * @param container The HTMLElement to append the cost estimator to.
+	 * @param getDynamicInputs A function that returns the necessary inputs for cost calculation.
+	 * @returns An object with an `update` method to refresh the cost estimation.
+	 */
 	public createCostEstimatorUI(
 		container: HTMLElement,
-		getDynamicInputs: () => GetDynamicInputsResult
+		getDynamicInputs: () =>
+			| GetDynamicInputsResult
+			| Promise<GetDynamicInputsResult>
 	): { update: () => Promise<string> } {
 		const costEl = container.createEl("small", {
 			text: "Calculating cost...",
@@ -272,8 +318,9 @@ export default class GatedNotesPlugin extends Plugin {
 		let lastCostString = "";
 
 		const update = async () => {
+			const result = getDynamicInputs();
 			const { promptText, imageCount, action, details } =
-				getDynamicInputs();
+				result instanceof Promise ? await result : result;
 
 			const model =
 				imageCount > 0
@@ -380,8 +427,8 @@ export default class GatedNotesPlugin extends Plugin {
 			editorCallback: (editor: Editor) => {
 				const cursor = editor.getCursor();
 				const currentLine = editor.getLine(cursor.line);
-				
-				if (currentLine.trim() === '') {
+
+				if (currentLine.trim() === "") {
 					editor.setLine(cursor.line, SPLIT_TAG);
 				} else {
 					editor.replaceSelection(`\n${SPLIT_TAG}\n`);
@@ -566,12 +613,13 @@ export default class GatedNotesPlugin extends Plugin {
 			id: "gn-remove-all-split-tags",
 			name: "Remove all manual split tags from current note",
 			checkCallback: (checking: boolean) => {
-				const view = this.app.workspace.getActiveViewOfType(MarkdownView);
+				const view =
+					this.app.workspace.getActiveViewOfType(MarkdownView);
 				if (!view?.file) return false;
-		
+
 				const content = view.editor.getValue();
 				if (!content.includes(SPLIT_TAG)) return false;
-		
+
 				if (!checking) {
 					const newContent = this.cleanupAfterSplitRemoval(content);
 					view.editor.setValue(newContent);
@@ -717,15 +765,45 @@ export default class GatedNotesPlugin extends Plugin {
 				this.openai = null;
 				return;
 			}
+			// Using a custom fetch adapter with Obsidian's requestUrl
+			// is more robust for handling requests in the Obsidian environment.
+			const customFetch = async (
+				url: RequestInfo | URL,
+				init?: RequestInit
+			): Promise<Response> => {
+				const headers: Record<string, string> = {};
+				if (init?.headers) {
+					// The openai-node SDK passes a Headers object. We need to convert it to
+					// a plain Record<string, string> for Obsidian's requestUrl function.
+					new Headers(init.headers).forEach((value, key) => {
+						headers[key] = value;
+					});
+				}
+
+				const requestParams: RequestUrlParam = {
+					url: url.toString(),
+					method: init?.method ?? 'GET',
+					headers: headers,
+					body: init?.body as string | ArrayBuffer,
+					throw: false,
+				};
+				const obsidianResponse = await requestUrl(requestParams);
+				return new Response(obsidianResponse.arrayBuffer, {
+					status: obsidianResponse.status,
+					headers: new Headers(obsidianResponse.headers),
+				});
+			};
 			this.openai = new OpenAI({
 				apiKey: openaiApiKey,
 				dangerouslyAllowBrowser: true,
+				fetch: customFetch,
 			});
 		} else {
 			this.openai = new OpenAI({
 				baseURL: `${lmStudioUrl.replace(/\/$/, "")}/v1`,
 				apiKey: "lm-studio",
 				dangerouslyAllowBrowser: true,
+				// LM Studio is local, so default fetch is usually fine.
 			});
 		}
 	}
@@ -989,16 +1067,16 @@ export default class GatedNotesPlugin extends Plugin {
 			new Notice("Note is already finalized.");
 			return;
 		}
-	
+
 		if (content.includes(SPLIT_TAG)) {
 			const userChoice = await this.showSplitMarkerConflictModal();
-	
+
 			if (userChoice === "manual") {
 				await this.manualFinalizeNote(file);
 				return;
 			} else if (userChoice === "remove") {
 				const contentWithoutSplits = content.replace(
-					new RegExp(escapeRegExp(SPLIT_TAG), "g"), 
+					new RegExp(escapeRegExp(SPLIT_TAG), "g"),
 					""
 				);
 				return this.performAutoFinalize(file, contentWithoutSplits);
@@ -1010,11 +1088,14 @@ export default class GatedNotesPlugin extends Plugin {
 		}
 	}
 
-	private async performAutoFinalize(file: TFile, content: string): Promise<void> {
+	private async performAutoFinalize(
+		file: TFile,
+		content: string
+	): Promise<void> {
 		const paragraphs: string[] = [];
 		let inFence = false;
 		let buffer: string[] = [];
-	
+
 		for (const line of content.split("\n")) {
 			if (line.trim().startsWith("```")) inFence = !inFence;
 			buffer.push(line);
@@ -1028,7 +1109,7 @@ export default class GatedNotesPlugin extends Plugin {
 			const lastParagraph = buffer.join("\n").trim();
 			if (lastParagraph) paragraphs.push(lastParagraph);
 		}
-	
+
 		const wrappedContent = paragraphs
 			.map(
 				(md, i) =>
@@ -1051,10 +1132,10 @@ export default class GatedNotesPlugin extends Plugin {
 			new Notice("Note is already finalized.");
 			return;
 		}
-	
+
 		const normalizedContent = this.normalizeSplitContent(content);
 		const chunks = normalizedContent.split(SPLIT_TAG);
-		
+
 		const wrappedContent = chunks
 			.map((md, i) => {
 				const trimmedMd = md.trim();
@@ -1063,37 +1144,40 @@ export default class GatedNotesPlugin extends Plugin {
 				}" ${PARA_MD_ATTR}="${md2attr(trimmedMd)}"></div>`;
 			})
 			.join("\n\n");
-		
+
 		await this.app.vault.modify(file, wrappedContent);
 		new Notice("Note manually finalized. Gating is now active.");
 	}
 
 	private normalizeSplitContent(content: string): string {
-		let normalized = content.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
-		
-		normalized = normalized.replace(/\n{3,}/g, '\n\n');
-		
-		normalized = normalized.replace(new RegExp(`\\s*${escapeRegExp(SPLIT_TAG)}\\s*`, 'g'), `\n${SPLIT_TAG}\n`);
-		
-		normalized = normalized.replace(/\n{3,}/g, '\n\n');
-		
+		let normalized = content.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
+
+		normalized = normalized.replace(/\n{3,}/g, "\n\n");
+
+		normalized = normalized.replace(
+			new RegExp(`\\s*${escapeRegExp(SPLIT_TAG)}\\s*`, "g"),
+			`\n${SPLIT_TAG}\n`
+		);
+
+		normalized = normalized.replace(/\n{3,}/g, "\n\n");
+
 		return normalized.trim();
 	}
 
 	private async unfinalize(file: TFile): Promise<void> {
 		const htmlContent = await this.app.vault.read(file);
 		const paragraphs = getParagraphsFromFinalizedNote(htmlContent);
-	
+
 		if (paragraphs.length === 0) {
 			new Notice("This note does not appear to be finalized.");
 			return;
 		}
-	
+
 		const mdContent = paragraphs
 			.map((p) => p.markdown)
 			.join(`\n${SPLIT_TAG}\n`)
 			.trim();
-		
+
 		await this.app.vault.modify(file, mdContent);
 		this.refreshReading();
 		this.refreshAllStatuses();
@@ -1129,36 +1213,41 @@ export default class GatedNotesPlugin extends Plugin {
 	}
 
 	private cleanupAfterSplitRemoval(content: string): string {
-		let cleaned = content.replace(new RegExp(escapeRegExp(SPLIT_TAG), "g"), "");
-		
-		cleaned = cleaned.replace(/\n{3,}/g, '\n\n');
-		
+		let cleaned = content.replace(
+			new RegExp(escapeRegExp(SPLIT_TAG), "g"),
+			""
+		);
+
+		cleaned = cleaned.replace(/\n{3,}/g, "\n\n");
+
 		cleaned = cleaned.trim();
-		
+
 		return cleaned;
 	}
 
-	private showSplitMarkerConflictModal(): Promise<"auto" | "manual" | "remove" | null> {
+	private showSplitMarkerConflictModal(): Promise<
+		"auto" | "manual" | "remove" | null
+	> {
 		return new Promise((resolve) => {
 			const modal = new Modal(this.app);
 			let choice: "auto" | "manual" | "remove" | null = null;
-	
+
 			modal.titleEl.setText("Manual Split Markers Detected");
 			modal.contentEl.createEl("p", {
 				text: "This note contains manual paragraph split markers. How would you like to proceed?",
 			});
-	
+
 			const buttonContainer = modal.contentEl.createDiv({
 				cls: "gn-edit-btnrow",
 			});
-	
+
 			new ButtonComponent(buttonContainer)
 				.setButtonText("Cancel")
 				.onClick(() => {
 					choice = null;
 					modal.close();
 				});
-	
+
 			new ButtonComponent(buttonContainer)
 				.setButtonText("Remove Splits & Auto-Finalize")
 				.setWarning()
@@ -1166,7 +1255,7 @@ export default class GatedNotesPlugin extends Plugin {
 					choice = "remove";
 					modal.close();
 				});
-	
+
 			new ButtonComponent(buttonContainer)
 				.setButtonText("Use Manual Splits")
 				.setCta()
@@ -1174,11 +1263,11 @@ export default class GatedNotesPlugin extends Plugin {
 					choice = "manual";
 					modal.close();
 				});
-	
+
 			modal.onClose = () => {
 				resolve(choice);
 			};
-	
+
 			modal.open();
 		});
 	}
@@ -1284,6 +1373,8 @@ ${guidancePrompt}
 3.  **Visual Question Cards: Create questions that require the user to see the image to answer. The "Front" of such cards should contain both a question and the \`[[IMAGE HASH=...]]\` placeholder.** For example: "What process does this diagram illustrate? [[IMAGE HASH=...]]".
 4.  **No Image-Only Fields: The "Front" or "Back" of a card must never consist solely of an image placeholder. Images must always be accompanied by relevant text or a question.**
 
+**Formatting Rule:** Preserve all Markdown formatting, especially LaTeX math expressions (e.g., \`$ ... $\` and \`$$ ... $$\`), in the "front" and "back" fields.
+
 **Output Format:**
 - Return ONLY valid JSON of this shape: \`[{"front":"...","back":"...","tag":"..."}]\`
 - Every card must have a valid front, back, and tag.
@@ -1303,8 +1394,7 @@ ${plainTextForLlm}`;
 
 		const generatedItems = this.parseLlmResponse(response, file.path);
 		const goodCards: Flashcard[] = [];
-		let cardsToFix: Omit<Flashcard, "id" | "paraIdx" | "review_history">[] =
-			[];
+		let cardsToFix: (Pick<Flashcard, "front" | "back" | "tag" | "chapter">)[] = [];
 
 		for (const item of generatedItems) {
 			if (item.tag.startsWith("[[IMAGE HASH=")) {
@@ -1410,7 +1500,7 @@ ${plainTextForLlm}`;
 	}
 
 	private async attemptTagCorrection(
-		cardData: Omit<Flashcard, "id" | "paraIdx" | "review_history">,
+		cardData: Pick<Flashcard, "front" | "back" | "tag" | "chapter">,
 		sourceText: string,
 		paragraphs: { id: number; markdown: string }[]
 	): Promise<Flashcard | null> {
@@ -1488,6 +1578,7 @@ ${JSON.stringify(sourceText)}
 		new Notice("🤖 Generating card with AI...");
 
 		const prompt = `From the following text, create a single, concise flashcard.
+**Formatting Rule:** Preserve all Markdown formatting, especially LaTeX math expressions (e.g., \`$ ... $\` and \`$$ ... $$\`), in the "front" and "back" fields.
 Return ONLY valid JSON of this shape: {"front":"...","back":"..."}
 
 Text:
@@ -1555,6 +1646,7 @@ ${selection}
 			);
 
 			const prompt = `From the following text, create ${count} concise flashcard(s).
+**Formatting Rule:** Preserve all Markdown formatting, especially LaTeX math expressions (e.g., \`$ ... $\` and \`$$ ... $$\`), in the "front" and "back" fields.
 Return ONLY valid JSON of this shape: [{"front":"...","back":"..."}]
 
 Text:
@@ -1625,8 +1717,9 @@ ${selection}
 	private parseLlmResponse(
 		rawResponse: string,
 		chapterPath: string
-	): Omit<Flashcard, "id" | "paraIdx" | "review_history">[] {
+	): (Pick<Flashcard, "front" | "back" | "tag" | "chapter">)[] {
 		try {
+			// Try the enhanced parsing
 			const items = extractJsonArray<{
 				front: string;
 				back: string;
@@ -1634,18 +1727,31 @@ ${selection}
 			}>(rawResponse);
 
 			return items
-				.filter((item) => item.front && item.back && item.tag)
+				.filter((item) => {
+					// More robust validation
+					if (!item || typeof item !== "object") {
+						this.logger(LogLevel.VERBOSE, "LLM response item filtered out: Not an object", item);
+						return false;
+					}
+
+					const hasRequiredFields =
+						typeof item.front === "string" &&
+						item.front.trim().length > 0 &&
+						typeof item.back === "string" &&
+						item.back.trim().length > 0 &&
+						typeof item.tag === "string" &&
+						item.tag.trim().length > 0;
+					
+					if (!hasRequiredFields) {
+						this.logger(LogLevel.VERBOSE, "LLM response item filtered out: Missing required fields", item);
+					}
+					return hasRequiredFields;
+				})
 				.map((item) => ({
 					front: item.front.trim(),
 					back: item.back.trim(),
 					tag: item.tag.trim(),
-					chapter: chapterPath,
-					status: "new" as CardStatus,
-					last_reviewed: null,
-					interval: 0,
-					ease_factor: 2.5,
-					due: Date.now(),
-					blocked: true,
+					chapter: chapterPath
 				}));
 		} catch (e: unknown) {
 			new Notice("Error parsing LLM response. See console for details.");
@@ -1657,6 +1763,10 @@ ${selection}
 		}
 	}
 
+	/**
+	 * Rerenders all preview-mode markdown views in the workspace.
+	 * This is used to apply changes to content gating or paragraph rendering.
+	 */
 	public refreshReading(): void {
 		this.app.workspace.iterateAllLeaves((leaf) => {
 			const view = leaf.view;
@@ -1666,6 +1776,10 @@ ${selection}
 		});
 	}
 
+	/**
+	 * Rerenders markdown views and attempts to preserve the user's scroll position.
+	 * This is useful after an action that might reflow the document, like unlocking content.
+	 */
 	public async refreshReadingAndPreserveScroll(): Promise<void> {
 		const mdView = this.app.workspace.getActiveViewOfType(MarkdownView);
 
@@ -2065,6 +2179,236 @@ ${selection}
 			.gn-epub-section input[type="checkbox"] {
 				margin-right: 8px;
 			}
+			.gn-pdf-modal {
+				width: 70vw;
+				height: 80vh;
+				max-width: 1000px;
+				max-height: 900px;
+				min-width: 600px;
+				min-height: 500px;
+			}
+			
+			.gn-pdf-modal .modal-content {
+				height: 100%;
+				display: flex;
+				flex-direction: column;
+				overflow-y: auto;
+				padding: 20px;
+			}
+			
+			.gn-hybrid-controls {
+				background: var(--background-secondary);
+				border-radius: var(--radius-m);
+				transition: all 0.2s ease-in-out;
+			}
+			
+			.gn-hybrid-controls h5 {
+				margin-bottom: 15px;
+				color: var(--text-accent);
+				font-weight: 600;
+			}
+			
+			.gn-cost-estimator {
+				padding: 8px 12px;
+				background: var(--background-modifier-info);
+				border-radius: var(--radius-s);
+				font-family: var(--font-monospace);
+				border-left: 3px solid var(--text-accent);
+			}
+			
+			.gn-cost-estimator.gn-hybrid-cost {
+				background: var(--background-modifier-success);
+				border-left-color: var(--color-green);
+			}
+			
+			.gn-processing-status {
+				display: flex;
+				align-items: center;
+				gap: 10px;
+				padding: 10px;
+				background: var(--background-secondary);
+				border-radius: var(--radius-s);
+				margin: 10px 0;
+			}
+			
+			.gn-processing-status .gn-spinner {
+				width: 16px;
+				height: 16px;
+				border: 2px solid var(--background-modifier-border);
+				border-top: 2px solid var(--text-accent);
+				border-radius: 50%;
+				animation: gn-spin 1s linear infinite;
+			}
+			
+			@keyframes gn-spin {
+				0% { transform: rotate(0deg); }
+				100% { transform: rotate(360deg); }
+			}
+			
+			.gn-page-preview {
+				display: grid;
+				grid-template-columns: repeat(auto-fill, minmax(150px, 1fr));
+				gap: 10px;
+				max-height: 200px;
+				overflow-y: auto;
+				padding: 10px;
+				background: var(--background-secondary);
+				border-radius: var(--radius-s);
+			}
+			
+			.gn-page-preview-item {
+				display: flex;
+				flex-direction: column;
+				align-items: center;
+				padding: 8px;
+				border: 1px solid var(--background-modifier-border);
+				border-radius: var(--radius-s);
+				background: var(--background-primary);
+			}
+			
+			.gn-page-preview-item img {
+				max-width: 100%;
+				max-height: 80px;
+				object-fit: contain;
+				border-radius: var(--radius-xs);
+			}
+			
+			.gn-page-preview-item .gn-page-num {
+				margin-top: 5px;
+				font-size: 0.8em;
+				color: var(--text-muted);
+			}
+			
+			.gn-mode-toggle {
+				display: flex;
+				background: var(--background-modifier-border);
+				border-radius: var(--radius-m);
+				padding: 2px;
+				margin-bottom: 15px;
+			}
+			
+			.gn-mode-toggle button {
+				flex: 1;
+				background: transparent;
+				border: none;
+				padding: 8px 16px;
+				border-radius: var(--radius-s);
+				cursor: pointer;
+				transition: all 0.2s ease;
+				font-weight: 500;
+			}
+			
+			.gn-mode-toggle button:hover {
+				background: var(--background-modifier-hover);
+			}
+			
+			.gn-mode-toggle button.active {
+				background: var(--interactive-accent);
+				color: var(--text-on-accent);
+			}
+			
+			.gn-progress-bar {
+				width: 100%;
+				height: 4px;
+				background: var(--background-modifier-border);
+				border-radius: 2px;
+				overflow: hidden;
+				margin: 10px 0;
+			}
+			
+			.gn-progress-bar .gn-progress-fill {
+				height: 100%;
+				background: var(--text-accent);
+				transition: width 0.3s ease;
+				border-radius: 2px;
+			}
+			
+			/* Warning styles for experimental features */
+			.gn-warning-banner {
+				background: var(--background-modifier-error);
+				border: 1px solid var(--color-red);
+				border-radius: var(--radius-s);
+				padding: 12px;
+				margin-bottom: 15px;
+			}
+			
+			.gn-warning-banner strong {
+				color: var(--color-red);
+			}
+			
+			/* Input grouping for page ranges */
+			.gn-input-group {
+				display: flex;
+				gap: 8px;
+				align-items: center;
+			}
+			
+			.gn-input-group .setting-item-control {
+				display: flex;
+				gap: 8px;
+				align-items: center;
+			}
+			
+			.gn-input-group input[type="text"] {
+				width: 80px !important;
+			}
+			
+			.gn-input-group .gn-input-separator {
+				color: var(--text-muted);
+				font-weight: bold;
+			}
+			
+			/* Enhanced tooltip styles */
+			.gn-tooltip {
+				position: relative;
+				display: inline-block;
+				cursor: help;
+				color: var(--text-muted);
+			}
+			
+			.gn-tooltip::after {
+				content: attr(data-tooltip);
+				position: absolute;
+				bottom: 125%;
+				left: 50%;
+				transform: translateX(-50%);
+				background: var(--background-tooltip);
+				color: var(--text-tooltip);
+				padding: 6px 10px;
+				border-radius: var(--radius-s);
+				font-size: 0.8em;
+				white-space: nowrap;
+				opacity: 0;
+				pointer-events: none;
+				transition: opacity 0.3s;
+				z-index: 1000;
+			}
+			
+			.gn-tooltip:hover::after {
+				opacity: 1;
+			}
+			
+			/* Responsive adjustments */
+			@media (max-width: 800px) {
+				.gn-pdf-modal {
+					width: 95vw;
+					height: 95vh;
+					min-width: 320px;
+				}
+				
+				.gn-page-preview {
+					grid-template-columns: repeat(auto-fill, minmax(100px, 1fr));
+				}
+				
+				.gn-input-group {
+					flex-direction: column;
+					align-items: stretch;
+				}
+				
+				.gn-input-group .setting-item-control {
+					flex-direction: column;
+				}
+			}
 		`;
 		document.head.appendChild(styleEl);
 		this.register(() => styleEl.remove());
@@ -2105,6 +2449,10 @@ ${selection}
 		);
 	}
 
+	/**
+	 * Creates a new flashcard object with default values for spaced repetition.
+	 * @param data The core data for the flashcard (front, back, tag, chapter).
+	 */
 	public createCardObject(
 		data: Partial<Flashcard> & {
 			front: string;
@@ -2131,6 +2479,11 @@ ${selection}
 		};
 	}
 
+	/**
+	 * Saves an array of new flashcards to the appropriate deck file.
+	 * @param sourceFile The source TFile of the chapter the cards belong to.
+	 * @param newCards An array of new Flashcard objects to save.
+	 */
 	public async saveCards(
 		sourceFile: TFile,
 		newCards: Flashcard[]
@@ -2142,6 +2495,12 @@ ${selection}
 		await this.writeDeck(deckPath, graph);
 	}
 
+	/**
+	 * Recalculates the `paraIdx` for all cards associated with a given note.
+	 * This is useful after editing a finalized note to re-sync card locations.
+	 * @param file The TFile of the note to process.
+	 * @param showNotice Whether to show a user-facing notice upon completion.
+	 */
 	public async recalculateParaIdx(
 		file: TFile,
 		showNotice = true
@@ -2226,6 +2585,9 @@ ${selection}
 		this.refreshAllStatuses();
 	}
 
+	/**
+	 * Triggers a recalculation of paragraph indexes for all markdown files in the vault.
+	 */
 	public async recalculateAllParaIndexes(): Promise<void> {
 		if (this.isRecalculatingAll) {
 			new Notice("Recalculation for all notes is already in progress.");
@@ -2257,6 +2619,10 @@ ${selection}
 		}
 	}
 
+	/**
+	 * Resets the review progress of a single flashcard, setting it back to a "new" state.
+	 * @param card The flashcard to reset.
+	 */
 	public resetCardProgress(card: Flashcard): void {
 		card.status = "new";
 		card.last_reviewed = null;
@@ -2540,6 +2906,12 @@ ${selection}
 		}
 	}
 
+	/**
+	 * Renders card content, processing special placeholders like `[[IMAGE HASH=...]]`.
+	 * @param content The raw markdown content from the card's front or back field.
+	 * @param container The HTMLElement to render the content into.
+	 * @param sourcePath The path of the card's source chapter, for resolving links.
+	 */
 	public async renderCardContent(
 		content: string,
 		container: HTMLElement,
@@ -2807,6 +3179,15 @@ ${selection}
 		});
 	}
 
+	/**
+	 * Opens the card editing modal.
+	 * @param card The flashcard to edit.
+	 * @param graph The full flashcard graph for the deck.
+	 * @param deck The TFile of the deck file.
+	 * @param onDone A callback function executed when the modal is closed.
+	 * @param reviewContext Context if the modal is opened during a new-card review sequence.
+	 * @param parentContext The context from which the modal was opened.
+	 */
 	public openEditModal(
 		card: Flashcard,
 		graph: FlashcardGraph,
@@ -2818,6 +3199,12 @@ ${selection}
 		new EditModal(this, card, graph, deck, onDone, reviewContext).open();
 	}
 
+	/**
+	 * Prompts the user to review a set of newly created cards.
+	 * @param newCards An array of the new cards to review.
+	 * @param deck The TFile of the deck they were added to.
+	 * @param graph The full flashcard graph for the deck.
+	 */
 	public async promptToReviewNewCards(
 		newCards: Flashcard[],
 		deck: TFile,
@@ -2865,6 +3252,12 @@ ${selection}
 		}
 	}
 
+	/**
+	 * Guides the user through a sequential review of newly created cards.
+	 * @param newCards The array of new cards to review.
+	 * @param deck The TFile of the deck.
+	 * @param graph The full flashcard graph.
+	 */
 	public async reviewNewCardsInSequence(
 		newCards: Flashcard[],
 		deck: TFile,
@@ -2940,11 +3333,17 @@ ${selection}
 		});
 	}
 
+	/**
+	 * Refreshes all status bar indicators.
+	 */
 	public async refreshAllStatuses(): Promise<void> {
 		this.refreshDueCardStatus();
 		this.updateMissingParaIdxStatus();
 	}
 
+	/**
+	 * Updates the status bar item that shows the number of due cards.
+	 */
 	public refreshDueCardStatus(): void {
 		if (this.statusRefreshQueued) return;
 		this.statusRefreshQueued = true;
@@ -2975,6 +3374,9 @@ ${selection}
 		}, 150);
 	}
 
+	/**
+	 * Updates the status bar item that shows the count of cards missing a paragraph index.
+	 */
 	public async updateMissingParaIdxStatus(): Promise<void> {
 		let count = 0;
 		const allDeckFiles = this.app.vault
@@ -3046,9 +3448,22 @@ ${selection}
 		return "done";
 	}
 
+	/**
+	 * Sends a prompt to the configured Large Language Model (LLM).
+	 * Handles both OpenAI and LM Studio providers, as well as multimodal requests.
+	 * @param prompt The text prompt to send.
+	 * @param imageUrl Optional base64-encoded image URL for multimodal requests.
+	 * @param options Optional settings to override the default model, temperature, etc.
+	 * @returns A promise that resolves to an object containing the LLM's response content and usage statistics.
+	 */
 	public async sendToLlm(
 		prompt: string,
-		imageUrl?: string
+		imageUrl?: string,
+		options: {
+			maxTokens?: number;
+			temperature?: number;
+			model?: string;
+		} = {}
 	): Promise<{ content: string; usage?: OpenAI.CompletionUsage }> {
 		if (!this.openai) {
 			new Notice("AI client is not configured. Check plugin settings.");
@@ -3062,28 +3477,41 @@ ${selection}
 			return { content: "" };
 		}
 
-		const model = imageUrl
-			? this.settings.openaiMultimodalModel
-			: apiProvider === "openai"
-			? this.settings.openaiModel
-			: lmStudioModel;
+		let model: string;
+		if (options.model) {
+			model = options.model;
+		} else if (imageUrl) {
+			model = this.settings.openaiMultimodalModel;
+		} else {
+			model =
+				apiProvider === "openai"
+					? this.settings.openaiModel
+					: lmStudioModel;
+		}
 
 		try {
 			const messageContent: OpenAI.Chat.Completions.ChatCompletionContentPart[] =
 				[{ type: "text", text: prompt }];
+
 			if (imageUrl) {
 				messageContent.push({
 					type: "image_url",
-					image_url: { url: imageUrl },
+					image_url: {
+						url: imageUrl,
+						detail: "high", // Use high detail for PDF processing
+					},
 				});
 			}
 
-			const payload: OpenAI.Chat.Completions.ChatCompletionCreateParams =
-				{
-					model,
-					temperature: openaiTemperature,
-					messages: [{ role: "user", content: messageContent }],
-				};
+			const payload: OpenAI.Chat.Completions.ChatCompletionCreateParams = {
+				model,
+				temperature: options.temperature ?? openaiTemperature,
+				messages: [{ role: "user", content: messageContent }],
+			};
+
+			if (options.maxTokens) {
+				payload.max_tokens = options.maxTokens;
+			}
 
 			this.logger(LogLevel.VERBOSE, "Sending payload to LLM:", payload);
 
@@ -3113,6 +3541,10 @@ ${selection}
 		}
 	}
 
+	/**
+	 * Fetches the list of available models from the configured AI provider.
+	 * @returns A promise that resolves to an array of model ID strings.
+	 */
 	public async fetchAvailableModels(): Promise<string[]> {
 		const { apiProvider, lmStudioUrl, openaiApiKey } = this.settings;
 		let apiUrl: string;
@@ -3173,6 +3605,9 @@ ${selection}
 		return Math.min(...blockedCards.map((c) => c.paraIdx ?? Infinity));
 	}
 
+	/**
+	 * Loads plugin settings from Obsidian's data store.
+	 */
 	async loadSettings(): Promise<void> {
 		this.settings = Object.assign(
 			{},
@@ -3181,6 +3616,9 @@ ${selection}
 		);
 	}
 
+	/**
+	 * Saves the current plugin settings to Obsidian's data store.
+	 */
 	async saveSettings(): Promise<void> {
 		await this.saveData(this.settings);
 		this.initializeOpenAIClient();
@@ -3297,6 +3735,9 @@ ${selection}
 	}
 }
 
+/**
+ * A modal for converting an EPUB file into an Obsidian note.
+ */
 class EpubToNoteModal extends Modal {
 	private fileInput!: HTMLInputElement;
 	private chapterNameInput!: TextComponent;
@@ -3332,23 +3773,18 @@ class EpubToNoteModal extends Modal {
 			attr: { style: "margin: 5px 0 0 0; font-size: 0.9em;" },
 		});
 
-		const fileSection = this.contentEl.createDiv();
-		fileSection.createEl("h4", { text: "Select EPUB File" });
-
-		const fileButton = fileSection.createEl("button", {
-			text: "Choose EPUB File",
-			cls: "mod-cta",
+		new Setting(this.contentEl).setName("Select EPUB File").addButton((btn) => {
+			btn.setButtonText("Choose File").onClick(() => this.fileInput.click());
 		});
 
-		this.fileInput = fileSection.createEl("input", {
+		this.fileInput = this.contentEl.createEl("input", {
 			type: "file",
 			attr: { accept: ".epub", style: "display: none;" },
 		}) as HTMLInputElement;
 
-		fileButton.onclick = () => this.fileInput.click();
 		this.fileInput.onchange = (e) => this.handleFileSelection(e);
 
-		new Setting(this.contentEl)
+		new Setting(this.contentEl.createDiv())
 			.setName("Chapter Name")
 			.setDesc("Name for the new note")
 			.addText((text) => {
@@ -3356,10 +3792,12 @@ class EpubToNoteModal extends Modal {
 				text.setPlaceholder("Enter chapter name...");
 			});
 
-		const folderSection = this.contentEl.createDiv();
-		folderSection.createEl("h4", { text: "Destination Folder" });
+		const folderSetting = new Setting(this.contentEl.createDiv()).setName(
+			"Destination Folder"
+		);
+		this.folderSelect = folderSetting.controlEl.createEl("select");
+		this.newFolderInput = new TextComponent(folderSetting.controlEl);
 
-		this.folderSelect = folderSection.createEl("select");
 		await this.populateFolderOptions();
 
 		this.folderSelect.onchange = () => {
@@ -3369,7 +3807,6 @@ class EpubToNoteModal extends Modal {
 				: "none";
 		};
 
-		this.newFolderInput = new TextComponent(folderSection);
 		this.newFolderInput.setPlaceholder("Enter new folder name...");
 		this.newFolderInput.inputEl.style.display = "none";
 
@@ -4390,6 +4827,9 @@ class EpubToNoteModal extends Modal {
 	}
 }
 
+/**
+ * A modal for converting a PDF file into a structured Obsidian note using AI.
+ */
 class PdfToNoteModal extends Modal {
 	private fileInput!: HTMLInputElement;
 	private chapterNameInput!: TextComponent;
@@ -4401,13 +4841,26 @@ class PdfToNoteModal extends Modal {
 	private selectedFile: File | null = null;
 	private exampleNotePath: string = "";
 	private exampleNoteContent: string = "";
+	private cleanupToggleComponent!: ToggleComponent;
+	private guidanceInput?: TextAreaComponent;
+	private processingModeSelect!: HTMLSelectElement;
+	private dpiInput!: TextComponent;
+	private maxWidthInput!: TextComponent;
+	private pageRangeFromInput!: TextComponent;
+	private pageRangeToInput!: TextComponent;
+	private includeTextToggle!: ToggleComponent;
+	private renderedPages: Array<{
+		pageNum: number;
+		imageData: string;
+		textContent?: string;
+	}> = [];
 
 	constructor(private plugin: GatedNotesPlugin) {
 		super(plugin.app);
 	}
 
 	async onOpen() {
-		this.titleEl.setText("Convert PDF to Note (EXPERIMENTAL)");
+		this.titleEl.setText("Convert PDF to Note (Enhanced)");
 		this.modalEl.addClass("gn-pdf-modal");
 		makeModalDraggable(this, this.plugin);
 
@@ -4416,35 +4869,34 @@ class PdfToNoteModal extends Modal {
 				style: "background: var(--background-modifier-error); padding: 10px; border-radius: 5px; margin-bottom: 15px;",
 			},
 		});
-		warningEl.createEl("strong", { text: "⚠️ Experimental Feature" });
+		warningEl.createEl("strong", { text: "⚠️ Enhanced PDF Conversion" });
 		warningEl.createEl("p", {
-			text: "This PDF conversion feature is experimental. Results may vary depending on PDF complexity and formatting. Always review the generated content carefully.",
+			text: "This enhanced PDF converter supports both text-only and hybrid (text + image) modes for better handling of complex documents with formulas and figures.",
 			attr: { style: "margin: 5px 0 0 0; font-size: 0.9em;" },
 		});
 
-		const fileSection = this.contentEl.createDiv();
-		fileSection.createEl("h4", { text: "Select PDF File" });
+		new Setting(this.contentEl)
+			.setName("Select PDF File")
+			.addButton((btn) => {
+				btn.setButtonText("Choose File").onClick(() => this.fileInput.click());
+			});
 
-		const fileButton = fileSection.createEl("button", {
-			text: "Choose PDF File",
-			cls: "mod-cta",
-		});
-
-		this.fileInput = fileSection.createEl("input", {
+		this.fileInput = this.contentEl.createEl("input", {
 			type: "file",
 			attr: { accept: ".pdf", style: "display: none;" },
 		}) as HTMLInputElement;
 
-		fileButton.onclick = () => this.fileInput.click();
 		this.fileInput.onchange = (e) => this.handleFileSelection(e);
 
-		this.pdfViewer = fileSection.createDiv({
+		this.pdfViewer = this.contentEl.createDiv({
 			cls: "pdf-viewer",
 			attr: {
 				style: "margin-top: 10px; min-height: 200px; border: 1px solid var(--background-modifier-border); padding: 10px;",
 			},
 		});
 		this.pdfViewer.setText("No PDF selected");
+
+		this.setupProcessingModeControls();
 
 		new Setting(this.contentEl)
 			.setName("Chapter Name")
@@ -4455,10 +4907,12 @@ class PdfToNoteModal extends Modal {
 				text.onChange(() => this.costUi?.update());
 			});
 
-		const folderSection = this.contentEl.createDiv();
-		folderSection.createEl("h4", { text: "Destination Folder" });
+		const folderSetting = new Setting(this.contentEl).setName(
+			"Destination Folder"
+		);
+		this.folderSelect = folderSetting.controlEl.createEl("select");
+		this.newFolderInput = new TextComponent(folderSetting.controlEl);
 
-		this.folderSelect = folderSection.createEl("select");
 		await this.populateFolderOptions();
 
 		this.folderSelect.onchange = () => {
@@ -4468,48 +4922,109 @@ class PdfToNoteModal extends Modal {
 				: "none";
 		};
 
-		this.newFolderInput = new TextComponent(folderSection);
 		this.newFolderInput.setPlaceholder("Enter new folder name...");
 		this.newFolderInput.inputEl.style.display = "none";
 
-		const exampleSection = this.contentEl.createDiv();
-		exampleSection.createEl("h4", { text: "Example Note (Optional)" });
-		exampleSection.createEl("p", {
-			text: "Select an existing note to use as a structural template for the conversion.",
-			cls: "setting-item-description",
-		});
+		this.setupExampleNoteSection();
 
-		const exampleButtonContainer = exampleSection.createDiv({
-			cls: "gn-edit-row",
-		});
-		const exampleButton = exampleButtonContainer.createEl("button", {
-			text: "Choose Example Note",
-		});
+		const guidanceContainer = this.contentEl.createDiv();
+		const addGuidanceBtn = new ButtonComponent(guidanceContainer)
+			.setButtonText("Add Custom Guidance")
+			.onClick(() => {
+				addGuidanceBtn.buttonEl.style.display = "none";
+				new Setting(guidanceContainer)
+					.setName("Custom Guidance")
+					.setDesc(
+						"Provide specific instructions for the AI (e.g., 'Focus on definitions', 'Summarize each section')."
+					)
+					.addTextArea((text) => {
+						this.guidanceInput = text;
+						text.setPlaceholder("Your custom instructions...");
+						text.inputEl.rows = 4;
+						text.inputEl.style.width = "100%";
+						text.onChange(() => this.costUi?.update());
+					});
+			});
 
-		const exampleDisplay = exampleSection.createDiv({
-			attr: {
-				style: "margin-top: 10px; font-style: italic; color: var(--text-muted);",
-			},
+		const postProcessingSection = this.contentEl.createDiv();
+		postProcessingSection.createEl("h4", {
+			text: "Post-Processing (Optional)",
 		});
-		exampleDisplay.setText("No example note selected");
-
-		exampleButton.onclick = () =>
-			this.openExampleNoteSelector(exampleDisplay);
+		new Setting(postProcessingSection)
+			.setName("Clean repetitive headers/footers")
+			.setDesc(
+				"Runs an additional AI pass to remove recurring text like chapter titles from page headers. This will incur additional cost and time."
+			)
+			.addToggle((toggle) => {
+				this.cleanupToggleComponent = toggle;
+				toggle.setValue(false).onChange(() => this.costUi?.update());
+			});
 
 		const costContainer = this.contentEl.createDiv();
 		this.costUi = this.plugin.createCostEstimatorUI(
 			costContainer,
-			(): GetDynamicInputsResult => {
-				const promptText = this.buildPrompt(
-					this.extractedText,
-					this.exampleNoteContent
-				);
+			async () => {
+				const isHybridMode = this.processingModeSelect.value === "hybrid";
+				const pageCount = this.getEstimatedPageCount();
 				const textContentTokens = countTextTokens(this.extractedText);
+				const guidance = this.guidanceInput?.getValue() || "";
+		
+				let mainPromptText: string;
+				let mainImageCount: number;
+				const mainDetails = {
+					textContentTokens,
+					isHybrid: isHybridMode,
+					pageCount: isHybridMode ? pageCount : undefined,
+				};
+		
+				if (isHybridMode) {
+					// Estimate for hybrid processing
+					mainPromptText = this.buildHybridPrompt(
+						1,
+						"Sample text for estimation",
+						guidance
+					);
+					mainImageCount = pageCount;
+					
+					// If cleanup is enabled, add estimated tokens for the cleanup pass
+					if (this.cleanupToggleComponent?.getValue()) {
+						// Estimate the output size from hybrid processing
+						const estimatedHybridOutput =
+							pageCount * 1000; // rough estimate of tokens per page
+						
+						// Build a sample cleanup prompt for cost estimation
+						const sampleCleanupPrompt = this.buildReconstructionPrompt(
+							"X".repeat(estimatedHybridOutput), // Dummy markdown content
+							this.extractedText // Use actual PDF text
+						);
+						
+						// Add cleanup prompt tokens to the total
+						mainPromptText += "\n\n" + sampleCleanupPrompt;
+					}
+				} else {
+					// Text-only mode
+					mainPromptText = this.buildPrompt(
+						this.extractedText,
+						this.exampleNoteContent,
+						guidance
+					);
+					mainImageCount = 0;
+					
+					// If cleanup is enabled for text mode
+					if (this.cleanupToggleComponent?.getValue()) {
+						const estimatedTextOutput = textContentTokens; // Assume similar size output
+						const sampleCleanupPrompt = this.buildCleanupPrompt(
+							"X".repeat(estimatedTextOutput)
+						);
+						mainPromptText += "\n\n" + sampleCleanupPrompt;
+					}
+				}
+		
 				return {
-					promptText,
-					imageCount: 0,
+					promptText: mainPromptText,
+					imageCount: mainImageCount,
 					action: "pdf_to_note",
-					details: { textContentTokens },
+					details: mainDetails,
 				};
 			}
 		);
@@ -4526,6 +5041,116 @@ class PdfToNoteModal extends Modal {
 			);
 	}
 
+	private setupProcessingModeControls(): void {
+		const modeSection = this.contentEl.createDiv();
+		modeSection.createEl("h4", { text: "Processing Mode" });
+
+		new Setting(modeSection)
+			.setName("Conversion Mode")
+			.setDesc(
+				"Choose between text-only extraction or hybrid mode with images"
+			)
+			.addDropdown((dropdown) => {
+				this.processingModeSelect = dropdown.selectEl;
+				dropdown
+					.addOption("text", "Text Only (Fast, Lower Cost)")
+					.addOption(
+						"hybrid",
+						"Hybrid (Text + Images, Better for Formulas)"
+					)
+					.setValue("text")
+					.onChange(() => {
+						this.toggleHybridControls();
+						this.costUi?.update();
+					});
+			});
+
+		const hybridControls = modeSection.createDiv({
+			cls: "gn-hybrid-controls",
+			attr: {
+				style: "display: none; margin-top: 10px; padding: 10px; border: 1px solid var(--background-modifier-border); border-radius: 5px;",
+			},
+		});
+
+		hybridControls.createEl("h5", { text: "Hybrid Mode Settings" });
+
+		new Setting(hybridControls)
+			.setName("Page Range")
+			.setDesc(
+				"Specify page range to process (leave empty for all pages)"
+			)
+			.addText((text) => {
+				this.pageRangeFromInput = text;
+				text.setPlaceholder("From (e.g., 1)");
+				text.inputEl.style.width = "80px";
+				text.onChange(() => this.costUi?.update());
+			})
+			.addText((text) => {
+				this.pageRangeToInput = text;
+				text.setPlaceholder("To (e.g., 10)");
+				text.inputEl.style.width = "80px";
+				text.onChange(() => this.costUi?.update());
+			});
+
+		new Setting(hybridControls)
+			.setName("Image Quality")
+			.setDesc(
+				"DPI for page rendering (higher = better quality, larger files)"
+			)
+			.addText((text) => {
+				this.dpiInput = text;
+				text.setValue("200");
+				text.setPlaceholder("200");
+				text.inputEl.style.width = "80px";
+			});
+
+		new Setting(hybridControls)
+			.setName("Max Image Width")
+			.setDesc(
+				"Maximum width in pixels (keeps images compact while maintaining detail)"
+			)
+			.addText((text) => {
+				this.maxWidthInput = text;
+				text.setValue("1400");
+				text.setPlaceholder("1400");
+				text.inputEl.style.width = "100px";
+			});
+
+		new Setting(hybridControls)
+			.setName("Include Text Context")
+			.setDesc(
+				"Include PDF text extraction alongside images for better AI processing"
+			)
+			.addToggle((toggle) => {
+				this.includeTextToggle = toggle;
+				toggle.setValue(true);
+			});
+
+		this.hybridControls = hybridControls;
+	}
+
+	private hybridControls!: HTMLElement;
+
+	private toggleHybridControls(): void {
+		const isHybrid = this.processingModeSelect.value === "hybrid";
+		this.hybridControls.style.display = isHybrid ? "block" : "none";
+	}
+
+	private getEstimatedPageCount(): number {
+		if (!this.selectedFile) return 1;
+
+		const fromPage = parseInt(this.pageRangeFromInput?.getValue() || "1");
+		const toPage = parseInt(this.pageRangeToInput?.getValue() || "");
+
+		if (toPage && fromPage) {
+			return Math.max(1, toPage - fromPage + 1);
+		}
+
+		// Rough estimate based on file size (very approximate)
+		const mbSize = this.selectedFile.size / (1024 * 1024);
+		return Math.max(1, Math.round(mbSize * 10)); // ~10 pages per MB estimate
+	}
+
 	private async handleFileSelection(event: Event): Promise<void> {
 		const target = event.target as HTMLInputElement;
 		const file = target.files?.[0];
@@ -4535,14 +5160,33 @@ class PdfToNoteModal extends Modal {
 		this.pdfViewer.setText("Processing PDF...");
 
 		try {
-			const pdfjsLib = await this.loadPdfJs();
+			// Always try text extraction first for preview
+			await this.extractTextFromPdf(file);
 
+			if (!this.chapterNameInput.getValue()) {
+				const suggestedName = file.name.replace(/\.pdf$/i, "");
+				this.chapterNameInput.setValue(suggestedName);
+			}
+
+			await this.costUi.update();
+		} catch (error) {
+			const errorMessage =
+				error instanceof Error
+					? error.message
+					: "Unknown error occurred";
+			this.pdfViewer.setText(`Error processing PDF: ${errorMessage}`);
+			console.error("PDF processing error:", error);
+		}
+	}
+
+	private async extractTextFromPdf(file: File): Promise<void> {
+		try {
+			const pdfjsLib = await this.loadPdfJs();
 			const arrayBuffer = await file.arrayBuffer();
 			const typedArray = new Uint8Array(arrayBuffer);
-
 			const pdf = await pdfjsLib.getDocument(typedArray).promise;
-			let fullText = "";
 
+			let fullText = "";
 			for (let i = 1; i <= pdf.numPages; i++) {
 				const page = await pdf.getPage(i);
 				const textContent = await page.getTextContent();
@@ -4565,20 +5209,8 @@ class PdfToNoteModal extends Modal {
 				},
 			});
 			textPreview.setText(fullText.substring(0, 500) + "...");
-
-			if (!this.chapterNameInput.getValue()) {
-				const suggestedName = file.name.replace(/\.pdf$/i, "");
-				this.chapterNameInput.setValue(suggestedName);
-			}
-
-			await this.costUi.update();
 		} catch (error) {
-			const errorMessage =
-				error instanceof Error
-					? error.message
-					: "Unknown error occurred";
-			this.pdfViewer.setText(`Error processing PDF: ${errorMessage}`);
-			console.error("PDF processing error:", error);
+			throw new Error(`Failed to extract text: ${error}`);
 		}
 	}
 
@@ -4606,7 +5238,6 @@ class PdfToNoteModal extends Modal {
 				};
 				script.onerror = () =>
 					reject(new Error("Failed to load pdf.js from CDN"));
-
 				setTimeout(
 					() => reject(new Error("pdf.js loading timeout")),
 					10000
@@ -4669,6 +5300,449 @@ class PdfToNoteModal extends Modal {
 		return lines.join("\n");
 	}
 
+	private async renderPdfPagesToImages(): Promise<void> {
+		const notice = new Notice("🔄 Rendering PDF pages to images...", 0);
+
+		try {
+			const pdfjsLib = await this.loadPdfJs();
+			const arrayBuffer = await this.selectedFile!.arrayBuffer();
+			const typedArray = new Uint8Array(arrayBuffer);
+			const pdf = await pdfjsLib.getDocument(typedArray).promise;
+
+			const fromPage = parseInt(
+				this.pageRangeFromInput.getValue() || "1"
+			);
+			const toPage = parseInt(
+				this.pageRangeToInput.getValue() || pdf.numPages.toString()
+			);
+			const dpi = parseInt(this.dpiInput.getValue() || "200");
+			const maxWidth = parseInt(this.maxWidthInput.getValue() || "1400");
+
+			this.renderedPages = [];
+
+			for (
+				let pageNum = fromPage;
+				pageNum <= Math.min(toPage, pdf.numPages);
+				pageNum++
+			) {
+				notice.setMessage(
+					`🔄 Rendering page ${pageNum - fromPage + 1}/${
+						toPage - fromPage + 1
+					}...`
+				);
+
+				const page = await pdf.getPage(pageNum);
+				const viewport = page.getViewport({ scale: dpi / 72 });
+
+				const canvas = document.createElement("canvas");
+				const context = canvas.getContext("2d")!;
+				let scale = 1;
+
+				if (viewport.width > maxWidth) {
+					scale = maxWidth / viewport.width;
+				}
+
+				canvas.width = viewport.width * scale;
+				canvas.height = viewport.height * scale;
+
+				await page.render({
+					canvasContext: context,
+					viewport: page.getViewport({ scale: (dpi / 72) * scale }),
+				}).promise;
+
+				const imageData = canvas.toDataURL("image/png");
+
+				// Extract text content for this page using PDF.js
+				let textContent = "";
+				if (this.includeTextToggle?.getValue()) {
+					const pageTextContent = await page.getTextContent();
+					textContent = this.extractParagraphsFromTextContent(
+						pageTextContent.items
+					);
+				}
+
+				this.renderedPages.push({
+					pageNum,
+					imageData,
+					textContent: textContent || undefined,
+				});
+			}
+
+			notice.hide();
+		} catch (error) {
+			notice.hide();
+			throw error;
+		}
+	}
+
+	private buildHybridPrompt(
+		pageNum: number,
+		textContent?: string,
+		customGuidance?: string
+	): string {
+		let systemPrompt = `You are an expert document processor converting a PDF page image (with optional PDF text) into clean, well-structured Markdown. Follow these rules strictly:
+
+1. **Headers**: Convert section titles into markdown headers ("# Header", "## Subheader", etc.).
+2. **Paragraphs**: Merge consecutive lines into complete paragraphs, removing unnecessary line breaks.
+3. **Footnotes**: If footnote citations and text appear on the same page, inline them in parentheses.
+4. **Figures & Tables**: Use ![IMAGE_PLACEHOLDER] for figures or recreate tables in markdown. Include captions below.
+5. **Mathematics**: Format all mathematical notation using LaTeX delimiters ("$" for inline, "$$" for block).
+6. **Image is authoritative**: If PDF text conflicts with the image, trust the image. Mark illegible content as [[ILLEGIBLE]].
+7. **Output**: ONLY the final Markdown text. No code fences or commentary.`;
+
+		if (this.exampleNoteContent.trim()) {
+			systemPrompt += `\n\nUse this structural template:\n${this.exampleNoteContent}`;
+		}
+
+		let userPrompt = `Convert this PDF page ${pageNum} to markdown.`;
+
+		if (customGuidance) {
+			userPrompt += `\n\n**User's Custom Instructions:**\n${customGuidance}`;
+		}
+
+		if (textContent && textContent.trim()) {
+			userPrompt += `\n\nPDF TEXT CONTENT (may have layout issues; use IMAGE as ground truth):\n${textContent}`;
+		}
+
+		return systemPrompt + "\n\n" + userPrompt;
+	}
+
+	private buildReconstructionPrompt(
+		aiGeneratedMarkdown: string,
+		originalPdfText: string
+	): string {
+		const systemPrompt = `You are an expert document reconstruction AI. Your task is to clean and merge a markdown document that was converted from a PDF page-by-page, fixing artifacts from that process.
+	
+	You have TWO inputs:
+	1. The AI-generated markdown (converted page-by-page, may have splits and repetitions)
+	2. The original PDF text extraction (continuous but may have layout issues)
+	
+	**Your tasks:**
+	1. **Remove Repetitive Headers/Footers**: Delete page-level artifacts like repeated chapter titles or page numbers
+	2. **Merge Split Paragraphs**: Identify paragraphs that were artificially split across pages and merge them
+	3. **Preserve Figures/Tables**: Keep all ![IMAGE_PLACEHOLDER] markers and table structures intact
+	4. **Fix Split Sentences**: Sentences ending abruptly at one point and continuing later should be joined
+	5. **Maintain Structure**: Preserve all legitimate headers, lists, and formatting
+	
+	**How to identify split paragraphs:**
+	- A paragraph ending mid-sentence (no period, question mark, or exclamation)
+	- The next section starting with a lowercase letter or continuing the thought
+	- Mathematical equations or code blocks split unnaturally
+	- Lists that continue across boundaries
+	
+	**Important**: The original PDF text is for reference only - the AI-generated markdown is your primary source. Use the PDF text to understand where natural paragraph boundaries should be.`;
+	
+		const userPrompt = `Please reconstruct this document:
+	
+	**ORIGINAL PDF TEXT (for reference - may have layout issues):**
+	\`\`\`
+	${originalPdfText}
+	\`\`\`
+	
+	**AI-GENERATED MARKDOWN (your primary source):**
+	\`\`\`markdown
+	${aiGeneratedMarkdown}
+	\`\`\`
+	
+	Return ONLY the cleaned, merged markdown text.`;
+	
+		return systemPrompt + "\n\n" + userPrompt;
+	}
+
+	private buildPrompt(
+		textContent: string,
+		exampleContent: string,
+		customGuidance?: string
+	): string {
+		let systemPrompt = `You are an expert document processor. Your task is to convert raw text extracted from a PDF into clean, well-structured markdown suitable for a note-taking app like Obsidian. Follow these rules strictly:
+
+1.  **Headers**: Convert section titles (e.g., "1.1 Trading protocol") into markdown headers ("# 1.1 Trading protocol", "## 1.1.1 Order-driven markets", etc.).
+2.  **Paragraphs**: Merge consecutive lines of text into complete paragraphs, removing unnecessary line breaks.
+3.  **Footnotes**: Find footnote citations (e.g., a superscript number) and inject the corresponding footnote text directly into the main text in parentheses. For example, "...a reference^1" with footnote "1 This is the info" becomes "...a reference (This is the info)".
+4.  **Figures & Tables**: For any figures or tables, use a placeholder like "![IMAGE_PLACEHOLDER]" or recreate the table in markdown. Any accompanying text, source, or caption should be placed immediately below the placeholder or markdown table, separated by a single newline.
+5.  **Mathematics**: Format all mathematical and scientific notations using LaTeX delimiters ("$" for inline, "$$" for block).
+6.  **Output**: The response should ONLY contain the final markdown text. Do not include any conversational phrases, introductions, or apologies.`;
+
+		let userPrompt = `Please convert the following text to markdown based on the system instructions.`;
+
+		if (customGuidance) {
+			userPrompt += `\n\n**User's Custom Instructions:**\n${customGuidance}`;
+		}
+
+		if (exampleContent.trim()) {
+			userPrompt += `
+
+[EXAMPLE_NOTE_START]
+The following is an example of the desired structure and formatting style. Use this as a template for organizing and formatting your output. The "..." represents abbreviated content - you should expand these sections based on the PDF content while maintaining the same structural pattern and formatting style.
+
+${exampleContent}
+[EXAMPLE_NOTE_END]`;
+		}
+
+		userPrompt += `
+
+[START_TEXT_CONTENT]
+${textContent}
+[END_TEXT_CONTENT]`;
+
+		return systemPrompt + "\n\n" + userPrompt;
+	}
+
+	private buildCleanupPrompt(messyMarkdown: string): string {
+		const systemPrompt = `You are a text-cleaning AI expert. Your task is to refine a markdown document converted from a PDF. The document contains repetitive headers and footers from the original PDF layout. Your goal is to remove these artifacts while preserving the core content and structure.`;
+
+		const userPrompt = `Please clean the following markdown text.
+
+**Instructions:**
+1.  **Identify Repetitive Text:** Scan the document for phrases, titles, or section numbers that appear repeatedly. For example, a chapter title like '# 2. Overview of Supervised Learning' or a section title like '## 2.3 Least Squares and Nearest Neighbors' might appear multiple times.
+2.  **Remove Redundancy:** Delete these repetitive headers and footers. The main section heading should appear only once where it is first introduced.
+3.  **Merge Content:** Ensure that paragraphs broken apart by these removed headers are seamlessly joined.
+4.  **Preserve Structure:** Do not alter the legitimate markdown structure (headings, lists, LaTeX equations, etc.). Only remove the redundant page-level artifacts.
+5.  **Output:** Return ONLY the cleaned, final markdown text. Do not add any commentary or explanation.
+
+**Markdown to Clean:**
+\`\`\`markdown
+${messyMarkdown}
+\`\`\`
+`;
+		return systemPrompt + "\n\n" + userPrompt;
+	}
+
+	private async handleConvert(): Promise<void> {
+		if (!this.selectedFile) {
+			new Notice("Please select a PDF file first.");
+			return;
+		}
+
+		const chapterName = this.chapterNameInput.getValue().trim();
+		if (!chapterName) {
+			new Notice("Please enter a chapter name.");
+			return;
+		}
+
+		const isHybridMode = this.processingModeSelect.value === "hybrid";
+
+		let folderPath = this.folderSelect.value;
+		if (folderPath === "__new__") {
+			const newFolderName = this.newFolderInput.getValue().trim();
+			if (!newFolderName) {
+				new Notice("Please enter a new folder name.");
+				return;
+			}
+			folderPath = newFolderName;
+			if (!this.app.vault.getAbstractFileByPath(folderPath)) {
+				await this.app.vault.createFolder(folderPath);
+			}
+		}
+
+		const finalCost = await this.costUi.update();
+		if (
+			!confirm(
+				`This will convert the PDF to a note using ${
+					isHybridMode ? "hybrid (text + images)" : "text-only"
+				} mode.\n${finalCost}\n\nProceed?`
+			)
+		) {
+			return;
+		}
+
+		const notice = new Notice("🤖 Converting PDF to note...", 0);
+
+		try {
+			let response: string;
+			let usage: OpenAI.CompletionUsage | undefined;
+	
+			if (isHybridMode) {
+				// Process with hybrid mode FIRST
+				const result = await this.processHybridMode(notice);
+				response = result.response;
+				usage = result.usage;
+			} else {
+				// Process with text-only mode
+				const promptText = this.buildPrompt(
+					this.extractedText,
+					this.exampleNoteContent,
+					this.guidanceInput?.getValue()
+				);
+				const result = await this.plugin.sendToLlm(promptText);
+				response = result.content;
+				usage = result.usage;
+			}
+	
+			if (!response) {
+				throw new Error("LLM returned an empty response.");
+			}
+	
+			let finalResponse = response;
+			let cleanupUsage: OpenAI.CompletionUsage | undefined;
+	
+			// NOW we can do cleanup/reconstruction with actual content
+			if (this.cleanupToggleComponent.getValue()) {
+				notice.setMessage("🤖 Reconstructing document structure...");
+	
+				let cleanupPrompt: string;
+				if (isHybridMode) {
+					// Use reconstruction for hybrid mode
+					cleanupPrompt = this.buildReconstructionPrompt(
+						response, // Now we have actual content!
+						this.extractedText
+					);
+				} else {
+					// Use original cleanup for text mode
+					cleanupPrompt = this.buildCleanupPrompt(response);
+				}
+	
+				const cleanupResult = await this.plugin.sendToLlm(
+					cleanupPrompt,
+					undefined,
+					{
+						model: this.plugin.settings.openaiModel,
+					}
+				);
+	
+				if (cleanupResult.content) {
+					finalResponse = cleanupResult.content;
+					cleanupUsage = cleanupResult.usage;
+				} else {
+					this.plugin.logger(
+						LogLevel.NORMAL,
+						"Cleanup pass returned an empty response. Using original content."
+					);
+				}
+			}
+
+			const fileName = chapterName.endsWith(".md")
+				? chapterName
+				: `${chapterName}.md`;
+			const notePath = folderPath
+				? `${folderPath}/${fileName}`
+				: fileName;
+
+			await this.app.vault.create(notePath, finalResponse);
+
+			if (usage) {
+				let totalInputTokens = usage.prompt_tokens;
+				let totalOutputTokens = usage.completion_tokens;
+
+				if (cleanupUsage) {
+					totalInputTokens += cleanupUsage.prompt_tokens;
+					totalOutputTokens += cleanupUsage.completion_tokens;
+				}
+
+				await logLlmCall(this.plugin, {
+					action: "pdf_to_note",
+					model: isHybridMode
+						? this.plugin.settings.openaiMultimodalModel
+						: this.plugin.settings.openaiModel,
+					inputTokens: totalInputTokens,
+					outputTokens: totalOutputTokens,
+					textContentTokens: countTextTokens(this.extractedText),
+				});
+			}
+
+			notice.setMessage(`✅ Successfully created note: ${notePath}`);
+			setTimeout(() => notice.hide(), 3000);
+
+			const newFile = this.app.vault.getAbstractFileByPath(notePath);
+			if (newFile instanceof TFile) {
+				const leaf = this.app.workspace.getLeaf(false);
+				await leaf.openFile(newFile);
+			}
+
+			this.close();
+		} catch (error) {
+			notice.hide();
+			const errorMessage =
+				error instanceof Error
+					? error.message
+					: "Unknown error occurred";
+			new Notice(`Failed to convert PDF: ${errorMessage}`);
+			this.plugin.logger(LogLevel.NORMAL, "PDF conversion error:", error);
+		}
+	}
+
+	private async processHybridMode(
+		notice: Notice
+	): Promise<{ response: string; usage?: OpenAI.CompletionUsage }> {
+		// Render pages first
+		await this.renderPdfPagesToImages();
+	
+		if (this.renderedPages.length === 0) {
+			throw new Error("No pages were rendered successfully");
+		}
+	
+		let combinedResponse = "";
+		let totalUsage: OpenAI.CompletionUsage = {
+			prompt_tokens: 0,
+			completion_tokens: 0,
+			total_tokens: 0,
+		};
+	
+		// Collect all PDF text for potential reconstruction
+		let fullPdfText = "";
+		for (const pageData of this.renderedPages) {
+			if (pageData.textContent) {
+				fullPdfText += `\n--- PAGE ${pageData.pageNum} ---\n${pageData.textContent}\n`;
+			}
+		}
+	
+		// Process each page
+		for (let i = 0; i < this.renderedPages.length; i++) {
+			const pageData = this.renderedPages[i];
+			notice.setMessage(
+				`🤖 Processing page ${i + 1}/${this.renderedPages.length} with AI...`
+			);
+	
+			const promptText = this.buildHybridPrompt(
+				pageData.pageNum,
+				pageData.textContent,
+				this.guidanceInput?.getValue()
+			);
+	
+			const imageUrl = pageData.imageData;
+	
+			const result = await this.plugin.sendToLlm(promptText, imageUrl, {
+				maxTokens: this.plugin.settings.pdfMaxTokensPerPage || 4000,
+			});
+	
+			if (!result.content) {
+				this.plugin.logger(
+					LogLevel.NORMAL,
+					`Warning: Empty response for page ${pageData.pageNum}`
+				);
+				continue;
+			}
+	
+			let pageContent = result.content;
+			// Remove markdown code fences if present
+			if (pageContent.match(/^\s*```(?:markdown)?\s*([\s\S]*?)\s*```\s*$/)) {
+				pageContent = pageContent.replace(
+					/^\s*```(?:markdown)?\s*([\s\S]*?)\s*```\s*$/,
+					"$1"
+				);
+			}
+	
+			combinedResponse += `\n\n${pageContent.trim()}\n\n`;
+	
+			if (result.usage) {
+				totalUsage.prompt_tokens += result.usage.prompt_tokens;
+				totalUsage.completion_tokens += result.usage.completion_tokens;
+				totalUsage.total_tokens += result.usage.total_tokens;
+			}
+		}
+	
+		// Clean up spacing before returning
+		combinedResponse = combinedResponse
+			.replace(/\n{3,}/g, "\n\n")
+			.replace(/[ \t]+/g, " ")
+			.trim();
+	
+		return {
+			response: combinedResponse,
+			usage: totalUsage,
+		};
+	}
+
 	private async populateFolderOptions(): Promise<void> {
 		const folders = this.app.vault
 			.getAllLoadedFiles()
@@ -4676,22 +5750,46 @@ class PdfToNoteModal extends Modal {
 			.map((folder) => folder.name)
 			.sort();
 
-		const rootOption = this.folderSelect.createEl("option", {
+		this.folderSelect.createEl("option", {
 			value: "",
 			text: "📁 Vault Root",
 		});
-
 		folders.forEach((folderName) => {
 			this.folderSelect.createEl("option", {
 				value: folderName,
 				text: `📁 ${folderName}`,
 			});
 		});
-
 		this.folderSelect.createEl("option", {
 			value: "__new__",
 			text: "➕ Create New Folder",
 		});
+	}
+
+	private setupExampleNoteSection(): void {
+		const exampleSection = this.contentEl.createDiv();
+		exampleSection.createEl("h4", { text: "Example Note (Optional)" });
+		exampleSection.createEl("p", {
+			text: "Select an existing note to use as a structural template for the conversion.",
+			cls: "setting-item-description",
+		});
+
+		const exampleButtonContainer = exampleSection.createDiv({
+			cls: "gn-edit-row",
+		});
+		const exampleButton = exampleButtonContainer.createEl("button", {
+			text: "Choose Example Note",
+		});
+
+		const exampleDisplay = exampleSection.createDiv({
+			attr: {
+				style: "margin-top: 10px; font-style: italic; color: var(--text-muted);",
+			},
+		});
+		exampleDisplay.setText("No example note selected");
+
+		exampleButton.onclick = () =>
+			this.openExampleNoteSelector(exampleDisplay);
 	}
 
 	private openExampleNoteSelector(displayElement: HTMLElement): void {
@@ -4767,135 +5865,14 @@ class PdfToNoteModal extends Modal {
 		return abbreviatedParagraphs.filter((p) => p).join("\n\n");
 	}
 
-	private buildPrompt(textContent: string, exampleContent: string): string {
-		let systemPrompt = `You are an expert document processor. Your task is to convert raw text extracted from a PDF into clean, well-structured markdown suitable for a note-taking app like Obsidian. Follow these rules strictly:
-
-1.  **Headers**: Convert section titles (e.g., "1.1 Trading protocol") into markdown headers ("# 1.1 Trading protocol", "## 1.1.1 Order-driven markets", etc.).
-2.  **Paragraphs**: Merge consecutive lines of text into complete paragraphs, removing unnecessary line breaks.
-3.  **Footnotes**: Find footnote citations (e.g., a superscript number) and inject the corresponding footnote text directly into the main text in parentheses. For example, "...a reference^1" with footnote "1 This is the info" becomes "...a reference (This is the info)".
-4.  **Figures & Tables**: For any figures or tables, use a placeholder like "![IMAGE_PLACEHOLDER]" or recreate the table in markdown. Any accompanying text, source, or caption should be placed immediately below the placeholder or markdown table, separated by a single newline.
-5.  **Mathematics**: Format all mathematical and scientific notations using LaTeX delimiters ("$" for inline, "$" for block).
-6.  **Output**: The response should ONLY contain the final markdown text. Do not include any conversational phrases, introductions, or apologies.`;
-
-		let userPrompt = `Please convert the following text to markdown based on the system instructions.`;
-
-		if (exampleContent.trim()) {
-			userPrompt += `
-
-[EXAMPLE_NOTE_START]
-The following is an example of the desired structure and formatting style. Use this as a template for organizing and formatting your output. The "..." represents abbreviated content - you should expand these sections based on the PDF content while maintaining the same structural pattern and formatting style.
-
-${exampleContent}
-[EXAMPLE_NOTE_END]`;
-		}
-
-		userPrompt += `
-
-[START_TEXT_CONTENT]
-${textContent}
-[END_TEXT_CONTENT]`;
-
-		return systemPrompt + "\n\n" + userPrompt;
-	}
-
-	private async handleConvert(): Promise<void> {
-		if (!this.selectedFile || !this.extractedText) {
-			new Notice("Please select a PDF file first.");
-			return;
-		}
-
-		const chapterName = this.chapterNameInput.getValue().trim();
-		if (!chapterName) {
-			new Notice("Please enter a chapter name.");
-			return;
-		}
-
-		let folderPath = this.folderSelect.value;
-		if (folderPath === "__new__") {
-			const newFolderName = this.newFolderInput.getValue().trim();
-			if (!newFolderName) {
-				new Notice("Please enter a new folder name.");
-				return;
-			}
-			folderPath = newFolderName;
-
-			if (!this.app.vault.getAbstractFileByPath(folderPath)) {
-				await this.app.vault.createFolder(folderPath);
-			}
-		}
-
-		const finalCost = await this.costUi.update();
-		if (
-			!confirm(
-				`This will convert the PDF to a note.\n${finalCost}\n\nProceed?`
-			)
-		) {
-			return;
-		}
-
-		const notice = new Notice("🤖 Converting PDF to note...", 0);
-
-		try {
-			const promptText = this.buildPrompt(
-				this.extractedText,
-				this.exampleNoteContent
-			);
-
-			const textContentTokens = countTextTokens(this.extractedText);
-
-			const { content: response, usage } = await this.plugin.sendToLlm(
-				promptText
-			);
-
-			if (!response) {
-				throw new Error("LLM returned an empty response.");
-			}
-
-			const fileName = chapterName.endsWith(".md")
-				? chapterName
-				: `${chapterName}.md`;
-			const notePath = folderPath
-				? `${folderPath}/${fileName}`
-				: fileName;
-
-			await this.app.vault.create(notePath, response);
-
-			if (usage) {
-				await logLlmCall(this.plugin, {
-					action: "pdf_to_note",
-					model: this.plugin.settings.openaiModel,
-					inputTokens: usage.prompt_tokens,
-					outputTokens: usage.completion_tokens,
-					textContentTokens,
-				});
-			}
-
-			notice.setMessage(`✅ Successfully created note: ${notePath}`);
-			setTimeout(() => notice.hide(), 3000);
-
-			const newFile = this.app.vault.getAbstractFileByPath(notePath);
-			if (newFile instanceof TFile) {
-				const leaf = this.app.workspace.getLeaf(false);
-				await leaf.openFile(newFile);
-			}
-
-			this.close();
-		} catch (error) {
-			notice.hide();
-			const errorMessage =
-				error instanceof Error
-					? error.message
-					: "Unknown error occurred";
-			new Notice(`Failed to convert PDF: ${errorMessage}`);
-			this.plugin.logger(LogLevel.NORMAL, "PDF conversion error:", error);
-		}
-	}
-
 	onClose() {
 		this.contentEl.empty();
 	}
 }
 
+/**
+ * A suggester modal for selecting an example note from the vault.
+ */
 class ExampleNoteSuggester extends Modal {
 	private inputEl!: HTMLInputElement;
 	private suggestionsEl!: HTMLElement;
@@ -5043,17 +6020,16 @@ class ExampleNoteSuggester extends Modal {
 	}
 }
 
+/**
+ * A generic confirmation modal that displays an estimated cost before proceeding.
+ */
 class ActionConfirmationModal extends Modal {
 	private costUi!: { update: () => Promise<string> };
 
 	constructor(
 		private plugin: GatedNotesPlugin,
 		private title: string,
-		private getDynamicInputs: () => {
-			promptText: string;
-			imageCount: number;
-			action: LlmLogEntry["action"];
-		},
+		private getDynamicInputs: () => GetDynamicInputsResult,
 		private onConfirm: () => void
 	) {
 		super(plugin.app);
@@ -5090,6 +6066,9 @@ class ActionConfirmationModal extends Modal {
 	}
 }
 
+/**
+ * The primary modal for editing a flashcard's content and properties.
+ */
 class EditModal extends Modal {
 	constructor(
 		private plugin: GatedNotesPlugin,
@@ -5360,6 +6339,64 @@ class EditModal extends Modal {
 			const buttonEl = evt.target as HTMLButtonElement;
 
 			const getDynamicInputsForCost = () => {
+				const cardJson = JSON.stringify({
+					front: this.card.front,
+					back: this.card.back,
+				});
+
+				// Different prompts based on quantity selection
+				const isMultiple = quantity === "many";
+				const cardWord = isMultiple ? "cards" : "card";
+				const verbForm = isMultiple ? "are" : "is";
+
+				const basePrompt = `You are an AI assistant that creates new, insightful flashcard${
+					isMultiple ? "s" : ""
+				} by "refocusing" an existing one.
+			
+			**Core Rule:** Your new ${cardWord} MUST be created by inverting the information **explicitly present** in the original card's "front" and "back" fields. The "Source Text" ${verbForm} provided only for context and should NOT be used to introduce new facts into the new ${cardWord}.
+			
+			**Thought Process:**
+			**Formatting Rule:** Preserve all Markdown formatting, especially LaTeX math expressions (e.g., \`$ ... $\` and \`$$ ... $$\`), in the "front" and "back" fields.
+
+			1.  **Deconstruct the Original Card:** Identify the key subject in the "back" and the key detail in the "front".
+			2.  **Invert & Refocus:** Create ${
+					isMultiple ? "new cards" : "a new card"
+				} where the original detail${isMultiple ? "s" : ""} become${
+					isMultiple ? "" : "s"
+				} the subject of the question${
+					isMultiple ? "s" : ""
+				}, and the original subject becomes the answer${
+					isMultiple ? "s" : ""
+				}.
+			
+			---
+			**Example 1:**
+			* **Original Card:**
+				* "front": "What was the outcome of the War of Fakery in 1653?"
+				* "back": "Country A decisively defeated Country B."
+			* **Refocused Card (testing the date, which is in the front):**
+				* "front": "In what year did the War of Fakery take place?"
+				* "back": "1653"
+			
+			**Example 2:**
+			* **Original Card:**
+				* "front": "Who is said to have lived circa 365–circa 270 BC?"
+				* "back": "Pyrrho"
+			* **Refocused Card (testing the date, which is in the front):**
+				* "front": "What were the approximate years of Pyrrho's life?"
+				* "back": "circa 365–circa 270 BC"
+			---
+			
+			**Your Task:**
+			Now, apply this process to the following card.
+			
+			**Original Card:**
+			${cardJson}
+			
+			**Source Text for Context (use only to understand the card, not to add new facts):**
+			${JSON.stringify(this.card.tag)}`;
+
+				// Add duplicate prevention context after the main instructions
 				let contextPrompt = "";
 				if (preventDuplicates) {
 					const otherCards = Object.values(this.graph).filter(
@@ -5372,66 +6409,26 @@ class EditModal extends Modal {
 							front: c.front,
 							back: c.back,
 						}));
-						contextPrompt = `To avoid duplicates, do not create cards that cover the same information as the following existing cards:\nExisting Cards:\n${JSON.stringify(
-							simplified
-						)}\n\n`;
+						contextPrompt = `\n\n**Important:** To avoid duplicates, do not create ${cardWord} that cover the same information as the following existing cards:
+			Existing Cards:
+			${JSON.stringify(simplified)}`;
 					}
 				}
 
-				const cardJson = JSON.stringify({
-					front: this.card.front,
-					back: this.card.back,
-				});
+				// Different instructions based on quantity
+				const quantityInstruction = isMultiple
+					? `Create multiple refocused cards by identifying different aspects or details from the original card that can be inverted. Look for dates, names, locations, concepts, or other discrete elements that could each become the focus of a separate question. Return ONLY valid JSON of this shape: [{"front":"...","back":"..."}]`
+					: `Return ONLY valid JSON of this shape: [{"front":"...","back":"..."}]`;
 
-				const basePrompt = `You are an AI assistant that creates a new, insightful flashcard by "refocusing" an existing one.
-	
-	**Core Rule:** Your new card MUST be created by inverting the information **explicitly present** in the original card's "front" and "back" fields. The "Source Text" is provided only for context and should NOT be used to introduce new facts into the new card.
-	
-	**Thought Process:**
-	1.  **Deconstruct the Original Card:** Identify the key subject in the "back" and the key detail in the "front".
-	2.  **Invert & Refocus:** Create a new card where the original detail becomes the subject of the question, and the original subject becomes the answer.
-	
-	---
-	**Example 1:**
-	* **Original Card:**
-		* "front": "What was the outcome of the War of Fakery in 1653?"
-		* "back": "Country A decisively defeated Country B."
-	* **Refocused Card (testing the date, which is in the front):**
-		* "front": "In what year did the War of Fakery take place?"
-		* "back": "1653"
-	
-	**Example 2:**
-	* **Original Card:**
-		* "front": "Who is said to have lived circa 365–circa 270 BC?"
-		* "back": "Pyrrho"
-	* **Refocused Card (testing the date, which is in the front):**
-		* "front": "What were the approximate years of Pyrrho's life?"
-		* "back": "circa 365–circa 270 BC"
-	---
-	
-	**Your Task:**
-	Now, apply this process to the following card.`;
-
-				const quantityInstruction =
-					quantity === "one"
-						? `Return ONLY valid JSON of this shape: [{"front":"...","back":"..."}]`
-						: `Create one or more cards and return ONLY valid JSON of this shape: [{"front":"...","back":"..."}]`;
-
-				const sourceText = JSON.stringify(this.card.tag);
-				const promptText = `${contextPrompt}${basePrompt}
-	
-	**Original Card:**
-	${cardJson}
-	
-	**Source Text for Context (use only to understand the card, not to add new facts):**
-	${sourceText}
-	
-	${quantityInstruction}`;
+				const promptText = `${basePrompt}${contextPrompt}
+			
+			${quantityInstruction}`;
 
 				return {
 					promptText,
 					imageCount: 0,
 					action: "refocus" as const,
+					details: { isVariableOutput: isMultiple },
 				};
 			};
 
@@ -5501,6 +6498,37 @@ class EditModal extends Modal {
 			const buttonEl = evt.target as HTMLButtonElement;
 
 			const getDynamicInputsForCost = () => {
+				const cardJson = JSON.stringify({
+					front: this.card.front,
+					back: this.card.back,
+				});
+
+				const basePrompt = `You are an AI assistant that breaks down complex flashcards into multiple simpler, more atomic flashcards.
+
+**Your Task:**
+Analyze the given card and split it into 2-4 smaller, focused cards. Each new card should test a single, specific concept or fact from the original card.
+
+**Guidelines:**
+1. **Identify Multiple Concepts:** Look for compound ideas, multiple facts, or complex relationships in the original card
+2. **Create Atomic Cards:** Each new card should focus on one clear, testable element
+3. **Maintain Accuracy:** Only use information explicitly present in the original card
+4. **Ensure Completeness:** Together, the new cards should cover the key information from the original
+
+**Formatting Rule:** Preserve all Markdown formatting, especially LaTeX math expressions (e.g., \`$ ... $\` and \`$$ ... $$\`), in the "front" and "back" fields.
+
+**Example:**
+* **Original Complex Card:**
+	* "front": "What were the main causes and effects of World War I?"
+	* "back": "Causes included nationalism and militarism. Effects included millions of deaths and the Treaty of Versailles."
+* **Split into Atomic Cards:**
+	* Card 1: "front": "What were two main causes of World War I?", "back": "Nationalism and militarism."
+	* Card 2: "front": "What was one major effect of World War I in terms of casualties?", "back": "Millions of deaths."
+	* Card 3: "front": "What treaty was created as a result of World War I?", "back": "The Treaty of Versailles."
+
+**Original Card to Split:**
+${cardJson}`;
+
+				// Add duplicate prevention context if needed
 				let contextPrompt = "";
 				if (preventDuplicates) {
 					const otherCards = Object.values(this.graph).filter(
@@ -5513,25 +6541,15 @@ class EditModal extends Modal {
 							front: c.front,
 							back: c.back,
 						}));
-						contextPrompt = `To avoid duplicates, do not create cards that cover the same information as the following existing cards:\nExisting Cards:\n${JSON.stringify(
-							simplified
-						)}\n\n`;
+						contextPrompt = `\n\n**Important:** Avoid creating cards that duplicate the following existing cards:
+Existing Cards:
+${JSON.stringify(simplified)}`;
 					}
 				}
 
-				const cardJson = JSON.stringify({
-					front: this.card.front,
-					back: this.card.back,
-				});
+				const promptText = `${basePrompt}${contextPrompt}
 
-				const promptText = `${contextPrompt}Take the following flashcard and split it into one or more new, simpler, more atomic flashcards. The original card may be too complex or cover multiple ideas.
-	
-	Return ONLY valid JSON of this shape: [{"front":"...","back":"..."}]
-	
-	---
-	**Original Card:**
-	${cardJson}
-	---`;
+Return ONLY valid JSON array of this shape: [{"front":"...","back":"..."}]`;
 
 				return { promptText, imageCount: 0, action: "split" as const };
 			};
@@ -5596,6 +6614,9 @@ class EditModal extends Modal {
 	}
 }
 
+/**
+ * A modal for selecting options before "refocusing" a card with AI.
+ */
 class RefocusOptionsModal extends Modal {
 	constructor(
 		private plugin: GatedNotesPlugin,
@@ -5662,6 +6683,9 @@ class RefocusOptionsModal extends Modal {
 	}
 }
 
+/**
+ * A modal for selecting options before "splitting" a card with AI.
+ */
 class SplitOptionsModal extends Modal {
 	constructor(
 		private plugin: GatedNotesPlugin,
@@ -5706,6 +6730,9 @@ class SplitOptionsModal extends Modal {
 	}
 }
 
+/**
+ * A modal that provides a tree-based browser for all flashcards in the vault.
+ */
 class CardBrowser extends Modal {
 	private showOnlyFlagged = false;
 	private showOnlySuspended = false;
@@ -5983,6 +7010,9 @@ class CardBrowser extends Modal {
 	}
 }
 
+/**
+ * A modal for generating an initial set of flashcards from a finalized note.
+ */
 class GenerateCardsModal extends Modal {
 	private countInput!: TextComponent;
 	private guidanceInput?: TextAreaComponent;
@@ -6092,6 +7122,9 @@ class GenerateCardsModal extends Modal {
 	}
 }
 
+/**
+ * A simple modal to get a count from the user, typically for AI generation tasks.
+ */
 class CountModal extends Modal {
 	private costUi!: { update: () => Promise<string> };
 	private countInput!: TextComponent;
@@ -6173,6 +7206,9 @@ class CountModal extends Modal {
 	}
 }
 
+/**
+ * A modal for generating additional flashcards for a note that already has some.
+ */
 class GenerateAdditionalCardsModal extends Modal {
 	private countInput!: TextComponent;
 	private preventDuplicatesToggle!: ToggleComponent;
@@ -6309,6 +7345,9 @@ class GenerateAdditionalCardsModal extends Modal {
 	}
 }
 
+/**
+ * A modal that displays detailed information and review history for a single card.
+ */
 class CardInfoModal extends Modal {
 	constructor(app: App, private card: Flashcard) {
 		super(app);
@@ -6365,6 +7404,9 @@ class CardInfoModal extends Modal {
 	}
 }
 
+/**
+ * The settings tab for the Gated Notes plugin.
+ */
 class GNSettingsTab extends PluginSettingTab {
 	constructor(app: App, private plugin: GatedNotesPlugin) {
 		super(app, plugin);
@@ -6375,7 +7417,6 @@ class GNSettingsTab extends PluginSettingTab {
 		containerEl.empty();
 		containerEl.createEl("h2", { text: "Gated Notes Settings" });
 
-		new Setting(containerEl).setName("AI Provider").setHeading();
 		new Setting(containerEl)
 			.setName("API Provider")
 			.setDesc("Choose the AI provider for text-based card generation.")
@@ -6485,8 +7526,6 @@ class GNSettingsTab extends PluginSettingTab {
 					})
 			);
 
-		new Setting(containerEl).setName("Card Generation").setHeading();
-
 		new Setting(containerEl)
 			.setName("Analyze images on generate (Experimental)")
 			.setDesc(
@@ -6558,7 +7597,6 @@ class GNSettingsTab extends PluginSettingTab {
 				);
 		}
 
-		new Setting(containerEl).setName("Spaced Repetition").setHeading();
 		this.createNumericArraySetting(
 			containerEl,
 			"Learning steps (minutes)",
@@ -6589,7 +7627,6 @@ class GNSettingsTab extends PluginSettingTab {
 					})
 			);
 
-		new Setting(containerEl).setName("Content Gating").setHeading();
 		new Setting(containerEl)
 			.setName("Enable content gating")
 			.setDesc("If disabled, all finalized content will be visible.")
@@ -6604,7 +7641,6 @@ class GNSettingsTab extends PluginSettingTab {
 					})
 			);
 
-		new Setting(containerEl).setName("Debugging").setHeading();
 		new Setting(containerEl)
 			.setName("Logging level")
 			.setDesc("Sets the verbosity of messages in the developer console.")
@@ -6648,23 +7684,55 @@ class GNSettingsTab extends PluginSettingTab {
 	}
 }
 
+/**
+ * Checks if a flashcard is new and has not been seen in a learning session.
+ * @param card The flashcard to check.
+ * @returns True if the card is considered unseen, false otherwise.
+ */
 const isUnseen = (card: Flashcard): boolean =>
 	card.status === "new" &&
 	(card.learning_step_index == null || card.learning_step_index === 0);
 
+/**
+ * Encodes a markdown string to be safely used in an HTML attribute.
+ * @param md The markdown string.
+ * @returns The URI-encoded string.
+ */
 const md2attr = (md: string): string => encodeURIComponent(md);
 
+/**
+ * Decodes a markdown string from an HTML attribute.
+ * @param attr The URI-encoded string from the attribute.
+ * @returns The decoded markdown string.
+ */
 const attr2md = (attr: string): string => decodeURIComponent(attr);
 
+/**
+ * Determines the path for the flashcard deck file based on a chapter's file path.
+ * The deck is placed in the same folder as the chapter file.
+ * @param chapterPath The path to the chapter's markdown file.
+ * @returns The normalized path to the `_flashcards.json` file for that chapter's subject.
+ */
 const getDeckPathForChapter = (chapterPath: string): string => {
 	const parts = chapterPath.split("/");
 	const folder = parts.length > 1 ? parts.slice(0, -1).join("/") : "";
 	return normalizePath((folder ? `${folder}/` : "") + DECK_FILE_NAME);
 };
 
+/**
+ * A temporary workaround to fix math rendering issues with Obsidian's MarkdownRenderer.
+ * Replaces single-backslash parentheses with dollar signs.
+ * @param s The string to process.
+ * @returns The processed string with fixed math delimiters.
+ */
 const fixMath = (s: string): string =>
 	s.replace(/\\\(\s*(.*?)\s*\\\)/g, "$$$$$1$$$$");
 
+/**
+ * Extracts paragraph data (ID and markdown content) from a finalized note's HTML content.
+ * @param finalizedContent The full HTML content of a finalized note.
+ * @returns An array of objects, each containing a paragraph's ID and its original markdown.
+ */
 const getParagraphsFromFinalizedNote = (
 	finalizedContent: string
 ): { id: number; markdown: string }[] => {
@@ -6682,6 +7750,12 @@ const getParagraphsFromFinalizedNote = (
 	}));
 };
 
+/**
+ * Finds the paragraph index for a given text selection within raw markdown content.
+ * @param markdownContent The full markdown content of a note.
+ * @param selectedText The text to find.
+ * @returns The 1-based index of the paragraph containing the text, or undefined if not found.
+ */
 const findParaIdxInMarkdown = (
 	markdownContent: string,
 	selectedText: string
@@ -6698,6 +7772,13 @@ const findParaIdxInMarkdown = (
 	return undefined;
 };
 
+/**
+ * Waits for a specific element to appear in the DOM and be ready.
+ * "Ready" means it has been processed by the plugin's post-processor or is not empty.
+ * @param selector The CSS selector for the element.
+ * @param container The parent element to search within.
+ * @returns A promise that resolves to the found element, or null if it times out.
+ */
 async function waitForEl<T extends HTMLElement>(
 	selector: string,
 	container: HTMLElement
@@ -6721,10 +7802,22 @@ async function waitForEl<T extends HTMLElement>(
 	});
 }
 
+/**
+ * Escapes a string for use in a regular expression.
+ * @param string The string to escape.
+ * @returns The escaped string.
+ */
 function escapeRegExp(string: string): string {
-	return string.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+	return string.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
+/**
+ * Finds and returns a DOM Range corresponding to a given text tag within a container element.
+ * Uses fuzzy matching to handle variations in whitespace and markdown rendering.
+ * @param tag The text content to find.
+ * @param container The HTMLElement to search within.
+ * @returns A DOM Range object highlighting the found text.
+ */
 function findTextRange(tag: string, container: HTMLElement): Range {
 	const normalize = (s: string) =>
 		s
@@ -6872,6 +7965,11 @@ function findTextRange(tag: string, container: HTMLElement): Range {
 	return range;
 }
 
+/**
+ * Makes an Obsidian modal draggable by its title bar.
+ * @param modal The Modal instance to make draggable.
+ * @param plugin The plugin instance, used to store the last position.
+ */
 function makeModalDraggable(modal: Modal, plugin: GatedNotesPlugin): void {
 	const modalEl = modal.modalEl;
 	const titleEl = modal.titleEl;
@@ -6930,6 +8028,13 @@ function makeModalDraggable(modal: Modal, plugin: GatedNotesPlugin): void {
 	};
 }
 
+/**
+ * Gets the starting line number for a specific paragraph in a file.
+ * @param plugin The plugin instance.
+ * @param file The TFile to read.
+ * @param paraIdx The 1-based index of the paragraph.
+ * @returns A promise that resolves to the line number.
+ */
 async function getLineForParagraph(
 	plugin: GatedNotesPlugin,
 	file: TFile,
@@ -6959,102 +8064,83 @@ async function getLineForParagraph(
 	return 0;
 }
 
+/**
+ * Robustly extracts a JSON array from a string, which may be malformed or wrapped in code blocks.
+ * @param s The raw string from an LLM response.
+ * @returns An array of parsed objects of type T.
+ * @throws An error if no valid JSON can be parsed.
+ */
 function extractJsonArray<T>(s: string): T[] {
-	const fixJsonString = (str: string) => {
-		return str
-			.replace(/```json\s*|\s*```/g, "")
-			.trim()
-			.replace(/\\(?!["\\/bfnrtu])/g, "\\\\");
-	};
-
+	// Step 1: Try direct parsing first
 	try {
-		const parsed = JSON.parse(s.trim());
-		return Array.isArray(parsed) ? parsed : [parsed];
-	} catch (e1) {
-		try {
-			const fixed = fixJsonString(s);
-			const parsed = JSON.parse(fixed);
+		const trimmed = s.trim();
+		if (trimmed.startsWith("[") && trimmed.endsWith("]")) {
+			const parsed = JSON.parse(trimmed);
 			return Array.isArray(parsed) ? parsed : [parsed];
-		} catch (e2) {
-			try {
-				const arrayMatch = s.match(/\[[\s\S]*\]/);
-				if (arrayMatch) {
-					const fixed = fixJsonString(arrayMatch[0]);
-					const parsed = JSON.parse(fixed);
-					return Array.isArray(parsed) ? parsed : [parsed];
-				}
-			} catch (e3) {
-				console.log("All JSON parsing methods failed");
-			}
+		}
+	} catch (e) {
+		// Continue to other methods
+	}
+
+	// Step 2: Try to extract from code blocks
+	const codeBlockMatch = s.match(/```(?:json)?\s*([\s\S]*?)```/i);
+	if (codeBlockMatch && codeBlockMatch[1]) {
+		try {
+			const content = codeBlockMatch[1].trim();
+			const parsed = JSON.parse(content);
+			return Array.isArray(parsed) ? parsed : [parsed];
+		} catch (e) {
+			// Continue to other methods
 		}
 	}
 
-	throw new Error("Could not parse JSON from LLM response");
-}
+	// Step 3: Try to find JSON array in the text
+	const arrayMatches = s.matchAll(
+		/\[\s*\{[\s\S]*?\}\s*(?:,\s*\{[\s\S]*?\}\s*)*\]/g
+	);
+	for (const match of arrayMatches) {
+		try {
+			const parsed = JSON.parse(match[0]);
+			if (Array.isArray(parsed) && parsed.length > 0) {
+				return parsed;
+			}
+		} catch (e) {
+			continue;
+		}
+	}
 
-function extractJsonObjects<T>(s: string): T[] {
-	const fixJsonString = (str: string) => {
-		return str
-			.replace(/```json\s*|\s*```/g, "")
-			.trim()
-			.replace(/\\(?!["\\/bfnrtu])/g, "\\\\");
-	};
-
+	// Step 4: Try to find and fix common JSON issues
 	try {
-		const j = JSON.parse(s);
-		return Array.isArray(j) ? j : [j];
-	} catch {}
-
-	try {
-		const fixed = fixJsonString(s);
-		const j = JSON.parse(fixed);
-		return Array.isArray(j) ? j : [j];
-	} catch {}
-
-	const fence = s.match(/```(?:json)?\s*([\s\S]*?)```/i);
-	if (fence && fence[1]) {
-		try {
-			const j = JSON.parse(fence[1]);
-			return Array.isArray(j) ? j : [j];
-		} catch {}
-
-		try {
-			const fixed = fixJsonString(fence[1]);
-			const j = JSON.parse(fixed);
-			return Array.isArray(j) ? j : [j];
-		} catch {}
+		const fixed = fixCommonJsonIssues(s);
+		const parsed = JSON.parse(fixed);
+		return Array.isArray(parsed) ? parsed : [parsed];
+	} catch (e) {
+		// Continue to other methods
 	}
 
-	const arr = s.match(/\[\s*[\s\S]*?\s*\]/);
-	if (arr && arr[0]) {
-		try {
-			const parsed = JSON.parse(arr[0]);
-			return Array.isArray(parsed) ? parsed : [parsed];
-		} catch {}
-
-		try {
-			const fixed = fixJsonString(arr[0]);
-			const parsed = JSON.parse(fixed);
-			return Array.isArray(parsed) ? parsed : [parsed];
-		} catch {}
+	// Step 5: Try to extract individual objects and combine them
+	const objectMatches = [...s.matchAll(/\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}/g)];
+	if (objectMatches.length > 0) {
+		const objects: T[] = [];
+		for (const match of objectMatches) {
+			try {
+				const obj = JSON.parse(match[0]);
+				if (obj && typeof obj === "object") {
+					objects.push(obj);
+				}
+			} catch (e) {
+				continue;
+			}
+		}
+		if (objects.length > 0) {
+			return objects;
+		}
 	}
 
-	const objMatch = s.match(/\{\s*[\s\S]*?\s*\}/);
-	if (objMatch && objMatch[0]) {
-		try {
-			return [JSON.parse(objMatch[0])];
-		} catch {}
-
-		try {
-			const fixed = fixJsonString(objMatch[0]);
-			return [JSON.parse(fixed)];
-		} catch {}
-	}
-
+	// Step 6: Last resort - try to parse as front/back format
 	const frontBackRegex =
 		/^\s*Front:\s*(?<front>[\s\S]+?)\s*Back:\s*(?<back>[\s\S]+?)\s*$/im;
 	const match = s.match(frontBackRegex);
-
 	if (match && match.groups) {
 		const { front, back } = match.groups;
 		if (front && back) {
@@ -7063,19 +8149,177 @@ function extractJsonObjects<T>(s: string): T[] {
 	}
 
 	throw new Error(
-		"No valid JSON object, array, or Front/Back structure found in the string."
+		"Could not parse JSON from LLM response: No valid JSON structure found"
 	);
 }
 
+/**
+ * Robustly extracts one or more JSON objects from a string.
+ * @param s The raw string from an LLM response.
+ * @returns An array of parsed objects of type T.
+ * @throws An error if no valid JSON can be parsed.
+ */
+function extractJsonObjects<T>(s: string): T[] {
+	// This function is similar but focuses on extracting objects (not necessarily arrays)
+
+	// Step 1: Try direct parsing
+	try {
+		const trimmed = s.trim();
+		const parsed = JSON.parse(trimmed);
+		return Array.isArray(parsed) ? parsed : [parsed];
+	} catch (e) {
+		// Continue
+	}
+
+	// Step 2: Try code blocks
+	const codeBlockMatch = s.match(/```(?:json)?\s*([\s\S]*?)```/i);
+	if (codeBlockMatch && codeBlockMatch[1]) {
+		try {
+			const content = codeBlockMatch[1].trim();
+			const parsed = JSON.parse(content);
+			return Array.isArray(parsed) ? parsed : [parsed];
+		} catch (e) {
+			// Continue
+		}
+	}
+
+	// Step 3: Try to fix and parse
+	try {
+		const fixed = fixCommonJsonIssues(s);
+		const parsed = JSON.parse(fixed);
+		return Array.isArray(parsed) ? parsed : [parsed];
+	} catch (e) {
+		// Continue
+	}
+
+	// Step 4: Extract array if present
+	const arrayMatch = s.match(/\[\s*[\s\S]*?\s*\]/);
+	if (arrayMatch) {
+		try {
+			const parsed = JSON.parse(arrayMatch[0]);
+			return Array.isArray(parsed) ? parsed : [parsed];
+		} catch (e) {
+			// Try fixing the array
+			try {
+				const fixed = fixCommonJsonIssues(arrayMatch[0]);
+				const parsed = JSON.parse(fixed);
+				return Array.isArray(parsed) ? parsed : [parsed];
+			} catch (e2) {
+				// Continue
+			}
+		}
+	}
+
+	// Step 5: Extract individual objects
+	const objectMatches = [...s.matchAll(/\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}/g)];
+	if (objectMatches.length > 0) {
+		const objects: T[] = [];
+		for (const match of objectMatches) {
+			try {
+				const obj = JSON.parse(match[0]);
+				objects.push(obj);
+			} catch (e) {
+				// Try fixing individual object
+				try {
+					const fixed = fixCommonJsonIssues(match[0]);
+					const obj = JSON.parse(fixed);
+					objects.push(obj);
+				} catch (e2) {
+					continue;
+				}
+			}
+		}
+		if (objects.length > 0) {
+			return objects;
+		}
+	}
+
+	// Step 6: Front/back fallback
+	const frontBackRegex =
+		/^\s*Front:\s*(?<front>[\s\S]+?)\s*Back:\s*(?<back>[\s\S]+?)\s*$/im;
+	const match = s.match(frontBackRegex);
+	if (match && match.groups) {
+		const { front, back } = match.groups;
+		if (front && back) {
+			return [{ front: front.trim(), back: back.trim() }] as T[];
+		}
+	}
+
+	throw new Error(
+		"No valid JSON object, array, or Front/Back structure found"
+	);
+}
+
+/**
+ * Attempts to fix common issues in malformed JSON strings.
+ * @param jsonString The potentially malformed JSON string.
+ * @returns A string with fixes applied.
+ */
+function fixCommonJsonIssues(jsonString: string): string {
+	let fixed = jsonString;
+
+	// Remove common wrapper text
+	fixed = fixed.replace(/```json\s*|\s*```/g, "").trim();
+
+	// Fix unescaped backslashes (but preserve valid escapes)
+	fixed = fixed.replace(/\\(?!["\\/bfnrtu]|u[0-9a-fA-F]{4})/g, "\\\\");
+
+	// Fix unescaped quotes in strings (basic heuristic)
+	// This is tricky and might need adjustment based on your specific use cases
+
+	// Fix trailing commas in arrays and objects
+	fixed = fixed.replace(/,(\s*[\]}])/g, "$1");
+
+	// Fix missing commas between array elements or object properties
+	// Look for } followed by { without a comma
+	fixed = fixed.replace(/\}(\s*)\{/g, "},$1{");
+
+	// Look for " followed by " without a comma (at the end of a property)
+	fixed = fixed.replace(/"(\s*)"(\s*[^:])/g, '",$1"$2');
+
+	// Normalize whitespace around structural characters
+	fixed = fixed.replace(/\s*([{}[\],:])\s*/g, "$1");
+	fixed = fixed.replace(/([{}[\],:])/g, "$1 ").replace(/\s+/g, " ");
+	fixed = fixed.replace(/\s*$/, "");
+
+	// Ensure proper array structure if it looks like it should be an array
+	if (fixed.includes("},{") && !fixed.trim().startsWith("[")) {
+		// Might be missing array brackets
+		if (!fixed.trim().startsWith("{")) {
+			fixed = "[" + fixed + "]";
+		} else {
+			// Replace },{ with },{
+			fixed = "[" + fixed + "]";
+		}
+	}
+
+	return fixed;
+}
+
+/**
+ * Counts the number of tokens in a string using the gpt-tokenizer library.
+ * @param text The text to tokenize.
+ * @returns The number of tokens.
+ */
 function countTextTokens(text: string): number {
 	if (!text) return 0;
 	return encode(text).length;
 }
 
+/**
+ * Calculates the token cost for a number of images based on a fixed value.
+ * @param imageCount The number of images.
+ * @returns The total token cost for the images.
+ */
 function calculateImageTokens(imageCount: number): number {
 	return imageCount * IMAGE_TOKEN_COST;
 }
 
+/**
+ * Reads and parses the LLM log file.
+ * @param plugin The plugin instance.
+ * @returns A promise that resolves to an array of LLM log entries.
+ */
 async function getLlmLog(plugin: GatedNotesPlugin): Promise<LlmLogEntry[]> {
 	const logPath = normalizePath(
 		plugin.app.vault.getRoot().path + LLM_LOG_FILE
@@ -7092,6 +8336,14 @@ async function getLlmLog(plugin: GatedNotesPlugin): Promise<LlmLogEntry[]> {
 	}
 }
 
+/**
+ * Estimates the number of output tokens for a given AI action based on historical log data.
+ * @param plugin The plugin instance.
+ * @param action The type of AI action being performed.
+ * @param model The model being used.
+ * @param details Additional details like card count or text token count for more accurate estimation.
+ * @returns A promise that resolves to the estimated number of output tokens.
+ */
 async function estimateOutputTokens(
 	plugin: GatedNotesPlugin,
 	action: LlmLogEntry["action"],
@@ -7166,13 +8418,27 @@ async function estimateOutputTokens(
 	return Math.round(totalOutputTokens / relevantEntries.length);
 }
 
+/**
+ * Calculates the estimated cost of an LLM call using the `aicost` library and historical data.
+ * @param plugin The plugin instance.
+ * @param provider The AI provider.
+ * @param model The model ID.
+ * @param action The type of AI action.
+ * @param inputTokens The number of input tokens.
+ * @param details Additional details for estimation.
+ * @returns A promise that resolves to an object containing cost details and a formatted string.
+ */
 async function getEstimatedCost(
 	plugin: GatedNotesPlugin,
 	provider: "openai" | "lmstudio",
 	model: string,
 	action: LlmLogEntry["action"],
 	inputTokens: number,
-	details: { cardCount?: number } = {}
+	details: {
+		cardCount?: number;
+		textContentTokens?: number;
+		isVariableOutput?: boolean;
+	} = {}
 ): Promise<{
 	totalCost: number;
 	inputCost: number;
@@ -7188,12 +8454,10 @@ async function getEstimatedCost(
 		};
 	}
 
-	const estimatedOutput = await estimateOutputTokens(
-		plugin,
-		action,
-		model,
-		details
-	);
+	// For variable output, estimate based on 2-3 cards average
+	const estimatedOutput = details.isVariableOutput
+		? await estimateOutputTokensForVariable(plugin, action, model)
+		: await estimateOutputTokens(plugin, action, model, details);
 
 	const costResult = await aicostCalculate({
 		provider: "openai",
@@ -7215,7 +8479,10 @@ async function getEstimatedCost(
 	const totalCost = inputCost + outputCost;
 
 	let formattedString = `Est. Cost: ~$${totalCost.toFixed(4)}`;
-	if (estimatedOutput > 0) {
+
+	if (details.isVariableOutput) {
+		formattedString += ` (assuming 1-3 cards, may vary)`;
+	} else if (estimatedOutput > 0) {
 		formattedString += ` (Prompt: $${inputCost.toFixed(
 			4
 		)} + Est. Response: $${outputCost.toFixed(4)})`;
@@ -7226,6 +8493,41 @@ async function getEstimatedCost(
 	return { totalCost, inputCost, outputCost, formattedString };
 }
 
+/**
+ * Estimates output tokens for actions that have a variable number of outputs (e.g., "refocus").
+ * @param plugin The plugin instance.
+ * @param action The AI action type.
+ * @param model The model ID.
+ * @returns A promise resolving to the estimated number of output tokens.
+ */
+async function estimateOutputTokensForVariable(
+	plugin: GatedNotesPlugin,
+	action: LlmLogEntry["action"],
+	model: string
+): Promise<number> {
+	const log = await getLlmLog(plugin);
+	const relevantEntries = log.filter(
+		(entry) => entry.action === action && entry.model === model
+	);
+
+	if (relevantEntries.length < 1) {
+		// If no history, estimate for ~2.5 cards worth of content
+		return 250; // rough estimate
+	}
+
+	const avgTokens =
+		relevantEntries.reduce((sum, entry) => sum + entry.outputTokens, 0) /
+		relevantEntries.length;
+
+	// Multiply by 2.5 to account for potentially generating multiple cards
+	return Math.round(avgTokens * 2.5);
+}
+
+/**
+ * Logs a completed LLM call, including its cost, to the log file.
+ * @param plugin The plugin instance.
+ * @param data The data for the log entry, excluding timestamp and cost which are calculated here.
+ */
 async function logLlmCall(
 	plugin: GatedNotesPlugin,
 	data: Omit<LlmLogEntry, "timestamp" | "cost">
