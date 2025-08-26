@@ -176,6 +176,15 @@ interface CardBrowserState {
 	isFirstRender: boolean;
 }
 
+interface ExtractedImage {
+	id: string;
+	pageNumber: number;
+	imageData: string; // Base64 data URL
+	width: number;
+	height: number;
+	filename: string;
+}
+
 /**
  * Represents a log entry for a call to a Large Language Model.
  */
@@ -2232,6 +2241,21 @@ ${selection}
 				flex-direction: column;
 			}
 			
+			.gn-image-placement-modal {
+				width: 90vw;
+				height: 85vh;
+				max-width: 1400px;
+				max-height: 900px;
+				min-width: 800px;
+				min-height: 600px;
+			}
+			
+			.gn-image-placement-modal .modal-content {
+				height: 100%;
+				display: flex;
+				flex-direction: column;
+			}
+			
 			.gn-epub-section {
 				display: flex;
 				align-items: center;
@@ -3525,7 +3549,7 @@ ${selection}
 	 */
 	public async sendToLlm(
 		prompt: string,
-		imageUrl?: string,
+		imageUrl?: string | string[],
 		options: {
 			maxTokens?: number;
 			temperature?: number;
@@ -3561,12 +3585,15 @@ ${selection}
 				[{ type: "text", text: prompt }];
 
 			if (imageUrl) {
-				messageContent.push({
-					type: "image_url",
-					image_url: {
-						url: imageUrl,
-						detail: "high", // Use high detail for PDF processing
-					},
+				const imageUrls = Array.isArray(imageUrl) ? imageUrl : [imageUrl];
+				imageUrls.forEach(url => {
+					messageContent.push({
+						type: "image_url",
+						image_url: {
+							url: url,
+							detail: "high", // Use high detail for PDF processing
+						},
+					});
 				});
 			}
 
@@ -4916,11 +4943,22 @@ class PdfToNoteModal extends Modal {
 	private pageRangeFromInput!: TextComponent;
 	private pageRangeToInput!: TextComponent;
 	private includeTextToggle!: ToggleComponent;
+	private preloadStatusEl!: HTMLElement;
+	private isPreloadingImages = false;
+	private preloadingPromise: Promise<void> | null = null;
 	private renderedPages: Array<{
 		pageNum: number;
 		imageData: string;
 		textContent?: string;
 	}> = [];
+	private extractedImages: ExtractedImage[] = [];
+	private useContextToggle!: ToggleComponent;
+	private contextPagesInput!: TextComponent;
+	private contextPagesContainer!: HTMLElement;
+	private useFutureContextToggle!: ToggleComponent;
+	private futureContextPagesInput!: TextComponent;
+	private futureContextContainer!: HTMLElement;
+	private useNuclearOptionToggle!: ToggleComponent;
 
 	constructor(private plugin: GatedNotesPlugin) {
 		super(plugin.app);
@@ -4965,6 +5003,11 @@ class PdfToNoteModal extends Modal {
 
 		this.setupProcessingModeControls();
 
+		this.preloadStatusEl = this.contentEl.createDiv({
+			cls: "gn-processing-status",
+			attr: { style: "display: none;" },
+		});
+
 		new Setting(this.contentEl)
 			.setName("Chapter Name")
 			.setDesc("Name for the new note/chapter")
@@ -4993,6 +5036,8 @@ class PdfToNoteModal extends Modal {
 		this.newFolderInput.inputEl.style.display = "none";
 
 		this.setupExampleNoteSection();
+
+		this.setupContextControlSection();
 
 		const guidanceContainer = this.contentEl.createDiv();
 		const addGuidanceBtn = new ButtonComponent(guidanceContainer)
@@ -5035,13 +5080,21 @@ class PdfToNoteModal extends Modal {
 				const pageCount = this.getEstimatedPageCount();
 				const textContentTokens = countTextTokens(this.extractedText);
 				const guidance = this.guidanceInput?.getValue() || "";
+				const useNuclearOption = this.useNuclearOptionToggle?.getValue() || false;
 		
 				let mainPromptText: string;
 				let mainImageCount: number;
-				const mainDetails = {
+				const mainDetails: {
+					textContentTokens: number;
+					isHybrid: boolean;
+					pageCount?: number;
+					useNuclearOption: boolean;
+					nuclearMultiplier?: number;
+				} = {
 					textContentTokens,
 					isHybrid: isHybridMode,
 					pageCount: isHybridMode ? pageCount : undefined,
+					useNuclearOption,
 				};
 		
 				if (isHybridMode) {
@@ -5087,9 +5140,28 @@ class PdfToNoteModal extends Modal {
 					}
 				}
 		
+				// Nuclear option multiplier
+				let finalPromptText = mainPromptText;
+				let finalImageCount = mainImageCount;
+				
+				if (useNuclearOption) {
+					// Nuclear option adds 4 passes:
+					// 1. Initial processing (existing cost)
+					// 2. Validation pass (small)
+					// 3. Deduplication pass (medium)
+					// 4. Final review pass (large)
+					const estimatedNuclearMultiplier = 4.5; // Conservative estimate
+					
+					// Simulate additional processing cost
+					finalPromptText = mainPromptText.repeat(Math.ceil(estimatedNuclearMultiplier));
+					finalImageCount = Math.ceil(mainImageCount * 1.2); // Images used in first pass only, plus small validation cost
+					
+					mainDetails.nuclearMultiplier = estimatedNuclearMultiplier;
+				}
+
 				return {
-					promptText: mainPromptText,
-					imageCount: mainImageCount,
+					promptText: finalPromptText,
+					imageCount: finalImageCount,
 					action: "pdf_to_note",
 					details: mainDetails,
 				};
@@ -5129,6 +5201,12 @@ class PdfToNoteModal extends Modal {
 					.onChange(() => {
 						this.toggleHybridControls();
 						this.costUi?.update();
+						if (
+							this.processingModeSelect.value === "hybrid" &&
+							this.selectedFile
+						) {
+							this.preloadPdfImages();
+						}
 					});
 			});
 
@@ -5236,6 +5314,10 @@ class PdfToNoteModal extends Modal {
 			}
 
 			await this.costUi.update();
+
+			if (this.processingModeSelect.value === "hybrid") {
+				this.preloadPdfImages();
+			}
 		} catch (error) {
 			const errorMessage =
 				error instanceof Error
@@ -5244,6 +5326,44 @@ class PdfToNoteModal extends Modal {
 			this.pdfViewer.setText(`Error processing PDF: ${errorMessage}`);
 			console.error("PDF processing error:", error);
 		}
+	}
+
+	private preloadPdfImages(): void {
+		if (
+			!this.selectedFile ||
+			this.isPreloadingImages ||
+			this.renderedPages.length > 0
+		) {
+			return;
+		}
+
+		this.isPreloadingImages = true;
+		this.preloadStatusEl.empty();
+		this.preloadStatusEl.createSpan({ cls: "gn-spinner" });
+		this.preloadStatusEl.createSpan({ text: " Preloading images..." });
+		this.preloadStatusEl.style.display = "flex";
+
+		this.preloadingPromise = this.renderPdfPagesToImages((message) => {
+			this.preloadStatusEl.setText(`⏳ ${message}`);
+		})
+			.then(() => {
+				this.preloadStatusEl.setText(
+					`✅ Images preloaded for ${this.renderedPages.length} pages.`
+				);
+			})
+			.catch((error) => {
+				this.preloadStatusEl.setText(
+					`⚠️ Image preloading failed: ${error.message}`
+				);
+				this.plugin.logger(
+					LogLevel.NORMAL,
+					"PDF image preloading error:",
+					error
+				);
+			})
+			.finally(() => {
+				this.isPreloadingImages = false;
+			});
 	}
 
 	private async extractTextFromPdf(file: File): Promise<void> {
@@ -5367,9 +5487,9 @@ class PdfToNoteModal extends Modal {
 		return lines.join("\n");
 	}
 
-	private async renderPdfPagesToImages(): Promise<void> {
-		const notice = new Notice("🔄 Rendering PDF pages to images...", 0);
-
+	private async renderPdfPagesToImages(
+		onProgress?: (message: string) => void
+	): Promise<void> {
 		try {
 			const pdfjsLib = await this.loadPdfJs();
 			const arrayBuffer = await this.selectedFile!.arrayBuffer();
@@ -5392,8 +5512,8 @@ class PdfToNoteModal extends Modal {
 				pageNum <= Math.min(toPage, pdf.numPages);
 				pageNum++
 			) {
-				notice.setMessage(
-					`🔄 Rendering page ${pageNum - fromPage + 1}/${
+				onProgress?.(
+					`Rendering page ${pageNum - fromPage + 1}/${
 						toPage - fromPage + 1
 					}...`
 				);
@@ -5434,10 +5554,7 @@ class PdfToNoteModal extends Modal {
 					textContent: textContent || undefined,
 				});
 			}
-
-			notice.hide();
 		} catch (error) {
-			notice.hide();
 			throw error;
 		}
 	}
@@ -5469,6 +5586,99 @@ class PdfToNoteModal extends Modal {
 
 		if (textContent && textContent.trim()) {
 			userPrompt += `\n\nPDF TEXT CONTENT (may have layout issues; use IMAGE as ground truth):\n${textContent}`;
+		}
+
+		return systemPrompt + "\n\n" + userPrompt;
+	}
+
+	private buildHybridPromptWithContext(
+		pageNum: number,
+		textContent: string | undefined,
+		previousTranscriptions: string[],
+		previousTextContents: string[],
+		futureTextContents: string[],
+		customGuidance?: string
+	): string {
+		const totalContextImages = previousTranscriptions.length + futureTextContents.length;
+		const currentImageIndex = previousTranscriptions.length + 1;
+		
+		let systemPrompt = `You are an expert document processor converting a PDF page image (with optional PDF text) into clean, well-structured Markdown. You are processing page ${pageNum} of a multi-page document.
+
+IMAGES PROVIDED:`;
+
+		if (previousTranscriptions.length > 0) {
+			systemPrompt += `\n- Images 1-${previousTranscriptions.length}: Previous pages (for context only)`;
+		}
+		systemPrompt += `\n- Image ${currentImageIndex}: Current page (MAIN FOCUS - transcribe this page)`;
+		if (futureTextContents.length > 0) {
+			systemPrompt += `\n- Images ${currentImageIndex + 1}-${currentImageIndex + futureTextContents.length}: Future pages (for context only)`;
+		}
+
+		systemPrompt += `
+
+INSTRUCTIONS:
+- Only transcribe content from the current page (Image ${currentImageIndex})
+- Use context images and data to:
+  - Continue mid-sentence/paragraph flows from previous pages
+  - Avoid repeating headers/footers that appear across pages
+  - See where content is heading to make better structural decisions
+  - Maintain consistent formatting and structure throughout
+- Do NOT transcribe content from context images (previous or future pages)
+
+Follow these rules strictly:
+1. **Headers**: Convert section titles into markdown headers ("# Header", "## Subheader", etc.). Skip repeated headers from previous pages.
+2. **Paragraphs**: If a paragraph continues from the previous page, continue it seamlessly. Merge consecutive lines into complete paragraphs.
+3. **Footnotes**: If footnote citations and text appear on the same page, inline them in parentheses.
+4. **Figures & Tables**: Use ![IMAGE_PLACEHOLDER] for figures or recreate tables in markdown. Include captions below.
+5. **Mathematics**: Format all mathematical notation using LaTeX delimiters ("$" for inline, "$$" for block).
+6. **Image is authoritative**: If PDF text conflicts with the image, trust the image. Mark illegible content as [[ILLEGIBLE]].
+7. **Output**: ONLY the final Markdown text. No code fences or commentary.`;
+
+		if (this.exampleNoteContent.trim()) {
+			systemPrompt += `\n\nUse this structural template (but don't follow it too literally if the content doesn't match):\n${this.exampleNoteContent}`;
+		}
+
+		let userPrompt = `You are processing page ${pageNum} of a multi-page document.`;
+
+		if (previousTranscriptions.length > 0) {
+			userPrompt += `\n\nPREVIOUS PAGE DATA (for context only):\n`;
+			previousTranscriptions.forEach((transcription, index) => {
+				const pageIndex = pageNum - previousTranscriptions.length + index;
+				userPrompt += `--- PAGE ${pageIndex} TRANSCRIPTION ---\n${transcription}\n\n`;
+				if (previousTextContents[index]) {
+					userPrompt += `--- PAGE ${pageIndex} PDF TEXT ---\n${previousTextContents[index]}\n\n`;
+				}
+			});
+		}
+
+		if (futureTextContents.length > 0) {
+			userPrompt += `\n\nFUTURE PAGE DATA (for context only):\n`;
+			futureTextContents.forEach((textContent, index) => {
+				const pageIndex = pageNum + index + 1;
+				userPrompt += `--- PAGE ${pageIndex} PDF TEXT ---\n${textContent}\n\n`;
+			});
+		}
+
+		const contextDescription = [];
+		if (previousTranscriptions.length > 0) {
+			contextDescription.push("continuing from previous content");
+		}
+		if (futureTextContents.length > 0) {
+			contextDescription.push("with awareness of upcoming content");
+		}
+
+		if (contextDescription.length > 0) {
+			userPrompt += `\nNow transcribe the current page (page ${pageNum}) ${contextDescription.join(" and ")}.`;
+		} else {
+			userPrompt += `\nTranscribe this page ${pageNum} to markdown.`;
+		}
+
+		if (customGuidance) {
+			userPrompt += `\n\n**User's Custom Instructions:**\n${customGuidance}`;
+		}
+
+		if (textContent && textContent.trim()) {
+			userPrompt += `\n\nCURRENT PAGE PDF TEXT CONTENT (may have layout issues; use current page IMAGE as ground truth):\n${textContent}`;
 		}
 
 		return systemPrompt + "\n\n" + userPrompt;
@@ -5575,6 +5785,285 @@ ${messyMarkdown}
 		return systemPrompt + "\n\n" + userPrompt;
 	}
 
+	// === NEW COMPREHENSIVE PDF PROCESSING METHODS ===
+
+	private hashContent(content: string): string {
+		// Simple hash function for content deduplication
+		let hash = 0;
+		for (let i = 0; i < content.length; i++) {
+			const char = content.charCodeAt(i);
+			hash = ((hash << 5) - hash) + char;
+			hash = hash & hash; // Convert to 32-bit integer
+		}
+		return Math.abs(hash).toString(16);
+	}
+
+	private extractBoundaryContent(transcription: string, type: 'end' | 'start', sentences: number = 2): string {
+		const clean = transcription.replace(/#+\s+.*/g, '').trim();
+		const paragraphs = clean.split(/\n\s*\n/).filter(p => p.trim().length > 20);
+		
+		if (paragraphs.length === 0) return '';
+		
+		if (type === 'end') {
+			const lastParagraph = paragraphs[paragraphs.length - 1];
+			const sents = lastParagraph.split(/[.!?]+/).filter(s => s.trim().length > 10);
+			return sents.slice(-sentences).join('. ').trim();
+		} else {
+			const firstParagraph = paragraphs[0];
+			const sents = firstParagraph.split(/[.!?]+/).filter(s => s.trim().length > 10);
+			return sents.slice(0, sentences).join('. ').trim();
+		}
+	}
+
+	private extractStructuralInfo(transcription: string): { headers: string[], topics: string[] } {
+		const headers = Array.from(transcription.matchAll(/^#+\s+(.+)$/gm)).map(m => m[1]);
+		const topics = headers.map(h => h.replace(/^\d+\.?\s*/, '').toLowerCase());
+		return { headers, topics };
+	}
+
+	private buildMinimalContextPrompt(
+		pageNum: number,
+		textContent: string,
+		previousBoundary?: string,
+		previousStructure?: { headers: string[], topics: string[] },
+		futurePreview?: string,
+		alreadyTranscribedHashes?: Set<string>,
+		customGuidance?: string
+	): string {
+		const systemPrompt = `You are an expert document processor converting a PDF page image into clean, well-structured Markdown. You are processing page ${pageNum} of a multi-page document.
+
+<XML_INSTRUCTIONS>
+<CORE_TASK>
+- ONLY transcribe content visible on the current page image
+- Use provided context ONLY to maintain continuity and avoid repetition
+- Output ONLY the final Markdown text (no code fences or commentary)
+</CORE_TASK>
+
+<CONTEXT_USAGE>
+${previousBoundary ? `<PREVIOUS_BOUNDARY>Last sentences from previous page: "${previousBoundary}"</PREVIOUS_BOUNDARY>` : ''}
+${previousStructure?.headers.length ? `<PREVIOUS_HEADERS>${previousStructure.headers.join(', ')}</PREVIOUS_HEADERS>` : ''}
+${futurePreview ? `<FUTURE_PREVIEW>Upcoming content hint: "${futurePreview}"</FUTURE_PREVIEW>` : ''}
+${alreadyTranscribedHashes?.size ? `<AVOID_REPETITION>Do not repeat previously processed content</AVOID_REPETITION>` : ''}
+</CONTEXT_USAGE>
+
+<FORMATTING_RULES>
+1. **Headers**: Convert to markdown headers. Skip if already covered in previous pages
+2. **Paragraphs**: Continue mid-sentence flows seamlessly from previous boundary
+3. **Figures**: Use ![IMAGE_PLACEHOLDER] with captions
+4. **Math**: Use LaTeX notation ($inline$ and $$block$$)
+5. **Tables**: Recreate in markdown format
+6. **Citations**: Inline footnotes in parentheses when possible
+</FORMATTING_RULES>
+
+<ANTI_PATTERNS>
+❌ Do NOT repeat headers/sections from previous pages
+❌ Do NOT transcribe content from context images
+❌ Do NOT start new paragraphs if continuing from previous page
+❌ Do NOT include page numbers or footers
+</ANTI_PATTERNS>
+</XML_INSTRUCTIONS>`;
+
+		let userPrompt = `<CURRENT_PAGE>
+Process page ${pageNum} following the XML instructions above.`;
+
+		if (customGuidance) {
+			userPrompt += `\n\n<CUSTOM_GUIDANCE>${customGuidance}</CUSTOM_GUIDANCE>`;
+		}
+
+		if (textContent?.trim()) {
+			userPrompt += `\n\n<PDF_TEXT_REFERENCE>
+The following is extracted PDF text (may have layout issues - use the IMAGE as ground truth):
+${textContent}
+</PDF_TEXT_REFERENCE>`;
+		}
+
+		userPrompt += '\n</CURRENT_PAGE>';
+
+		return systemPrompt + "\n\n" + userPrompt;
+	}
+
+	private buildValidationPrompt(pageContent: string, previousContent: string, pageNum: number): string {
+		return `You are a document validation AI. Check if this page content has any issues:
+
+**Previous page content (last 200 chars):**
+${previousContent.slice(-200)}
+
+**Current page content:**
+${pageContent}
+
+**Check for these issues:**
+1. Repeated headers/sections from previous page
+2. Missing connection between pages (abrupt start)
+3. Incomplete sentences or paragraphs
+4. Content that seems out of sequence
+
+Respond with either:
+- "VALID" if no issues found
+- "ISSUES: [specific problems found]"`;
+	}
+
+	private buildDeduplicationPrompt(allContent: string): string {
+		return `You are a content deduplication expert. This document was processed page-by-page and has repetitive sections.
+
+**Your tasks:**
+1. Identify and remove duplicate headers, paragraphs, or sections
+2. Merge content that was artificially split across pages
+3. Ensure narrative flow is preserved
+4. Keep all unique content and proper structure
+
+**Content to clean:**
+${allContent}
+
+Return ONLY the cleaned markdown text.`;
+	}
+
+	private buildNuclearReviewPrompt(content: string, originalPdfText: string): string {
+		return `You are performing a final comprehensive review of a PDF-to-markdown conversion. This is the "nuclear option" review - be extremely thorough.
+
+**Original PDF Text Reference:**
+\`\`\`
+${originalPdfText}
+\`\`\`
+
+**Current Markdown:**
+\`\`\`markdown
+${content}
+\`\`\`
+
+**Comprehensive Review Tasks:**
+1. **Completeness**: Ensure no significant content is missing compared to PDF text
+2. **Structure**: Verify logical flow and proper markdown formatting
+3. **Deduplication**: Remove any remaining duplicate content
+4. **Continuity**: Fix paragraph breaks and sentence fragments
+5. **Formatting**: Perfect headers, lists, math notation, and figures
+6. **Quality**: Improve readability while preserving accuracy
+
+Return ONLY the final, perfected markdown text.`;
+	}
+
+	private async processPagesWithNuclearOption(notice: Notice): Promise<{ response: string; usage?: OpenAI.CompletionUsage }> {
+		const processedResults: string[] = [];
+		const processedHashes = new Set<string>();
+		const useContext = this.useNuclearOptionToggle?.getValue() || this.useContextToggle?.getValue() || false;
+		const contextPageCount = useContext ? parseInt(this.contextPagesInput?.getValue() || "1") || 1 : 0;
+
+		const totalUsage: OpenAI.CompletionUsage = {
+			prompt_tokens: 0,
+			completion_tokens: 0,
+			total_tokens: 0,
+		};
+
+		const addToTotalUsage = (usage?: OpenAI.CompletionUsage) => {
+			if (usage) {
+				totalUsage.prompt_tokens += usage.prompt_tokens;
+				totalUsage.completion_tokens += usage.completion_tokens;
+				totalUsage.total_tokens += usage.total_tokens;
+			}
+		};
+		
+		// Phase 1: Process each page with minimal context
+		for (let i = 0; i < this.renderedPages.length; i++) {
+			const pageData = this.renderedPages[i];
+			notice.setMessage(`🎯 Nuclear Phase 1: Processing page ${i + 1}/${this.renderedPages.length}...`);
+
+			// Get minimal context
+			let previousBoundary: string | undefined;
+			let previousStructure: { headers: string[], topics: string[] } | undefined;
+			
+			if (useContext && i > 0 && processedResults[i - 1]) {
+				previousBoundary = this.extractBoundaryContent(processedResults[i - 1], 'end', 2);
+				previousStructure = this.extractStructuralInfo(processedResults[i - 1]);
+			}
+
+			// Future preview (if enabled)
+			let futurePreview: string | undefined;
+			if (i < this.renderedPages.length - 1 && this.renderedPages[i + 1].textContent) {
+				const nextPageText = this.renderedPages[i + 1].textContent!.slice(0, 200);
+				futurePreview = nextPageText.split(/[.!?]/)[0];
+			}
+
+			// Build prompt with minimal context
+			const promptText = this.buildMinimalContextPrompt(
+				pageData.pageNum,
+				pageData.textContent || "",
+				previousBoundary,
+				previousStructure,
+				futurePreview,
+				processedHashes,
+				this.guidanceInput?.getValue()
+			);
+
+			const result = await this.plugin.sendToLlm(promptText, pageData.imageData, {
+				maxTokens: this.plugin.settings.pdfMaxTokensPerPage || 4000,
+			});
+			addToTotalUsage(result.usage);
+
+			if (!result.content) {
+				throw new Error(`Page ${pageData.pageNum} failed: AI returned empty content`);
+			}
+
+			let pageContent = result.content.replace(/^\s*```(?:markdown)?\s*([\s\S]*?)\s*```\s*$/s, "$1").trim();
+			
+			// Track content hash to avoid repetition
+			const contentHash = this.hashContent(pageContent);
+			processedHashes.add(contentHash);
+			
+			processedResults.push(pageContent);
+		}
+
+		// Phase 2: Validate each page against previous
+		notice.setMessage(`🔍 Nuclear Phase 2: Validating page connections...`);
+		for (let i = 1; i < processedResults.length; i++) {
+			const validationPrompt = this.buildValidationPrompt(
+				processedResults[i], 
+				processedResults[i - 1], 
+				i + 1
+			);			
+			
+			const validation = await this.plugin.sendToLlm(validationPrompt, undefined, { maxTokens: 500 });
+			addToTotalUsage(validation.usage);
+			if (validation.content?.includes('ISSUES:')) {
+				console.warn(`Page ${i + 1} validation issues:`, validation.content);
+			}
+		}
+
+		// Phase 3: Deduplication pass
+		notice.setMessage(`🧹 Nuclear Phase 3: Deduplicating content...`);
+		const combinedContent = processedResults.join('\n\n');
+		const deduplicationPrompt = this.buildDeduplicationPrompt(combinedContent);
+		
+		const dedupResult = await this.plugin.sendToLlm(deduplicationPrompt, undefined, {
+			maxTokens: Math.max(8000, combinedContent.length / 2)
+		});
+		addToTotalUsage(dedupResult.usage);
+
+		if (!dedupResult.content) {
+			console.warn('Deduplication failed, using original combined content');
+		}
+
+		const cleanedContent = !dedupResult.content ? combinedContent : dedupResult.content;
+
+		// Phase 4: Nuclear final review
+		notice.setMessage(`⚡ Nuclear Phase 4: Final comprehensive review...`);
+		let fullPdfText = "";
+		for (const pageData of this.renderedPages) {
+			if (pageData.textContent) {
+				fullPdfText += `${pageData.textContent}\n\n`;
+			}
+		}
+
+		const nuclearReviewPrompt = this.buildNuclearReviewPrompt(cleanedContent, fullPdfText);
+		
+		const finalResult = await this.plugin.sendToLlm(nuclearReviewPrompt, undefined, {
+			maxTokens: Math.max(12000, cleanedContent.length)
+		});
+		addToTotalUsage(finalResult.usage);
+
+		notice.setMessage(`✅ Nuclear processing complete!`);
+		const finalContent = !finalResult.content ? cleanedContent : finalResult.content;
+		return { response: finalContent, usage: totalUsage };
+	}
+
 	private async handleConvert(): Promise<void> {
 		if (!this.selectedFile) {
 			new Notice("Please select a PDF file first.");
@@ -5603,13 +6092,19 @@ ${messyMarkdown}
 		}
 
 		const finalCost = await this.costUi.update();
-		if (
-			!confirm(
-				`This will convert the PDF to a note using ${
-					isHybridMode ? "hybrid (text + images)" : "text-only"
-				} mode.\n${finalCost}\n\nProceed?`
-			)
-		) {
+		const useNuclearOption = this.useNuclearOptionToggle?.getValue() || false;
+		
+		let confirmMessage = `This will convert the PDF to a note using ${
+			isHybridMode ? "hybrid (text + images)" : "text-only"
+		} mode.\n${finalCost}`;
+		
+		if (useNuclearOption) {
+			confirmMessage += `\n\n⚡ NUCLEAR OPTION ENABLED ⚡\nThis uses 4-pass processing for maximum quality:\n• Phase 1: Page-by-page with minimal context\n• Phase 2: Validation of page connections\n• Phase 3: Content deduplication\n• Phase 4: Comprehensive final review\n\nThis provides the highest quality output with minimal manual cleanup needed.`;
+		}
+		
+		confirmMessage += '\n\nProceed?';
+		
+		if (!confirm(confirmMessage)) {
 			return;
 		}
 
@@ -5678,6 +6173,9 @@ ${messyMarkdown}
 				}
 			}
 
+			// Apply post-processing to fix common LLM issues
+			finalResponse = this.postProcessMarkdown(finalResponse);
+
 			const fileName = chapterName.endsWith(".md")
 				? chapterName
 				: `${chapterName}.md`;
@@ -5716,7 +6214,22 @@ ${messyMarkdown}
 				await leaf.openFile(newFile);
 			}
 
-			this.close();
+			// Extract images from PDF and show placement modal if images found
+			notice.setMessage("🖼️ Extracting images from PDF...");
+			this.extractedImages = await this.extractImagesFromPdf();
+			
+			this.plugin.logger(LogLevel.NORMAL, `Extracted ${this.extractedImages.length} images from PDF`);
+			
+			if (this.extractedImages.length > 0) {
+				notice.hide();
+				this.close();
+				// Show image placement assistance modal after closing this modal
+				setTimeout(() => {
+					new ImagePlacementModal(this.app, this.extractedImages, newFile as TFile, finalResponse).open();
+				}, 100);
+			} else {
+				this.close();
+			}
 		} catch (error) {
 			notice.hide();
 			const errorMessage =
@@ -5731,11 +6244,25 @@ ${messyMarkdown}
 	private async processHybridMode(
 		notice: Notice
 	): Promise<{ response: string; usage?: OpenAI.CompletionUsage }> {
-		// Render pages first
-		await this.renderPdfPagesToImages();
-	
+		if (this.isPreloadingImages && this.preloadingPromise) {
+			notice.setMessage("Waiting for image preloading to finish...");
+			await this.preloadingPromise;
+		}
+
+		if (this.renderedPages.length === 0) {
+			await this.renderPdfPagesToImages((message) =>
+				notice.setMessage(`🔄 ${message}`)
+			);
+		}
+
 		if (this.renderedPages.length === 0) {
 			throw new Error("No pages were rendered successfully");
+		}
+
+		// Check if nuclear option is enabled
+		const useNuclearOption = this.useNuclearOptionToggle?.getValue() || false;
+		if (useNuclearOption) {
+			return await this.processPagesWithNuclearOption(notice);
 		}
 	
 		let combinedResponse = "";
@@ -5754,23 +6281,85 @@ ${messyMarkdown}
 		}
 	
 		// Process each page
+		const processedResults: string[] = []; // Track previous page results
+		const useContext = this.useContextToggle?.getValue() || false;
+		const contextPageCount = useContext ? parseInt(this.contextPagesInput?.getValue() || "1") || 1 : 0;
+		const useFutureContext = useContext && (this.useFutureContextToggle?.getValue() || false);
+		const futureContextPageCount = useFutureContext ? parseInt(this.futureContextPagesInput?.getValue() || "1") || 1 : 0;
+		
 		for (let i = 0; i < this.renderedPages.length; i++) {
 			const pageData = this.renderedPages[i];
 			notice.setMessage(
 				`🤖 Processing page ${i + 1}/${this.renderedPages.length} with AI...`
 			);
 	
-			const promptText = this.buildHybridPrompt(
-				pageData.pageNum,
-				pageData.textContent,
-				this.guidanceInput?.getValue()
+			// Collect context from previous pages
+			const contextImages: string[] = [];
+			const contextTranscriptions: string[] = [];
+			const contextTextContent: string[] = [];
+			
+			if (useContext && i > 0) {
+				// Determine how many previous pages to include
+				const startIdx = Math.max(0, i - contextPageCount);
+				const endIdx = i;
+				
+				// Collect previous page images, transcriptions, and PDF text
+				for (let j = startIdx; j < endIdx; j++) {
+					contextImages.push(this.renderedPages[j].imageData);
+					if (j < processedResults.length) {
+						contextTranscriptions.push(processedResults[j]);
+					}
+					// Add PDF text content from previous page
+					if (this.renderedPages[j].textContent) {
+						contextTextContent.push(this.renderedPages[j].textContent!);
+					}
+				}
+			}
+
+			// Collect context from future pages
+			const futureContextImages: string[] = [];
+			const futureContextTextContent: string[] = [];
+			
+			if (useFutureContext && i < this.renderedPages.length - 1) {
+				// Determine how many future pages to include
+				const startIdx = i + 1;
+				const endIdx = Math.min(this.renderedPages.length, i + 1 + futureContextPageCount);
+				
+				// Collect future page images and PDF text
+				for (let j = startIdx; j < endIdx; j++) {
+					futureContextImages.push(this.renderedPages[j].imageData);
+					if (this.renderedPages[j].textContent) {
+						futureContextTextContent.push(this.renderedPages[j].textContent!);
+					}
+				}
+			}
+			
+			const promptText = useContext && (i > 0 || useFutureContext)
+				? this.buildHybridPromptWithContext(
+					pageData.pageNum,
+					pageData.textContent,
+					contextTranscriptions,
+					contextTextContent,
+					futureContextTextContent,
+					this.guidanceInput?.getValue()
+				)
+				: this.buildHybridPrompt(
+					pageData.pageNum,
+					pageData.textContent,
+					this.guidanceInput?.getValue()
+				);
+	
+			// Include context images plus current page image plus future context images
+			const allImages = [...contextImages, pageData.imageData, ...futureContextImages];
+			const primaryImageUrl = pageData.imageData; // Current page is primary
+			
+			const result = await this.plugin.sendToLlm(
+				promptText, 
+				allImages.length > 1 ? allImages : primaryImageUrl, 
+				{
+					maxTokens: this.plugin.settings.pdfMaxTokensPerPage || 4000,
+				}
 			);
-	
-			const imageUrl = pageData.imageData;
-	
-			const result = await this.plugin.sendToLlm(promptText, imageUrl, {
-				maxTokens: this.plugin.settings.pdfMaxTokensPerPage || 4000,
-			});
 	
 			if (!result.content) {
 				this.plugin.logger(
@@ -5788,6 +6377,9 @@ ${messyMarkdown}
 					"$1"
 				);
 			}
+			
+			// Store the processed result for context in next pages
+			processedResults.push(pageContent.trim());
 	
 			combinedResponse += `\n\n${pageContent.trim()}\n\n`;
 	
@@ -5859,6 +6451,96 @@ ${messyMarkdown}
 			this.openExampleNoteSelector(exampleDisplay);
 	}
 
+	private setupContextControlSection(): void {
+		const contextSection = this.contentEl.createDiv();
+		contextSection.createEl("h4", { text: "Multi-Page Context (Optional)" });
+		contextSection.createEl("p", {
+			text: "Use previous pages for context to improve continuity and reduce hallucinations. Higher values use more tokens but may produce better results.",
+			cls: "setting-item-description",
+		});
+
+		new Setting(contextSection)
+			.setName("Use Previous Pages for Context")
+			.setDesc("Include previous page images and transcriptions to maintain flow")
+			.addToggle((toggle) => {
+				this.useContextToggle = toggle;
+				toggle.setValue(false).onChange((value) => {
+					this.contextPagesContainer.style.display = value ? "block" : "none";
+					this.costUi?.update();
+				});
+			});
+
+		this.contextPagesContainer = contextSection.createDiv();
+		this.contextPagesContainer.style.display = "none";
+
+		new Setting(this.contextPagesContainer)
+			.setName("Previous Pages to Include")
+			.setDesc("Number of previous pages to include for context (1-3 recommended, or 999 for all)")
+			.addText((text) => {
+				this.contextPagesInput = text;
+				text.setPlaceholder("1")
+					.setValue("1")
+					.onChange(() => this.costUi?.update());
+			});
+
+		new Setting(this.contextPagesContainer)
+			.setName("Include Future Pages")
+			.setDesc("Also include upcoming pages for even better continuity (uses more tokens)")
+			.addToggle((toggle) => {
+				this.useFutureContextToggle = toggle;
+				toggle.setValue(false).onChange((value) => {
+					this.futureContextContainer.style.display = value ? "block" : "none";
+					this.costUi?.update();
+				});
+			});
+
+		this.futureContextContainer = this.contextPagesContainer.createDiv();
+		this.futureContextContainer.style.display = "none";
+
+		new Setting(this.futureContextContainer)
+			.setName("Future Pages to Include")
+			.setDesc("Number of upcoming pages to include for context (1-2 recommended)")
+			.addText((text) => {
+				this.futureContextPagesInput = text;
+				text.setPlaceholder("1")
+					.setValue("1")
+					.onChange(() => this.costUi?.update());
+			});
+		
+		// === NUCLEAR OPTION SECTION ===
+		const nuclearSection = this.contentEl.createDiv();
+		nuclearSection.createEl("h4", { text: "⚡ Nuclear Option (Maximum Quality)" });
+		
+		const nuclearWarning = nuclearSection.createEl("div", {
+			attr: { 
+				style: "background: var(--background-modifier-error); border: 1px solid var(--color-red); border-radius: 4px; padding: 12px; margin: 10px 0;" 
+			}
+		});
+		nuclearWarning.createEl("div", { 
+			text: "⚠️ HIGH COST WARNING", 
+			attr: { style: "font-weight: bold; color: var(--color-red); margin-bottom: 8px;" }
+		});
+		nuclearWarning.createEl("p", {
+			text: "Nuclear option uses 4-pass processing with validation and comprehensive review. This can cost 3-5x more tokens than standard processing but provides maximum accuracy with minimal manual cleanup needed.",
+			attr: { style: "margin: 0; font-size: 0.9em;" }
+		});
+
+		new Setting(nuclearSection)
+			.setName("Enable Nuclear Option")
+			.setDesc("4-phase processing: Minimal Context → Validation → Deduplication → Final Review")
+			.addToggle((toggle) => {
+				this.useNuclearOptionToggle = toggle;
+				toggle.setValue(false).onChange((value) => {
+					if (value) {
+						// Auto-enable context when nuclear option is enabled
+						this.useContextToggle?.setValue(true);
+						this.contextPagesContainer.style.display = "block";
+					}
+					this.costUi?.update();
+				});
+			});
+	}
+
 	private openExampleNoteSelector(displayElement: HTMLElement): void {
 		const suggester = new ExampleNoteSuggester(this.app, (file: TFile) => {
 			this.exampleNotePath = file.path;
@@ -5910,6 +6592,7 @@ ${messyMarkdown}
 			const trimmed = paragraph.trim();
 			if (!trimmed) return "";
 
+			// Keep headers, code blocks, and short content unchanged
 			if (
 				trimmed.startsWith("#") ||
 				trimmed.startsWith("```") ||
@@ -5919,17 +6602,437 @@ ${messyMarkdown}
 				return trimmed;
 			}
 
+			// Handle bullet points and lists - preserve structure
+			const lines = trimmed.split('\n');
+			if (lines.some(line => line.trim().startsWith('* ') || line.trim().startsWith('- ') || line.trim().match(/^\d+\./))) {
+				// This is a list - abbreviate each item while preserving structure
+				return lines.map(line => {
+					const lineWords = line.trim().split(/\s+/);
+					if (lineWords.length <= 8 || line.trim().startsWith('*') && lineWords.length <= 12) {
+						return line; // Keep short lines or bullet points intact
+					}
+					const prefix = line.match(/^(\s*[\*\-\d]+\.?\s*)/)?.[1] || '';
+					const content = line.replace(/^(\s*[\*\-\d]+\.?\s*)/, '').trim();
+					const contentWords = content.split(/\s+/);
+					if (contentWords.length <= 6) {
+						return line;
+					}
+					const firstThree = contentWords.slice(0, 3).join(" ");
+					const lastTwo = contentWords.slice(-2).join(" ");
+					return `${prefix}${firstThree} ... ${lastTwo}`;
+				}).join('\n');
+			}
+
+			// Handle regular paragraphs
 			const words = trimmed.split(/\s+/);
-			if (words.length <= 6) {
+			if (words.length <= 8) {
 				return trimmed;
 			}
 
-			const firstTwo = words.slice(0, 2).join(" ");
-			const lastTwo = words.slice(-2).join(" ");
-			return `${firstTwo} ... ${lastTwo}`;
+			const firstFour = words.slice(0, 4).join(" ");
+			const lastThree = words.slice(-3).join(" ");
+			return `${firstFour} ... ${lastThree}`;
 		});
 
 		return abbreviatedParagraphs.filter((p) => p).join("\n\n");
+	}
+
+	private postProcessMarkdown(content: string): string {
+		// Step 1: Convert LaTeX syntax to MathJax
+		content = this.convertLatexToMathJax(content);
+		
+		// Step 2: Clean up consecutive newlines after non-sentence endings
+		content = this.cleanupConsecutiveNewlines(content);
+		
+		return content;
+	}
+
+	private convertLatexToMathJax(content: string): string {
+		// Replace display math delimiters: \[ ... \] → $$ ... $$
+		content = content.replace(/\\\[([\s\S]*?)\\\]/g, '$$\n$1\n$$');
+		
+		// Replace inline math delimiters: \( ... \) → $ ... $
+		content = content.replace(/\\\((.*?)\\\)/g, '$$$1$$');
+		
+		return content;
+	}
+
+	private cleanupConsecutiveNewlines(content: string): string {
+		// Pattern to match 2+ consecutive newlines that follow non-sentence ending characters
+		// Non-sentence endings: colon, semicolon, comma (removed lowercase character)
+		const pattern = /([,:;])\n{2,}/g;
+		
+		// Replace with single newline + space for better flow
+		content = content.replace(pattern, '$1 ');
+		
+		// Also handle cases where there are excessive newlines (3+) anywhere
+		content = content.replace(/\n{3,}/g, '\n\n');
+		
+		return content;
+	}
+
+	private async extractImagesFromPdf(): Promise<ExtractedImage[]> {
+		if (!this.selectedFile) {
+			return [];
+		}
+
+		try {
+			const pdfjsLib = await this.loadPdfJs();
+			const arrayBuffer = await this.selectedFile.arrayBuffer();
+			const typedArray = new Uint8Array(arrayBuffer);
+			const pdf = await pdfjsLib.getDocument(typedArray).promise;
+
+			// Debug: Print PDF object and available operations
+			console.log("=== PDF DEBUG INFO ===");
+			console.log("PDF object:", pdf);
+			console.log("PDF.js Library:", pdfjsLib);
+			console.log("Available OPS:", pdfjsLib.OPS);
+			console.log("OPS keys:", Object.keys(pdfjsLib.OPS));
+			console.log("Image-related OPS:", {
+				paintImageXObject: pdfjsLib.OPS.paintImageXObject,
+				paintJpegXObject: pdfjsLib.OPS.paintJpegXObject,
+				paintInlineImageXObject: pdfjsLib.OPS.paintInlineImageXObject,
+				paintImageMaskXObject: pdfjsLib.OPS.paintImageMaskXObject
+			});
+
+			const extractedImages: ExtractedImage[] = [];
+			const imageCount = { current: 0 };
+
+			for (let pageNum = 1; pageNum <= pdf.numPages; pageNum++) { // Check all pages
+				const page = await pdf.getPage(pageNum);
+				
+				// Debug: Print page object
+				console.log(`=== PAGE ${pageNum} DEBUG INFO ===`);
+				console.log("Page object:", page);
+				
+				const pageImages = await this.extractImagesFromPage(page, pageNum, imageCount, pdfjsLib);
+				extractedImages.push(...pageImages);
+			}
+
+			return extractedImages;
+		} catch (error) {
+			this.plugin.logger(LogLevel.NORMAL, "Error extracting images from PDF:", error);
+			return [];
+		}
+	}
+
+	private async extractImagesFromPage(page: any, pageNum: number, imageCount: { current: number }, pdfjsLib: any): Promise<ExtractedImage[]> {
+		const extractedImages: ExtractedImage[] = [];
+
+		try {
+			const operatorList = await page.getOperatorList();
+			this.plugin.logger(LogLevel.NORMAL, `Page ${pageNum}: Analyzing ${operatorList.fnArray.length} operations for images`);
+
+			// Look for all types of image operations like the debug modal does
+			let imageOperations = 0;
+			const seenDataRefs = new Set<string>();
+			
+			const imageOpsToCheck = [
+				{ name: 'paintImageMaskXObject', op: pdfjsLib.OPS.paintImageMaskXObject },
+				{ name: 'paintImageXObject', op: pdfjsLib.OPS.paintImageXObject },
+				{ name: 'paintJpegXObject', op: pdfjsLib.OPS.paintJpegXObject },
+				{ name: 'paintInlineImageXObject', op: pdfjsLib.OPS.paintInlineImageXObject }
+			];
+			
+			for (let i = 0; i < operatorList.fnArray.length; i++) {
+				const fn = operatorList.fnArray[i];
+				const args = operatorList.argsArray[i];
+
+				// Check if this is any type of image operation
+				const imageOp = imageOpsToCheck.find(op => fn === op.op);
+				if (imageOp) {
+					imageOperations++;
+					this.plugin.logger(LogLevel.NORMAL, `Page ${pageNum}: Found ${imageOp.name} operation ${imageOperations} at index ${i}`);
+					this.plugin.logger(LogLevel.NORMAL, `Page ${pageNum}: Args:`, args);
+					
+					// Handle two different argument formats:
+					// Format 1: args[0] = {data, width, height} (object format)
+					// Format 2: args[0] = 'img_ref', args[1] = width, args[2] = height (separate args format)
+					let imageMetadata: any = null;
+					let dataRef: string = '';
+					
+					if (args && args.length > 0 && args[0]) {
+						if (typeof args[0] === 'object' && args[0].width && args[0].height) {
+							// Format 1: Object format
+							imageMetadata = args[0];
+							dataRef = imageMetadata.data || imageMetadata.name || `${imageOp.name}_${pageNum}_${i}`;
+						} else if (typeof args[0] === 'string' && args.length >= 3 && typeof args[1] === 'number' && typeof args[2] === 'number') {
+							// Format 2: Separate arguments format
+							imageMetadata = {
+								data: args[0],
+								name: args[0],
+								width: args[1],
+								height: args[2]
+							};
+							dataRef = args[0];
+						}
+					}
+					
+					if (imageMetadata && dataRef) {
+						
+						// Check if we've already processed this image reference
+						if (seenDataRefs.has(dataRef)) {
+							this.plugin.logger(LogLevel.NORMAL, `Page ${pageNum}: Skipping duplicate dataRef ${dataRef}`);
+							continue;
+						}
+						seenDataRefs.add(dataRef);
+						
+						this.plugin.logger(LogLevel.NORMAL, `Page ${pageNum}: Processing unique ${imageOp.name} image ${imageMetadata.width}x${imageMetadata.height}px: ${dataRef}`);
+						
+						try {
+							// Use appropriate extraction method based on operation type
+							let extractedImage: ExtractedImage | null = null;
+							
+							if (imageOp.name === 'paintImageMaskXObject') {
+								extractedImage = await this.extractImageMaskFromPage(page, imageMetadata, pageNum, imageCount);
+							} else {
+								// For other image types, try the general extraction method
+								extractedImage = await this.extractImageFromPage(page, imageMetadata, pageNum, imageCount, imageOp.name);
+							}
+							
+							if (extractedImage) {
+								extractedImages.push(extractedImage);
+								this.plugin.logger(LogLevel.NORMAL, `Page ${pageNum}: Successfully extracted ${imageOp.name} image ${extractedImage.id} (${extractedImages.length} total so far)`);
+							} else {
+								this.plugin.logger(LogLevel.NORMAL, `Page ${pageNum}: Failed to extract ${imageOp.name} image ${dataRef} - extraction returned null`);
+							}
+						} catch (imageError) {
+							this.plugin.logger(LogLevel.NORMAL, `Failed to extract ${imageOp.name} image ${dataRef} from page ${pageNum}:`, imageError);
+						}
+					} else {
+						this.plugin.logger(LogLevel.NORMAL, `Page ${pageNum}: ${imageOp.name} operation ${imageOperations} has invalid args:`, args);
+					}
+				}
+			}
+			
+			this.plugin.logger(LogLevel.NORMAL, `Page ${pageNum}: Found ${imageOperations} image operations, extracted ${extractedImages.length} images`);
+			
+			if (imageOperations === 0) {
+				this.plugin.logger(LogLevel.NORMAL, `Page ${pageNum}: No image mask operations found`);
+			}
+		} catch (error) {
+			this.plugin.logger(LogLevel.NORMAL, `Error processing page ${pageNum} for images:`, error);
+		}
+
+		return extractedImages;
+	}
+
+	private async extractImageFromPage(page: any, imageMetadata: any, pageNum: number, imageCount: { current: number }, opType: string): Promise<ExtractedImage | null> {
+		return new Promise((resolve) => {
+			// Use same timeout as mask extraction
+			const timeout = setTimeout(() => {
+				this.plugin.logger(LogLevel.NORMAL, `Timeout extracting ${opType} image from page ${pageNum}`);
+				resolve(null);
+			}, 10000);
+
+			try {
+				const dataRef = imageMetadata.data || imageMetadata.name || imageMetadata;
+				this.plugin.logger(LogLevel.NORMAL, `Page ${pageNum}: Attempting to extract ${opType} image with dataRef: ${dataRef}`);
+				
+				page.objs.get(dataRef, (obj: any) => {
+					clearTimeout(timeout);
+					
+					this.plugin.logger(LogLevel.NORMAL, `Page ${pageNum}: Retrieved ${opType} object for ${dataRef}:`, obj ? 'SUCCESS' : 'NULL');
+					
+					if (!obj) {
+						this.plugin.logger(LogLevel.NORMAL, `No object found for ${opType} ${dataRef}`);
+						resolve(null);
+						return;
+					}
+
+					try {
+						let canvas: HTMLCanvasElement;
+						let ctx: CanvasRenderingContext2D;
+
+						// Handle different object types
+						if (obj.bitmap) {
+							// ImageBitmap object (like paintImageMaskXObject)
+							canvas = document.createElement('canvas');
+							ctx = canvas.getContext('2d')!;
+							canvas.width = obj.bitmap.width || imageMetadata.width;
+							canvas.height = obj.bitmap.height || imageMetadata.height;
+							ctx.drawImage(obj.bitmap, 0, 0);
+						} else if (obj.data && obj.width && obj.height) {
+							// Raw image data
+							canvas = document.createElement('canvas');
+							ctx = canvas.getContext('2d')!;
+							canvas.width = obj.width;
+							canvas.height = obj.height;
+							
+							const imageData = ctx.createImageData(obj.width, obj.height);
+							imageData.data.set(obj.data);
+							ctx.putImageData(imageData, 0, 0);
+						} else {
+							this.plugin.logger(LogLevel.NORMAL, `Unsupported ${opType} object structure for ${dataRef}:`, obj);
+							resolve(null);
+							return;
+						}
+						
+						const imageData = canvas.toDataURL('image/png');
+						
+						imageCount.current++;
+						const extractedImage: ExtractedImage = {
+							id: `image_${pageNum}_${imageCount.current}`,
+							pageNumber: pageNum,
+							imageData: imageData,
+							width: canvas.width,
+							height: canvas.height,
+							filename: `extracted_${opType.toLowerCase()}_${pageNum}_${imageCount.current}.png`
+						};
+						
+						this.plugin.logger(LogLevel.NORMAL, `Page ${pageNum}: Successfully extracted ${opType} image ${extractedImage.id} (${canvas.width}x${canvas.height}px)`);
+						resolve(extractedImage);
+					} catch (error) {
+						this.plugin.logger(LogLevel.NORMAL, `Error rendering ${opType} object for ${dataRef}:`, error);
+						resolve(null);
+					}
+				});
+			} catch (error) {
+				clearTimeout(timeout);
+				this.plugin.logger(LogLevel.NORMAL, `Error accessing ${opType} image ${imageMetadata.data}:`, error);
+				resolve(null);
+			}
+		});
+	}
+
+	private async extractImageMaskFromPage(page: any, imageMetadata: any, pageNum: number, imageCount: { current: number }): Promise<ExtractedImage | null> {
+		return new Promise((resolve) => {
+			// Increase timeout to handle multiple images better
+			const timeout = setTimeout(() => {
+				this.plugin.logger(LogLevel.NORMAL, `Timeout extracting image from page ${pageNum}`);
+				resolve(null);
+			}, 10000);
+
+			try {
+				const dataRef = imageMetadata.data;
+				this.plugin.logger(LogLevel.NORMAL, `Page ${pageNum}: Attempting to extract image with dataRef: ${dataRef}`);
+				
+				page.objs.get(dataRef, (obj: any) => {
+					clearTimeout(timeout);
+					
+					this.plugin.logger(LogLevel.NORMAL, `Page ${pageNum}: Retrieved object for ${dataRef}:`, obj ? 'SUCCESS' : 'NULL');
+					
+					if (!obj || !obj.bitmap) {
+						this.plugin.logger(LogLevel.NORMAL, `No bitmap found for ${dataRef}. Object:`, obj);
+						resolve(null);
+						return;
+					}
+
+					try {
+						// Use the proven ImageBitmap extraction method
+						const canvas = document.createElement('canvas');
+						const ctx = canvas.getContext('2d')!;
+						canvas.width = obj.bitmap.width || imageMetadata.width;
+						canvas.height = obj.bitmap.height || imageMetadata.height;
+						
+						this.plugin.logger(LogLevel.NORMAL, `Page ${pageNum}: Creating canvas ${canvas.width}x${canvas.height}px for ${dataRef}`);
+						
+						// Draw the ImageBitmap to canvas
+						ctx.drawImage(obj.bitmap, 0, 0);
+						const imageData = canvas.toDataURL('image/png');
+						
+						imageCount.current++;
+						const extractedImage: ExtractedImage = {
+							id: `image_${pageNum}_${imageCount.current}`,
+							pageNumber: pageNum,
+							imageData: imageData,
+							width: canvas.width,
+							height: canvas.height,
+							filename: `extracted_image_${pageNum}_${imageCount.current}.png`
+						};
+						
+						this.plugin.logger(LogLevel.NORMAL, `Page ${pageNum}: Successfully extracted image ${extractedImage.id} (${canvas.width}x${canvas.height}px)`);
+						resolve(extractedImage);
+					} catch (error) {
+						this.plugin.logger(LogLevel.NORMAL, `Error rendering bitmap for ${dataRef}:`, error);
+						resolve(null);
+					}
+				});
+			} catch (error) {
+				clearTimeout(timeout);
+				this.plugin.logger(LogLevel.NORMAL, `Error accessing image ${imageMetadata.data}:`, error);
+				resolve(null);
+			}
+		});
+	}
+
+	private async getImageFromPage(page: any, objId: string): Promise<{ imageData: string; width: number; height: number } | null> {
+		return new Promise((resolve) => {
+			try {
+				// Try to get the image object
+				page.objs.get(objId, (imgObj: any) => {
+					if (!imgObj) {
+						resolve(null);
+						return;
+					}
+
+					try {
+						// Handle different types of image objects
+						let imageData: ImageData | HTMLImageElement | HTMLCanvasElement = imgObj;
+						
+						// If it's raw image data, we need to process it
+						if (imgObj.data && imgObj.width && imgObj.height) {
+							// Create a canvas to convert the image data to a data URL
+							const canvas = document.createElement('canvas');
+							const ctx = canvas.getContext('2d');
+							
+							if (!ctx) {
+								resolve(null);
+								return;
+							}
+
+							canvas.width = imgObj.width;
+							canvas.height = imgObj.height;
+
+							// Create ImageData from the raw data
+							const imageData = new ImageData(
+								new Uint8ClampedArray(imgObj.data),
+								imgObj.width,
+								imgObj.height
+							);
+							
+							ctx.putImageData(imageData, 0, 0);
+							const dataUrl = canvas.toDataURL('image/png');
+							
+							resolve({
+								imageData: dataUrl,
+								width: imgObj.width,
+								height: imgObj.height
+							});
+						} else if (imgObj instanceof HTMLImageElement || imgObj instanceof HTMLCanvasElement) {
+							// If it's already an image or canvas, convert to data URL
+							const canvas = document.createElement('canvas');
+							const ctx = canvas.getContext('2d');
+							
+							if (!ctx) {
+								resolve(null);
+								return;
+							}
+
+							canvas.width = imgObj.width || (imgObj as HTMLImageElement).naturalWidth;
+							canvas.height = imgObj.height || (imgObj as HTMLImageElement).naturalHeight;
+							
+							ctx.drawImage(imgObj, 0, 0);
+							const dataUrl = canvas.toDataURL('image/png');
+							
+							resolve({
+								imageData: dataUrl,
+								width: canvas.width,
+								height: canvas.height
+							});
+						} else {
+							resolve(null);
+						}
+					} catch (error) {
+						this.plugin.logger(LogLevel.NORMAL, "Error processing image object:", error);
+						resolve(null);
+					}
+				});
+			} catch (error) {
+				this.plugin.logger(LogLevel.NORMAL, "Error getting image from page:", error);
+				resolve(null);
+			}
+		});
 	}
 
 	onClose() {
@@ -6079,6 +7182,366 @@ class ExampleNoteSuggester extends Modal {
 			}
 		} else if (e.key === "Escape") {
 			this.close();
+		}
+	}
+
+	onClose() {
+		this.contentEl.empty();
+	}
+}
+
+/**
+ * A modal for assisting users in placing extracted images from PDF into their note.
+ */
+class ImagePlacementModal extends Modal {
+	private imageListEl!: HTMLElement;
+	private notePreviewEl!: HTMLElement;
+	private selectedImage: ExtractedImage | null = null;
+	private placeholders: { lineIndex: number; placeholderIndex: number; element: HTMLElement }[] = [];
+	private updatedContent: string;
+
+	constructor(
+		app: App,
+		private extractedImages: ExtractedImage[],
+		private noteFile: TFile,
+		private noteContent: string
+	) {
+		super(app);
+		this.updatedContent = noteContent;
+		
+		// Make modal larger and draggable
+		this.modalEl.addClass("gn-image-placement-modal");
+	}
+
+	onOpen() {
+		makeModalDraggable(this, this.app as any);
+		
+		this.titleEl.setText(`📷 Found ${this.extractedImages.length} images in PDF`);
+		
+		const introEl = this.contentEl.createDiv({ cls: "gn-image-placement-intro" });
+		introEl.createEl("p", {
+			text: "Select an image on the left, then click a placeholder on the right to replace it with the selected image."
+		});
+
+		// Create two-column layout
+		const containerEl = this.contentEl.createDiv({ cls: "gn-image-placement-container" });
+		containerEl.setAttribute("style", "display: flex; gap: 20px; flex: 1; min-height: 0;");
+
+		// Left column: Image list
+		const leftCol = containerEl.createDiv({ cls: "gn-image-list-column" });
+		leftCol.setAttribute("style", "flex: 1; overflow-y: auto; border: 1px solid var(--background-modifier-border); padding: 10px;");
+		
+		leftCol.createEl("h3", { text: "Extracted Images" });
+		leftCol.createEl("p", { 
+			text: "Click to select an image:",
+			cls: "setting-item-description"
+		});
+		this.imageListEl = leftCol.createDiv({ cls: "gn-image-list" });
+
+		// Right column: Note preview
+		const rightCol = containerEl.createDiv({ cls: "gn-note-preview-column" });
+		rightCol.setAttribute("style", "flex: 1; overflow-y: auto; border: 1px solid var(--background-modifier-border); padding: 10px;");
+		
+		rightCol.createEl("h3", { text: "Note Content with Image Placeholders" });
+		rightCol.createEl("p", { 
+			text: "Click on highlighted ![IMAGE_PLACEHOLDER] tags to replace them with the selected image.",
+			cls: "setting-item-description"
+		});
+		this.notePreviewEl = rightCol.createDiv({ cls: "gn-note-preview" });
+
+		this.renderImageList();
+		this.renderNotePreview();
+
+		// Action buttons
+		const buttonContainer = this.contentEl.createDiv({ cls: "gn-image-placement-buttons" });
+		buttonContainer.setAttribute("style", "display: flex; gap: 10px; justify-content: flex-end; margin-top: 20px;");
+
+		const updateNoteButton = buttonContainer.createEl("button", {
+			text: "✅ Update Note with Changes",
+			cls: "mod-cta"
+		});
+		updateNoteButton.onclick = () => this.updateNoteFile();
+
+		const saveImagesButton = buttonContainer.createEl("button", {
+			text: "💾 Save All Images to Vault"
+		});
+		saveImagesButton.onclick = () => this.saveAllImages();
+
+		const copyButton = buttonContainer.createEl("button", {
+			text: "📋 Copy Results to Clipboard",
+			cls: "mod-muted"
+		});
+		copyButton.onclick = () => this.copyImageResults();
+
+		const closeButton = buttonContainer.createEl("button", {
+			text: "Close"
+		});
+		closeButton.onclick = () => this.close();
+	}
+
+	private renderImageList(): void {
+		this.imageListEl.empty();
+
+		this.extractedImages.forEach((image, index) => {
+			const imageItem = this.imageListEl.createDiv({ cls: "gn-image-item" });
+			const isSelected = this.selectedImage === image;
+			
+			imageItem.setAttribute("style", 
+				"margin-bottom: 15px; padding: 10px; border-radius: 4px; cursor: pointer; " +
+				`border: 2px solid ${isSelected ? 'var(--interactive-accent)' : 'var(--background-modifier-border)'}; ` +
+				`background: ${isSelected ? 'var(--background-secondary-alt)' : 'transparent'};`
+			);
+
+			// Make entire item clickable to select image
+			imageItem.onclick = () => {
+				this.selectedImage = image;
+				this.renderImageList(); // Re-render to update selection visual
+			};
+
+			// Image preview
+			const imgEl = imageItem.createEl("img", {
+				attr: {
+					src: image.imageData,
+					style: "max-width: 200px; max-height: 150px; object-fit: contain; display: block; margin-bottom: 10px;"
+				}
+			});
+
+			// Image info
+			const infoEl = imageItem.createDiv({ cls: "gn-image-info" });
+			infoEl.createEl("div", { 
+				text: `${image.filename}`,
+				attr: { style: "font-weight: 500; margin-bottom: 5px;" }
+			});
+			infoEl.createEl("div", { 
+				text: `Page ${image.pageNumber} • ${image.width}x${image.height}px`,
+				attr: { style: "font-size: 0.9em; color: var(--text-muted); margin-bottom: 10px;" }
+			});
+
+			// Selection indicator
+			if (isSelected) {
+				const selectedEl = infoEl.createEl("div", {
+					text: "✓ Selected",
+					attr: { 
+						style: "color: var(--interactive-accent); font-weight: 500; margin-bottom: 10px;"
+					}
+				});
+			}
+
+			// Save individual image button
+			const saveButton = infoEl.createEl("button", {
+				text: "💾 Save to Vault",
+				cls: "mod-muted"
+			});
+			saveButton.onclick = (e) => {
+				e.stopPropagation(); // Prevent triggering selection
+				this.saveImage(image);
+			};
+		});
+	}
+
+	private renderNotePreview(): void {
+		this.notePreviewEl.empty();
+		this.placeholders = [];
+		
+		// Split content by lines and render with clickable placeholders
+		const lines = this.updatedContent.split('\n');
+		
+		lines.forEach((line, lineIndex) => {
+			const lineEl = this.notePreviewEl.createDiv({ cls: "gn-note-line" });
+			lineEl.setAttribute("style", "margin-bottom: 5px; line-height: 1.5;");
+
+			if (line.includes('![IMAGE_PLACEHOLDER]')) {
+				// Make placeholder clickable
+				const parts = line.split('![IMAGE_PLACEHOLDER]');
+				parts.forEach((part, partIndex) => {
+					if (partIndex > 0) {
+						const placeholderEl = lineEl.createEl("span", {
+							text: "![IMAGE_PLACEHOLDER]",
+							cls: "gn-image-placeholder"
+						});
+						placeholderEl.setAttribute("style", 
+							"background-color: var(--text-selection); " +
+							"padding: 2px 6px; " +
+							"border-radius: 3px; " +
+							"cursor: pointer; " +
+							"font-family: var(--font-monospace); " +
+							"transition: background-color 0.2s;"
+						);
+						
+						// Track this placeholder
+						const placeholderIndex = partIndex - 1;
+						this.placeholders.push({
+							lineIndex,
+							placeholderIndex,
+							element: placeholderEl
+						});
+						
+						placeholderEl.onclick = () => this.insertImageAtPlaceholder(lineIndex, placeholderIndex);
+						
+						// Add hover effect
+						placeholderEl.onmouseenter = () => {
+							placeholderEl.style.backgroundColor = "var(--interactive-accent)";
+						};
+						placeholderEl.onmouseleave = () => {
+							placeholderEl.style.backgroundColor = "var(--text-selection)";
+						};
+					}
+					if (part) {
+						lineEl.appendChild(document.createTextNode(part));
+					}
+				});
+			} else {
+				lineEl.textContent = line;
+			}
+		});
+
+		// Show placeholder count
+		const placeholderCount = this.placeholders.length;
+		if (placeholderCount > 0) {
+			const countEl = this.notePreviewEl.createDiv({
+				text: `Found ${placeholderCount} placeholder(s) in the note`,
+				attr: {
+					style: "margin-top: 10px; padding: 8px; background: var(--background-secondary); border-radius: 4px; font-size: 0.9em; color: var(--text-muted);"
+				}
+			});
+		}
+	}
+
+	private async insertImageAtPlaceholder(lineIndex: number, placeholderIndex: number): Promise<void> {
+		if (!this.selectedImage) {
+			new Notice("Please select an image first by clicking on one of the images on the left.");
+			return;
+		}
+
+		try {
+			// Save the image to vault first
+			const imagePath = await this.saveImageToVault(this.selectedImage);
+			
+			// Replace the placeholder in the content
+			const lines = this.updatedContent.split('\n');
+			const line = lines[lineIndex];
+			
+			// Find and replace the specific placeholder occurrence
+			const parts = line.split('![IMAGE_PLACEHOLDER]');
+			if (placeholderIndex < parts.length - 1) {
+				// Replace the placeholder at this specific position
+				const beforePlaceholder = parts.slice(0, placeholderIndex + 1).join('![IMAGE_PLACEHOLDER]');
+				const afterPlaceholder = parts.slice(placeholderIndex + 1).join('![IMAGE_PLACEHOLDER]');
+				
+				// Create the image reference using the saved path
+				const imageRef = `![[${imagePath}]]`;
+				lines[lineIndex] = beforePlaceholder + imageRef + afterPlaceholder;
+				
+				this.updatedContent = lines.join('\n');
+				
+				// Re-render the preview to show the change
+				this.renderNotePreview();
+				
+				new Notice(`Inserted ${this.selectedImage.filename} at line ${lineIndex + 1}`);
+			}
+		} catch (error) {
+			new Notice(`Failed to insert image: ${error}`);
+		}
+	}
+
+	private async saveImageToVault(image: ExtractedImage): Promise<string> {
+		try {
+			// Convert data URL to blob
+			const response = await fetch(image.imageData);
+			const blob = await response.blob();
+			const arrayBuffer = await blob.arrayBuffer();
+
+			// Create a timestamped filename like manual image paste behavior
+			const timestamp = new Date().toISOString().replace(/[:.]/g, '-').replace('T', '_').substring(0, 19);
+			const ext = '.png'; // Always PNG since we convert to canvas
+			const timestampedFilename = `extracted_image_${timestamp}${ext}`;
+
+			// Use simple attachment folder approach for now (API is giving malformed paths)
+			const attachmentPath = `attachments/${timestampedFilename}`;
+			
+			// Ensure parent directory exists
+			const parentPath = attachmentPath.substring(0, attachmentPath.lastIndexOf('/'));
+			if (parentPath && !this.app.vault.getAbstractFileByPath(parentPath)) {
+				await this.app.vault.createFolder(parentPath);
+			}
+
+			await this.app.vault.createBinary(attachmentPath, arrayBuffer);
+			
+			// Return just the filename for the wiki-link
+			const fileName = attachmentPath.substring(attachmentPath.lastIndexOf('/') + 1);
+			return fileName;
+		} catch (error) {
+			console.error("Error saving image:", error);
+			// Fallback to basic attachment folder approach
+			try {
+				// Re-fetch since arrayBuffer is out of scope
+				const response2 = await fetch(image.imageData);
+				const blob2 = await response2.blob();
+				const arrayBuffer2 = await blob2.arrayBuffer();
+				
+				const timestamp = new Date().toISOString().replace(/[:.]/g, '-').replace('T', '_').substring(0, 19);
+				const timestampedFilename = `extracted_image_${timestamp}.png`;
+				const attachmentPath = `attachments/${timestampedFilename}`;
+				
+				// Ensure attachments folder exists
+				if (!this.app.vault.getAbstractFileByPath('attachments')) {
+					await this.app.vault.createFolder('attachments');
+				}
+
+				await this.app.vault.createBinary(attachmentPath, arrayBuffer2);
+				return timestampedFilename;
+			} catch (fallbackError) {
+				throw new Error(`Failed to save ${image.filename}: ${fallbackError}`);
+			}
+		}
+	}
+
+	private async saveImage(image: ExtractedImage): Promise<void> {
+		try {
+			await this.saveImageToVault(image);
+			new Notice(`Saved ${image.filename} to vault`);
+		} catch (error) {
+			new Notice(`Failed to save ${image.filename}: ${error}`);
+		}
+	}
+
+	private async updateNoteFile(): Promise<void> {
+		try {
+			// Update the note file with the modified content
+			await this.app.vault.modify(this.noteFile, this.updatedContent);
+			new Notice(`Updated note with image placements`);
+			this.close();
+		} catch (error) {
+			new Notice(`Failed to update note: ${error}`);
+		}
+	}
+
+	private async saveAllImages(): Promise<void> {
+		for (const image of this.extractedImages) {
+			await this.saveImage(image);
+		}
+		new Notice(`Saved all ${this.extractedImages.length} images to vault`);
+	}
+
+	private async copyImageResults(): Promise<void> {
+		const results = [
+			`PDF Image Extraction Results`,
+			`================================`,
+			`Total images found: ${this.extractedImages.length}`,
+			``,
+			...this.extractedImages.map((img, idx) => 
+				`Image ${idx + 1}: ${img.filename} (${img.width}x${img.height}px) from page ${img.pageNumber}`
+			)
+		];
+		
+		try {
+			await navigator.clipboard.writeText(results.join('\n'));
+			new Notice('Image results copied to clipboard!');
+		} catch (error) {
+			console.log('=== IMAGE RESULTS ===');
+			console.log(results.join('\n'));
+			console.log('=== END RESULTS ===');
+			new Notice('Check console for results to copy');
 		}
 	}
 
