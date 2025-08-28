@@ -332,7 +332,9 @@ class ImageManager {
 			.substring(0, 19);
 		const finalFilename = filename || `embedded_image_${timestamp}.png`;
 
-		const imagePath = await this.saveImageToVault(imageData, finalFilename);
+		// Get attachment folder from Obsidian settings
+		const attachmentFolder = this.getAttachmentFolder(noteFile);
+		const imagePath = await this.saveImageToVault(imageData, finalFilename, attachmentFolder);
 		const imageMarkdown = `![[${finalFilename}]]`;
 
 		const content = await this.plugin.app.vault.read(noteFile);
@@ -341,6 +343,28 @@ class ImageManager {
 		lines.splice(lineIndex, 0, imageMarkdown);
 
 		await this.plugin.app.vault.modify(noteFile, lines.join("\n"));
+	}
+
+	/**
+	 * Get the appropriate attachment folder based on Obsidian settings
+	 */
+	private getAttachmentFolder(noteFile: TFile): string | undefined {
+		// Access Obsidian's file config settings
+		const config = (this.plugin.app as any).vault.config;
+		const attachmentFolderPath = config?.attachmentFolderPath;
+
+		if (!attachmentFolderPath) {
+			// No attachment folder configured, save to vault root
+			return undefined;
+		}
+
+		if (attachmentFolderPath === "./") {
+			// Same folder as current note
+			return noteFile.parent?.path || undefined;
+		}
+
+		// Specific folder path
+		return attachmentFolderPath;
 	}
 
 	replacePlaceholder(
@@ -526,6 +550,11 @@ class InteractiveEditor extends Modal {
 	private previewUpdateTimeout: NodeJS.Timeout | undefined;
 	private selectedImages: Set<number> = new Set();
 	private selectedImagesDisplay!: HTMLElement;
+	private isPreviewMode: boolean = false;
+	private scrollSyncPosition: number = 0;
+	private toggleButton!: HTMLButtonElement;
+	private editorContainer!: HTMLElement;
+	private previewContainer!: HTMLElement;
 
 	constructor(
 		app: App,
@@ -533,7 +562,9 @@ class InteractiveEditor extends Modal {
 		initialContent: string,
 		images: (ExtractedImage | StitchedImage)[],
 		onSave: (content: string) => void,
-		private sourcePdfPath?: string // Add optional PDF path
+		private sourcePdfPath?: string, // Add optional PDF path
+		private pageRangeStart?: number, // Starting page of range
+		private pageRangeEnd?: number // Ending page of range
 	) {
 		super(app);
 		this.content = initialContent;
@@ -561,20 +592,43 @@ class InteractiveEditor extends Modal {
 		this.modalEl.style.width = "90vw";
 		this.modalEl.style.height = "80vh";
 
-		// Left panel: Editor
-		const editorPanel = container.createDiv("editor-panel");
-		editorPanel.style.flex = "1";
-		editorPanel.style.display = "flex";
-		editorPanel.style.flexDirection = "column";
+		// Left panel: Combined Editor/Preview with toggle
+		const editorPreviewPanel = container.createDiv("editor-preview-panel");
+		editorPreviewPanel.style.flex = "1";
+		editorPreviewPanel.style.display = "flex";
+		editorPreviewPanel.style.flexDirection = "column";
 
-		editorPanel.createEl("h3", { text: "Markdown Editor" });
+		// Toggle button container
+		const toggleContainer = editorPreviewPanel.createDiv("toggle-container");
+		toggleContainer.style.display = "flex";
+		toggleContainer.style.alignItems = "center";
+		toggleContainer.style.marginBottom = "10px";
+		toggleContainer.style.gap = "10px";
 
-		this.editor = editorPanel.createEl("textarea");
+		toggleContainer.createEl("h3", { text: "Edit/Preview" });
+
+		const toggleButton = toggleContainer.createEl("button", {
+			text: "📝 Edit Mode",
+			cls: "mod-cta"
+		});
+		toggleButton.onclick = () => this.toggleEditPreview();
+
+		// Editor
+		const editorContainer = editorPreviewPanel.createDiv("editor-container");
+		editorContainer.style.flex = "1";
+		editorContainer.style.display = "flex";
+		editorContainer.style.flexDirection = "column";
+
+		this.editor = editorContainer.createEl("textarea");
 		this.editor.style.flex = "1";
 		this.editor.style.fontFamily = "monospace";
 		this.editor.style.fontSize = "14px";
 		this.editor.style.resize = "none";
 		this.editor.value = this.content;
+
+		// Store references for later use
+		this.toggleButton = toggleButton;
+		this.editorContainer = editorContainer;
 
 		this.editor.addEventListener("input", () => {
 			this.content = this.editor.value;
@@ -587,21 +641,31 @@ class InteractiveEditor extends Modal {
 			}, 300);
 		});
 
-		// Middle panel: Preview
-		const previewPanel = container.createDiv("preview-panel");
-		previewPanel.style.flex = "1";
-		previewPanel.style.display = "flex";
-		previewPanel.style.flexDirection = "column";
+		// Sync scroll position when scrolling in editor
+		this.editor.addEventListener("scroll", () => {
+			this.scrollSyncPosition = this.editor.scrollTop;
+		});
 
-		previewPanel.createEl("h3", { text: "Live Preview" });
+		// Preview (initially hidden)
+		const previewContainer = editorPreviewPanel.createDiv("preview-container");
+		previewContainer.style.flex = "1";
+		previewContainer.style.display = "none";
+		previewContainer.style.flexDirection = "column";
 
-		this.preview = previewPanel.createDiv("preview-content");
+		this.preview = previewContainer.createDiv("preview-content");
 		this.preview.style.flex = "1";
-		this.preview.style.border =
-			"1px solid var(--background-modifier-border)";
+		this.preview.style.border = "1px solid var(--background-modifier-border)";
 		this.preview.style.padding = "10px";
 		this.preview.style.overflow = "auto";
 		this.preview.style.backgroundColor = "var(--background-primary)";
+
+		// Store reference for later use
+		this.previewContainer = previewContainer;
+
+		// Sync scroll position when scrolling in preview
+		this.preview.addEventListener("scroll", () => {
+			this.scrollSyncPosition = this.preview.scrollTop;
+		});
 
 		// Right panel: Images
 		const imagePanel = container.createDiv("image-panel");
@@ -647,6 +711,90 @@ class InteractiveEditor extends Modal {
 		cancelButton.onclick = () => this.close();
 	}
 
+	/**
+	 * Toggle between edit and preview modes with scroll synchronization
+	 */
+	private toggleEditPreview(): void {
+		this.isPreviewMode = !this.isPreviewMode;
+
+		if (this.isPreviewMode) {
+			// Switch to preview mode
+			this.editorContainer.style.display = "none";
+			this.previewContainer.style.display = "flex";
+			this.toggleButton.textContent = "👁️ Preview Mode";
+			
+			// Update preview content
+			this.updatePreview().then(() => {
+				// Sync scroll position from editor to preview
+				this.preview.scrollTop = this.scrollSyncPosition;
+			}).catch(error => {
+				console.error("Failed to update preview:", error);
+			});
+		} else {
+			// Switch to edit mode  
+			this.previewContainer.style.display = "none";
+			this.editorContainer.style.display = "flex";
+			this.toggleButton.textContent = "📝 Edit Mode";
+			
+			// Sync scroll position from preview to editor
+			setTimeout(() => {
+				this.editor.scrollTop = this.scrollSyncPosition;
+			}, 50);
+		}
+	}
+
+	/**
+	 * Rotate an image 90 degrees clockwise
+	 */
+	private async rotateImage(imageIndex: number, imgElement: HTMLImageElement): Promise<void> {
+		try {
+			const image = this.images[imageIndex];
+			
+			// Create a canvas to rotate the image
+			const canvas = document.createElement("canvas");
+			const ctx = canvas.getContext("2d");
+			if (!ctx) {
+				throw new Error("Could not get canvas context");
+			}
+
+			// Create a new image object to load the current image data
+			const img = new Image();
+			img.onload = () => {
+				// Set canvas dimensions (swap width/height for 90-degree rotation)
+				canvas.width = img.height;
+				canvas.height = img.width;
+
+				// Rotate the canvas 90 degrees clockwise
+				ctx.translate(canvas.width / 2, canvas.height / 2);
+				ctx.rotate(Math.PI / 2);
+				ctx.drawImage(img, -img.width / 2, -img.height / 2);
+
+				// Get the rotated image data
+				const rotatedDataUrl = canvas.toDataURL("image/png");
+
+				// Update the image in our array
+				const updatedImage = {
+					...image,
+					imageData: rotatedDataUrl,
+					width: image.height, // Swap dimensions
+					height: image.width
+				};
+				this.images[imageIndex] = updatedImage;
+
+				// Update the display
+				imgElement.src = rotatedDataUrl;
+
+				// Show feedback
+				new Notice("Image rotated 90° clockwise");
+			};
+			
+			img.src = image.imageData;
+		} catch (error) {
+			console.error("Failed to rotate image:", error);
+			new Notice("Failed to rotate image");
+		}
+	}
+
 	private populateImageList(): void {
 		this.imageList.empty();
 
@@ -687,6 +835,26 @@ class InteractiveEditor extends Modal {
 					${image.width}×${image.height}px<br/>
 					${image.filename}`;
 			}
+
+			// Action buttons
+			const actionButtons = imageItem.createDiv("action-buttons");
+			actionButtons.style.display = "flex";
+			actionButtons.style.gap = "5px";
+			actionButtons.style.marginTop = "8px";
+			actionButtons.style.justifyContent = "center";
+
+			// Rotate button
+			const rotateButton = actionButtons.createEl("button", {
+				text: "↻ Rotate",
+				cls: "mod-cta"
+			});
+			rotateButton.style.fontSize = "11px";
+			rotateButton.style.padding = "2px 8px";
+			rotateButton.onclick = async (e) => {
+				e.preventDefault();
+				e.stopPropagation();
+				await this.rotateImage(index, img);
+			};
 
 			// Click to add placeholder or select for stitching
 			imageItem.onclick = async (e) => {
@@ -977,7 +1145,8 @@ class InteractiveEditor extends Modal {
 					`✅ Image captured from PDF! Added to image library.`
 				);
 			},
-			this.sourcePdfPath // Pass the source PDF path if available
+			this.sourcePdfPath, // Pass the source PDF path if available
+			this.pageRangeStart // Start at first page of processed range
 		);
 		pdfViewerModal.open();
 	}
@@ -1307,7 +1476,8 @@ class PDFViewerModal extends Modal {
 		app: App,
 		private plugin: GatedNotesPlugin,
 		onImageCaptured: (image: ExtractedImage | StitchedImage) => void,
-		private sourcePdfPath?: string // Optional source PDF path
+		private sourcePdfPath?: string, // Optional source PDF path
+		private startingPage?: number // Page to start viewing at
 	) {
 		super(app);
 		this.onImageCaptured = onImageCaptured;
@@ -1518,9 +1688,11 @@ class PDFViewerModal extends Modal {
 
 			this.currentPdf = await loadingTask.promise;
 			this.totalPages = this.currentPdf.numPages;
-			this.currentPage = 1;
+			this.currentPage = this.startingPage && this.startingPage >= 1 && this.startingPage <= this.totalPages 
+				? this.startingPage 
+				: 1;
 
-			// Render first page
+			// Render first page (or starting page)
 			await this.renderCurrentPage();
 			this.updatePageInfo();
 
@@ -6416,9 +6588,22 @@ ${selection}
 		const allNotes = this.app.vault.getMarkdownFiles();
 		const unusedImages: TFile[] = [];
 
+		// Get image database and all flashcard files
+		const imageDb = await this.getImageDb();
+		const allDeckFiles = this.app.vault
+			.getFiles()
+			.filter((f) => f.name.endsWith(DECK_FILE_NAME));
+
+		// Create a map from image file path to its hash for faster lookups
+		const imagePathToHash = new Map<string, string>();
+		for (const [hash, imageData] of Object.entries(imageDb)) {
+			imagePathToHash.set(imageData.path, hash);
+		}
+
 		for (const image of images) {
 			let isUsed = false;
 			const imageName = image.name;
+			const imageHash = imagePathToHash.get(image.path);
 
 			// Check all notes for references to this image
 			for (const note of allNotes) {
@@ -6440,6 +6625,34 @@ ${selection}
 					}
 				} catch (error) {
 					console.warn(`Could not read note ${note.path}:`, error);
+				}
+			}
+
+			// If not found in notes, check flashcards for image hash references
+			if (!isUsed && imageHash) {
+				const hashReference = `[[IMAGE HASH=${imageHash}]]`;
+				
+				for (const deckFile of allDeckFiles) {
+					try {
+						const graph = await this.readDeck(deckFile.path);
+						
+						// Check all cards in this deck
+						for (const card of Object.values(graph)) {
+							// Check front, back, and tag fields for image hash references
+							if (
+								card.front.includes(hashReference) ||
+								card.back.includes(hashReference) ||
+								card.tag.includes(hashReference)
+							) {
+								isUsed = true;
+								break;
+							}
+						}
+						
+						if (isUsed) break;
+					} catch (error) {
+						console.warn(`Could not read deck ${deckFile.path}:`, error);
+					}
 				}
 			}
 
@@ -7575,10 +7788,6 @@ class PdfToNoteModal extends Modal {
 	// Token limit controls
 	private limitMainTokensToggle!: ToggleComponent;
 	private mainTokensInput!: TextComponent;
-	private limitValidationTokensToggle!: ToggleComponent;
-	private validationTokensInput!: TextComponent;
-	private limitDeduplicationTokensToggle!: ToggleComponent;
-	private deduplicationTokensInput!: TextComponent;
 	private limitNuclearReviewTokensToggle!: ToggleComponent;
 	private nuclearReviewTokensInput!: TextComponent;
 	private limitCleanupTokensToggle!: ToggleComponent;
@@ -7589,6 +7798,12 @@ class PdfToNoteModal extends Modal {
 	private maxWidthInput!: TextComponent;
 	private pageRangeFromInput!: TextComponent;
 	private pageRangeToInput!: TextComponent;
+	private pageRangeErrorEl!: HTMLElement;
+	private totalPdfPages: number = 0;
+	private examplePdfPageRangeFromInput!: TextComponent;
+	private examplePdfPageRangeToInput!: TextComponent;
+	private examplePdfPageRangeErrorEl!: HTMLElement;
+	private examplePdfTotalPages: number = 0;
 	private includeTextToggle!: ToggleComponent;
 	private preloadStatusEl!: HTMLElement;
 	private isPreloadingImages = false;
@@ -7606,8 +7821,6 @@ class PdfToNoteModal extends Modal {
 	private futureContextPagesInput!: TextComponent;
 	private futureContextContainer!: HTMLElement;
 	private useNuclearOptionToggle!: ToggleComponent;
-	private nuclearPhaseSelect!: HTMLSelectElement;
-	private nuclearPhaseContainer!: HTMLElement;
 
 	constructor(private plugin: GatedNotesPlugin) {
 		super(plugin.app);
@@ -7805,12 +8018,12 @@ class PdfToNoteModal extends Modal {
 				let finalImageCount = mainImageCount;
 
 				if (useNuclearOption) {
-					// Nuclear option adds 4 passes:
+					// Nuclear option adds 2 passes:
 					// 1. Initial processing (existing cost)
 					// 2. Validation pass (small)
 					// 3. Deduplication pass (medium)
 					// 4. Final review pass (large)
-					const estimatedNuclearMultiplier = 4.5; // Conservative estimate
+					const estimatedNuclearMultiplier = 2.5; // Conservative estimate for 2-phase
 
 					// Simulate additional processing cost
 					finalPromptText = mainPromptText.repeat(
@@ -7864,14 +8077,43 @@ class PdfToNoteModal extends Modal {
 						this.toggleHybridControls();
 						this.toggleExamplePdfModeControls();
 						this.costUi?.update();
-						if (
-							this.processingModeSelect.value === "hybrid" &&
-							this.selectedFile
-						) {
-							this.preloadPdfImages();
-						}
+						// Image rendering will happen on-demand during Convert
 					});
 			});
+
+		// Page Range (available for both text and hybrid modes)
+		new Setting(modeSection)
+			.setName("Page Range")
+			.setDesc(
+				"Specify page range to process (leave empty for all pages)"
+			)
+			.addText((text) => {
+				this.pageRangeFromInput = text;
+				text.setPlaceholder("From (e.g., 1)");
+				text.inputEl.style.width = "80px";
+				text.onChange(() => {
+					this.validatePageRange();
+					this.updateSmartDefaults();
+					this.updateTextPreview();
+					this.costUi?.update();
+				});
+			})
+			.addText((text) => {
+				this.pageRangeToInput = text;
+				text.setPlaceholder("To (e.g., 10)");
+				text.inputEl.style.width = "80px";
+				text.onChange(() => {
+					this.validatePageRange();
+					this.updateSmartDefaults();
+					this.updateTextPreview();
+					this.costUi?.update();
+				});
+			});
+
+		// Add error display for page range validation
+		this.pageRangeErrorEl = modeSection.createDiv({
+			attr: { style: "color: var(--color-red); font-size: 0.9em; margin-top: 5px; display: none;" }
+		});
 
 		const hybridControls = modeSection.createDiv({
 			cls: "gn-hybrid-controls",
@@ -7881,24 +8123,6 @@ class PdfToNoteModal extends Modal {
 		});
 
 		hybridControls.createEl("h5", { text: "Hybrid Mode Settings" });
-
-		new Setting(hybridControls)
-			.setName("Page Range")
-			.setDesc(
-				"Specify page range to process (leave empty for all pages)"
-			)
-			.addText((text) => {
-				this.pageRangeFromInput = text;
-				text.setPlaceholder("From (e.g., 1)");
-				text.inputEl.style.width = "80px";
-				text.onChange(() => this.costUi?.update());
-			})
-			.addText((text) => {
-				this.pageRangeToInput = text;
-				text.setPlaceholder("To (e.g., 10)");
-				text.inputEl.style.width = "80px";
-				text.onChange(() => this.costUi?.update());
-			});
 
 		new Setting(hybridControls)
 			.setName("Image Quality")
@@ -8005,9 +8229,7 @@ class PdfToNoteModal extends Modal {
 
 			await this.costUi.update();
 
-			if (this.processingModeSelect.value === "hybrid") {
-				this.preloadPdfImages();
-			}
+			// Image rendering will happen on-demand during Convert if needed
 		} catch (error) {
 			const errorMessage =
 				error instanceof Error
@@ -8018,43 +8240,7 @@ class PdfToNoteModal extends Modal {
 		}
 	}
 
-	private preloadPdfImages(): void {
-		if (
-			!this.selectedFile ||
-			this.isPreloadingImages ||
-			this.renderedPages.length > 0
-		) {
-			return;
-		}
-
-		this.isPreloadingImages = true;
-		this.preloadStatusEl.empty();
-		this.preloadStatusEl.createSpan({ cls: "gn-spinner" });
-		this.preloadStatusEl.createSpan({ text: " Preloading images..." });
-		this.preloadStatusEl.style.display = "flex";
-
-		this.preloadingPromise = this.renderPdfPagesToImages((message) => {
-			this.preloadStatusEl.setText(`⏳ ${message}`);
-		})
-			.then(() => {
-				this.preloadStatusEl.setText(
-					`✅ Images preloaded for ${this.renderedPages.length} pages.`
-				);
-			})
-			.catch((error) => {
-				this.preloadStatusEl.setText(
-					`⚠️ Image preloading failed: ${error.message}`
-				);
-				this.plugin.logger(
-					LogLevel.NORMAL,
-					"PDF image preloading error:",
-					error
-				);
-			})
-			.finally(() => {
-				this.isPreloadingImages = false;
-			});
-	}
+	// Removed preloadPdfImages - images are now rendered on-demand during Convert
 
 	private async extractTextFromPdf(file: File): Promise<void> {
 		try {
@@ -8062,8 +8248,15 @@ class PdfToNoteModal extends Modal {
 			const typedArray = new Uint8Array(await file.arrayBuffer());
 			const pdf = await pdfjsLib.getDocument(typedArray).promise;
 
+			// Store total pages for validation
+			this.totalPdfPages = pdf.numPages;
+
+			// Respect page range for text extraction too
+			const fromPage = parseInt(this.pageRangeFromInput?.getValue() || "1");
+			const toPage = parseInt(this.pageRangeToInput?.getValue() || pdf.numPages.toString());
+
 			let fullText = "";
-			for (let i = 1; i <= pdf.numPages; i++) {
+			for (let i = Math.max(1, fromPage); i <= Math.min(pdf.numPages, toPage); i++) {
 				const page = await pdf.getPage(i);
 
 				// 1) Ask for marked content & let pdf.js pre-combine glyphs
@@ -8083,8 +8276,13 @@ class PdfToNoteModal extends Modal {
 
 			this.pdfViewer.empty();
 			const preview = this.pdfViewer.createEl("div");
+			const actualFrom = Math.max(1, fromPage);
+			const actualTo = Math.min(pdf.numPages, toPage);
+			const pageRangeText = actualFrom === actualTo 
+				? `page ${actualFrom}` 
+				: `pages ${actualFrom}-${actualTo}`;
 			preview.createEl("p", {
-				text: `✅ PDF processed: ${file.name} (${pdf.numPages} pages)`,
+				text: `✅ PDF processed: ${file.name} (${pageRangeText} of ${pdf.numPages} total)`,
 			});
 			const textPreview = preview.createEl("pre", {
 				attr: {
@@ -8092,6 +8290,10 @@ class PdfToNoteModal extends Modal {
 				},
 			});
 			textPreview.setText(fullText.substring(0, 500) + "...");
+
+			// Trigger validation and smart defaults now that we know the total pages
+			this.validatePageRange();
+			this.updateSmartDefaults();
 		} catch (error) {
 			throw new Error(`Failed to extract text: ${error}`);
 		}
@@ -8284,7 +8486,12 @@ class PdfToNoteModal extends Modal {
 	}
 
 	private extractParagraphsFromTextContent(items: any[]): string {
-		return this.extractTextWithColumnAwareness(items);
+		// Use marked content order (proper reading order) instead of spatial heuristics
+		return items
+			.filter((item: any) => item.str && typeof item.str === 'string' && item.str.trim())
+			.map((item: any) => item.str)
+			.join('')
+			.trim();
 	}
 
 	/**
@@ -8528,7 +8735,7 @@ class PdfToNoteModal extends Modal {
 				// Extract text content for this page using PDF.js
 				let textContent = "";
 				if (this.includeTextToggle?.getValue()) {
-					const pageTextContent = await page.getTextContent();
+					const pageTextContent = await page.getTextContent({ includeMarkedContent: true });
 					textContent = this.extractParagraphsFromTextContent(
 						pageTextContent.items
 					);
@@ -9059,16 +9266,9 @@ Return ONLY the final, perfected markdown text.`;
 	private async processPagesWithNuclearOption(
 		notice: Notice
 	): Promise<{ response: string; usage?: OpenAI.CompletionUsage }> {
-		const processedResults: string[] = [];
-		const processedHashes = new Set<string>();
-		const useContext =
-			this.useNuclearOptionToggle?.getValue() ||
-			this.useContextToggle?.getValue() ||
-			false;
-		const contextPageCount = useContext
-			? parseInt(this.contextPagesInput?.getValue() || "1") || 1
-			: 0;
-		const maxPhase = parseInt(this.nuclearPhaseSelect?.value || "4");
+		const guidance = this.guidanceInput?.getValue() || "";
+		// Always run full 2-phase when enabled (no partial phases)
+		const maxPhase = 2;
 
 		const totalUsage: OpenAI.CompletionUsage = {
 			prompt_tokens: 0,
@@ -9084,184 +9284,169 @@ Return ONLY the final, perfected markdown text.`;
 			}
 		};
 
-		// Phase 1: Process each page with minimal context
+		// Phase 1: Process each page with multimodal (page image + marked content text)
+		const phase1Pages: Array<{ page: number; markdown: string }> = [];
+		
 		for (let i = 0; i < this.renderedPages.length; i++) {
 			const pageData = this.renderedPages[i];
 			notice.setMessage(
 				`🎯 Nuclear Phase 1: Processing page ${i + 1}/${
 					this.renderedPages.length
-				}...`
+				} (multimodal)...`
 			);
 
-			// Get minimal context
-			let previousBoundary: string | undefined;
-			let previousStructure:
-				| { headers: string[]; topics: string[] }
-				| undefined;
-
-			if (useContext && i > 0 && processedResults[i - 1]) {
-				previousBoundary = this.extractBoundaryContent(
-					processedResults[i - 1],
-					"end",
-					2
-				);
-				previousStructure = this.extractStructuralInfo(
-					processedResults[i - 1]
-				);
-			}
-
-			// Future preview (if enabled)
-			let futurePreview: string | undefined;
-			if (
-				i < this.renderedPages.length - 1 &&
-				this.renderedPages[i + 1].textContent
-			) {
-				const nextPageText = this.renderedPages[
-					i + 1
-				].textContent!.slice(0, 200);
-				futurePreview = nextPageText.split(/[.!?]/)[0];
-			}
-
-			// Build prompt with minimal context
-			const promptText = this.buildMinimalContextPrompt(
-				pageData.pageNum,
+			const result = await this.runPhase1PerPage(
+				pageData.imageData,
 				pageData.textContent || "",
-				previousBoundary,
-				previousStructure,
-				futurePreview,
-				processedHashes,
-				this.guidanceInput?.getValue()
-			);
-
-			const imageArray = this.buildImageArrayForLlm(pageData.imageData);
-			const maxTokens = this.getMaxTokensForMainProcessing();
-			const result = await this.plugin.sendToLlm(
-				promptText,
-				imageArray,
-				maxTokens ? { maxTokens } : {}
+				guidance
 			);
 			addToTotalUsage(result.usage);
 
-			if (!result.content) {
-				throw new Error(
-					`Page ${pageData.pageNum} failed: AI returned empty content`
-				);
-			}
-
-			let pageContent = result.content
-				.replace(/^\s*```(?:markdown)?\s*([\s\S]*?)\s*```\s*$/s, "$1")
-				.trim();
-
-			// Track content hash to avoid repetition
-			const contentHash = this.hashContent(pageContent);
-			processedHashes.add(contentHash);
-
-			processedResults.push(pageContent);
+			phase1Pages.push({
+				page: pageData.pageNum,
+				markdown: result.content || ""
+			});
 		}
 
 		// Early return if stopping after Phase 1
 		if (maxPhase <= 1) {
 			notice.setMessage(`✅ Nuclear processing complete (Phase 1 only)!`);
 			return {
-				response: processedResults.join("\n\n"),
+				response: phase1Pages.map(p => p.markdown).join("\n\n"),
 				usage: totalUsage,
 			};
 		}
 
-		// Phase 2: Validate each page against previous
-		notice.setMessage(`🔍 Nuclear Phase 2: Validating page connections...`);
-		for (let i = 1; i < processedResults.length; i++) {
-			const validationPrompt = this.buildValidationPrompt(
-				processedResults[i],
-				processedResults[i - 1],
-				i + 1
-			);
-
-			const validationMaxTokens = this.getMaxTokensForValidation();
-			const validation = await this.plugin.sendToLlm(
-				validationPrompt,
-				undefined,
-				validationMaxTokens ? { maxTokens: validationMaxTokens } : {}
-			);
-			addToTotalUsage(validation.usage);
-			if (validation.content?.includes("ISSUES:")) {
-				console.warn(
-					`Page ${i + 1} validation issues:`,
-					validation.content
-				);
-			}
-		}
-
-		// Early return if stopping after Phase 2
-		if (maxPhase <= 2) {
-			notice.setMessage(`✅ Nuclear processing complete (Phase 2)!`);
-			return {
-				response: processedResults.join("\n\n"),
-				usage: totalUsage,
-			};
-		}
-
-		// Phase 3: Deduplication pass
-		notice.setMessage(`🧹 Nuclear Phase 3: Deduplicating content...`);
-		const combinedContent = processedResults.join("\n\n");
-		const deduplicationPrompt =
-			this.buildDeduplicationPrompt(combinedContent);
-
-		const dedupMaxTokens = this.getMaxTokensForDeduplication(
-			combinedContent.length
-		);
-		const dedupResult = await this.plugin.sendToLlm(
-			deduplicationPrompt,
-			undefined,
-			dedupMaxTokens ? { maxTokens: dedupMaxTokens } : {}
-		);
-		addToTotalUsage(dedupResult.usage);
-
-		if (!dedupResult.content) {
-			console.warn(
-				"Deduplication failed, using original combined content"
-			);
-		}
-
-		const cleanedContent = !dedupResult.content
-			? combinedContent
-			: dedupResult.content;
-
-		// Early return if stopping after Phase 3
-		if (maxPhase <= 3) {
-			notice.setMessage(`✅ Nuclear processing complete (Phase 3)!`);
-			return { response: cleanedContent, usage: totalUsage };
-		}
-
-		// Phase 4: Nuclear final review
-		notice.setMessage(`⚡ Nuclear Phase 4: Final comprehensive review...`);
-		let fullPdfText = "";
-		for (const pageData of this.renderedPages) {
-			if (pageData.textContent) {
-				fullPdfText += `${pageData.textContent}\n\n`;
-			}
-		}
-
-		const nuclearReviewPrompt = this.buildNuclearReviewPrompt(
-			cleanedContent,
-			fullPdfText
-		);
-
-		const nuclearMaxTokens = this.getMaxTokensForNuclearReview(
-			cleanedContent.length
-		);
-		const finalResult = await this.plugin.sendToLlm(
-			nuclearReviewPrompt,
-			undefined,
-			nuclearMaxTokens ? { maxTokens: nuclearMaxTokens } : {}
-		);
+		// Phase 2: Final reconciliation pass
+		notice.setMessage(`⚡ Nuclear Phase 2: Final reconciliation...`);
+		
+		// Get full marked content text for all pages
+		const fullMarkedText = await this.getFullMarkedText();
+		
+		const finalResult = await this.runPhase2Final({
+			guidance,
+			phase1Pages,
+			fullMarkedText,
+			titleHint: this.selectedFile?.name.replace(/\.[^.]+$/, "") || "Document"
+		});
 		addToTotalUsage(finalResult.usage);
 
 		notice.setMessage(`✅ Nuclear processing complete!`);
-		const finalContent = !finalResult.content
-			? cleanedContent
-			: finalResult.content;
-		return { response: finalContent, usage: totalUsage };
+		return { response: finalResult.content || "", usage: totalUsage };
+	}
+
+	/**
+	 * Phase 1: Process a single page with multimodal (image + marked content text)
+	 */
+	private async runPhase1PerPage(
+		pageImageDataUrl: string,
+		pageMarkedText: string,
+		guidance: string
+	): Promise<{ content: string; usage?: OpenAI.CompletionUsage }> {
+		const systemPrompt = `You convert a single PDF page into clean markdown. ${guidance}
+
+Guidelines:
+- Convert this page to clean markdown preserving structure and meaning
+- Use ![IMAGE_PLACEHOLDER] for figures, tables, charts, and infographics
+- Keep callouts and sidebars as block quotes or formatted sections
+- Preserve headings and subheadings with appropriate markdown levels
+- Do not include page numbers, headers, or footers
+- Focus on the substantive content of this page only`;
+
+		const userPrompt = `Here is this page's text content (in proper reading order):\n\n${pageMarkedText}\n\nNow produce clean markdown for this page, using the page image for visual context and structure:`;
+		const fullPrompt = `${systemPrompt}\n\n${userPrompt}`;
+
+		const maxTokens = this.getMaxTokensForMainProcessing();
+		return await this.plugin.sendToLlm(
+			fullPrompt,
+			pageImageDataUrl,
+			maxTokens ? { maxTokens } : {}
+		);
+	}
+
+	/**
+	 * Get concatenated marked content text for the whole PDF (no page breaks)
+	 */
+	private async getFullMarkedText(): Promise<string> {
+		if (!this.selectedFile) {
+			return "";
+		}
+
+		const pdfjsLib = await this.loadPdfJs();
+		const typedArray = new Uint8Array(await this.selectedFile.arrayBuffer());
+		const pdf = await pdfjsLib.getDocument(typedArray).promise;
+
+		const chunks: string[] = [];
+		for (let i = 1; i <= pdf.numPages; i++) {
+			const page = await pdf.getPage(i);
+			const textContent = await page.getTextContent({ includeMarkedContent: true });
+			
+			// Join items in the order PDF.js provides (marked content order)
+			const pageText = textContent.items
+				.filter((item: any) => item.str && typeof item.str === 'string' && item.str.trim())
+				.map((item: any) => item.str)
+				.join('')
+				.trim();
+			
+			if (pageText) {
+				chunks.push(pageText);
+			}
+		}
+		
+		// Join with double newlines (light page separation)
+		return chunks.join('\n\n');
+	}
+
+	/**
+	 * Phase 2: Final reconciliation pass that sees everything
+	 */
+	private async runPhase2Final(inputs: {
+		guidance: string;
+		phase1Pages: Array<{ page: number; markdown: string }>;
+		fullMarkedText: string;
+		titleHint: string;
+	}): Promise<{ content: string; usage?: OpenAI.CompletionUsage }> {
+		const { guidance, phase1Pages, fullMarkedText, titleHint } = inputs;
+
+		const systemPrompt = `You are producing the FINAL single markdown note from a PDF document.
+${guidance}
+
+Rules:
+- Output a single cohesive markdown document (no page headers or breaks)
+- Reorder content logically if needed (titles → body → sidebars/callouts)  
+- Keep callouts/biographies as intact blocks (use blockquotes or formatted sections)
+- Use ![IMAGE_PLACEHOLDER] exactly where figures/tables/infographics belong
+- Do not include headers/footers/page numbers or navigational elements
+- Do not include "See also" sections or similar boilerplate
+- Do not invent content - stick to what's in the source material
+- Prefer exact quotes when appropriate, especially for important statements
+- Ensure all substantive textual content from SOURCE_TEXT appears somewhere in the final note
+- The page drafts may be incomplete or mis-ordered - use them as helpful hints but rely on SOURCE_TEXT for completeness`;
+
+		// Prepare the user content
+		const userParts: string[] = [];
+		
+		if (titleHint) {
+			userParts.push(`# ${titleHint}\n`);
+		}
+		
+		userParts.push(`## SOURCE_TEXT (marked-content, all pages, proper reading order)\n${fullMarkedText}`);
+		
+		userParts.push(`## PAGE_DRAFTS (Phase 1 outputs; may be incomplete or mis-ordered)\n${
+			phase1Pages
+				.sort((a, b) => a.page - b.page)
+				.map(p => `### Page ${p.page}\n${p.markdown}`)
+				.join('\n\n')
+		}`);
+
+		const fullPrompt = `${systemPrompt}\n\n${userParts.join('\n\n')}`;
+
+		const maxTokens = this.getMaxTokensForNuclearReview(fullMarkedText.length);
+		return await this.plugin.sendToLlm(
+			fullPrompt,
+			undefined,
+			maxTokens ? { maxTokens } : {}
+		);
 	}
 
 	private async handleConvert(): Promise<void> {
@@ -9334,7 +9519,7 @@ Return ONLY the final, perfected markdown text.`;
 		} mode.\n${finalCost}`;
 
 		if (useNuclearOption) {
-			confirmMessage += `\n\n⚡ NUCLEAR OPTION ENABLED ⚡\nThis uses 4-pass processing for maximum quality:\n• Phase 1: Page-by-page with minimal context\n• Phase 2: Validation of page connections\n• Phase 3: Content deduplication\n• Phase 4: Comprehensive final review\n\nThis provides the highest quality output with minimal manual cleanup needed.`;
+			confirmMessage += `\n\n⚡ 2-PHASE APPROACH ENABLED ⚡\nThis uses 2-phase processing for maximum quality:\n• Phase 1: Per-page multimodal analysis\n• Phase 2: Final reconciliation with complete source text\n\nThis provides the highest quality output with minimal manual cleanup needed.`;
 		}
 
 		confirmMessage += "\n\nProceed?";
@@ -9507,10 +9692,13 @@ Return ONLY the final, perfected markdown text.`;
 
 				// Show enhanced interactive editor
 				setTimeout(() => {
-					// Get PDF path from selected file
+					// Get PDF path from selected file and page range info
 					const pdfPath = this.selectedFile
 						? URL.createObjectURL(this.selectedFile)
 						: undefined;
+					
+					const pageRangeStart = parseInt(this.pageRangeFromInput?.getValue() || "1");
+					const pageRangeEnd = parseInt(this.pageRangeToInput?.getValue() || "999999");
 
 					new InteractiveEditor(
 						this.app,
@@ -9567,7 +9755,9 @@ Return ONLY the final, perfected markdown text.`;
 								`✅ Note created with ${allImages.length} images processed!`
 							);
 						},
-						pdfPath // Pass the PDF path
+						pdfPath, // Pass the PDF path
+						pageRangeStart, // Pass the starting page
+						pageRangeEnd // Pass the ending page
 					).open();
 				}, 100);
 			} else {
@@ -9893,6 +10083,38 @@ Return ONLY the final, perfected markdown text.`;
 				style: "font-size: 12px; color: var(--text-muted); margin-top: 5px;",
 			},
 		});
+
+		// Example PDF Page Range (only shows if example PDF mode is visible)
+		const examplePageRangeContainer = this.examplePdfModeContainer.createDiv({
+			attr: { style: "margin-top: 15px;" }
+		});
+
+		const examplePageRangeSetting = new Setting(examplePageRangeContainer)
+			.setName("Example PDF Page Range")
+			.setDesc("Specify page range for example PDF (leave empty for all pages)")
+			.addText((text) => {
+				this.examplePdfPageRangeFromInput = text;
+				text.setPlaceholder("From (e.g., 32)");
+				text.inputEl.style.width = "80px";
+				text.onChange(() => {
+					this.validateExamplePdfPageRange();
+					this.costUi?.update();
+				});
+			})
+			.addText((text) => {
+				this.examplePdfPageRangeToInput = text;
+				text.setPlaceholder("To (e.g., 33)");
+				text.inputEl.style.width = "80px";
+				text.onChange(() => {
+					this.validateExamplePdfPageRange();
+					this.costUi?.update();
+				});
+			});
+
+		// Add error display for example PDF page range validation
+		this.examplePdfPageRangeErrorEl = examplePageRangeContainer.createDiv({
+			attr: { style: "color: var(--color-red); font-size: 0.9em; margin-top: 5px; display: none;" }
+		});
 	}
 
 	private setupContextControlSection(): void {
@@ -9998,68 +10220,16 @@ Return ONLY the final, perfected markdown text.`;
 					"width: 100px; margin-left: 20px;";
 			});
 
-		// Validation Token Limit (only show if nuclear option is enabled)
-		const validationTokenContainer = tokenSection.createDiv();
-		validationTokenContainer.style.display = "none";
-		validationTokenContainer.addClass("gn-nuclear-token-control");
 
-		new Setting(validationTokenContainer)
-			.setName("Limit Validation Tokens")
-			.setDesc("Limit tokens for page validation checks")
-			.addToggle((toggle) => {
-				this.limitValidationTokensToggle = toggle;
-				toggle.setValue(true).onChange((value) => {
-					this.validationTokensInput.inputEl.style.display = value
-						? "block"
-						: "none";
-				});
-			});
 
-		new Setting(validationTokenContainer)
-			.setClass("gn-token-input")
-			.addText((text) => {
-				this.validationTokensInput = text;
-				text
-					.setPlaceholder("500")
-					.setValue("500").inputEl.style.cssText =
-					"width: 100px; margin-left: 20px;";
-			});
+		// Phase 2 Reconciliation Token Limit (2-phase approach)
+		const phase2TokenContainer = tokenSection.createDiv();
+		phase2TokenContainer.style.display = "none";
+		phase2TokenContainer.addClass("gn-nuclear-token-control");
 
-		// Deduplication Token Limit (nuclear option)
-		const dedupTokenContainer = tokenSection.createDiv();
-		dedupTokenContainer.style.display = "none";
-		dedupTokenContainer.addClass("gn-nuclear-token-control");
-
-		new Setting(dedupTokenContainer)
-			.setName("Limit Deduplication Tokens")
-			.setDesc("Limit tokens for content deduplication")
-			.addToggle((toggle) => {
-				this.limitDeduplicationTokensToggle = toggle;
-				toggle.setValue(false).onChange((value) => {
-					this.deduplicationTokensInput.inputEl.style.display = value
-						? "block"
-						: "none";
-				});
-			});
-
-		new Setting(dedupTokenContainer)
-			.setClass("gn-token-input")
-			.addText((text) => {
-				this.deduplicationTokensInput = text;
-				text
-					.setPlaceholder("8000")
-					.setValue("8000").inputEl.style.cssText =
-					"width: 100px; margin-left: 20px; display: none;";
-			});
-
-		// Nuclear Review Token Limit (nuclear option)
-		const nuclearTokenContainer = tokenSection.createDiv();
-		nuclearTokenContainer.style.display = "none";
-		nuclearTokenContainer.addClass("gn-nuclear-token-control");
-
-		new Setting(nuclearTokenContainer)
-			.setName("Limit Nuclear Review Tokens")
-			.setDesc("Limit tokens for final nuclear review")
+		new Setting(phase2TokenContainer)
+			.setName("Limit Phase 2 Reconciliation Tokens")
+			.setDesc("Limit tokens for final reconciliation pass")
 			.addToggle((toggle) => {
 				this.limitNuclearReviewTokensToggle = toggle;
 				toggle.setValue(false).onChange((value) => {
@@ -10067,10 +10237,7 @@ Return ONLY the final, perfected markdown text.`;
 						? "block"
 						: "none";
 				});
-			});
-
-		new Setting(nuclearTokenContainer)
-			.setClass("gn-token-input")
+			})
 			.addText((text) => {
 				this.nuclearReviewTokensInput = text;
 				text
@@ -10139,20 +10306,6 @@ Return ONLY the final, perfected markdown text.`;
 		return isNaN(value) ? 4000 : value;
 	}
 
-	private getMaxTokensForValidation(): number | null {
-		if (!this.limitValidationTokensToggle?.getValue()) return null;
-		const value = parseInt(this.validationTokensInput?.getValue() || "500");
-		return isNaN(value) ? 500 : value;
-	}
-
-	private getMaxTokensForDeduplication(contentLength: number): number | null {
-		if (!this.limitDeduplicationTokensToggle?.getValue()) return null;
-		const inputValue = parseInt(
-			this.deduplicationTokensInput?.getValue() || "8000"
-		);
-		const defaultValue = Math.max(8000, contentLength / 2);
-		return isNaN(inputValue) ? defaultValue : inputValue;
-	}
 
 	private getMaxTokensForNuclearReview(contentLength: number): number | null {
 		if (!this.limitNuclearReviewTokensToggle?.getValue()) return null;
@@ -10169,10 +10322,171 @@ Return ONLY the final, perfected markdown text.`;
 		return isNaN(value) ? 8000 : value;
 	}
 
+	/**
+	 * Validate page range inputs and show errors if invalid
+	 */
+	private validatePageRange(): boolean {
+		if (this.totalPdfPages === 0) {
+			// No PDF loaded yet, skip validation
+			this.pageRangeErrorEl.style.display = "none";
+			return true;
+		}
+
+		const fromValue = this.pageRangeFromInput?.getValue()?.trim() || "";
+		const toValue = this.pageRangeToInput?.getValue()?.trim() || "";
+
+		// If both empty, it's valid (means all pages)
+		if (!fromValue && !toValue) {
+			this.pageRangeErrorEl.style.display = "none";
+			return true;
+		}
+
+		const fromPage = parseInt(fromValue) || 1;
+		const toPage = parseInt(toValue) || this.totalPdfPages;
+
+		let errorMessage = "";
+
+		// Validate from page
+		if (fromPage < 1) {
+			errorMessage = "Start page must be 1 or greater";
+		} else if (fromPage > this.totalPdfPages) {
+			errorMessage = `Start page cannot exceed ${this.totalPdfPages}`;
+		} 
+		// Validate to page
+		else if (toPage < 1) {
+			errorMessage = "End page must be 1 or greater";
+		} else if (toPage > this.totalPdfPages) {
+			errorMessage = `End page cannot exceed ${this.totalPdfPages}`;
+		}
+		// Validate range order
+		else if (fromPage > toPage) {
+			errorMessage = "Start page cannot be greater than end page";
+		}
+
+		if (errorMessage) {
+			this.pageRangeErrorEl.textContent = errorMessage;
+			this.pageRangeErrorEl.style.display = "block";
+			return false;
+		} else {
+			this.pageRangeErrorEl.style.display = "none";
+			return true;
+		}
+	}
+
+	/**
+	 * Validate example PDF page range inputs and show errors if invalid
+	 */
+	private validateExamplePdfPageRange(): boolean {
+		if (this.examplePdfTotalPages === 0) {
+			// No example PDF loaded yet, skip validation
+			this.examplePdfPageRangeErrorEl.style.display = "none";
+			return true;
+		}
+
+		const fromValue = this.examplePdfPageRangeFromInput?.getValue()?.trim() || "";
+		const toValue = this.examplePdfPageRangeToInput?.getValue()?.trim() || "";
+
+		// If both empty, it's valid (means all pages)
+		if (!fromValue && !toValue) {
+			this.examplePdfPageRangeErrorEl.style.display = "none";
+			return true;
+		}
+
+		const fromPage = parseInt(fromValue) || 1;
+		const toPage = parseInt(toValue) || this.examplePdfTotalPages;
+
+		let errorMessage = "";
+
+		// Validate from page
+		if (fromPage < 1) {
+			errorMessage = "Start page must be 1 or greater";
+		} else if (fromPage > this.examplePdfTotalPages) {
+			errorMessage = `Start page cannot exceed ${this.examplePdfTotalPages}`;
+		} 
+		// Validate to page
+		else if (toPage < 1) {
+			errorMessage = "End page must be 1 or greater";
+		} else if (toPage > this.examplePdfTotalPages) {
+			errorMessage = `End page cannot exceed ${this.examplePdfTotalPages}`;
+		}
+		// Validate range order
+		else if (fromPage > toPage) {
+			errorMessage = "Start page cannot be greater than end page";
+		}
+
+		if (errorMessage) {
+			this.examplePdfPageRangeErrorEl.textContent = errorMessage;
+			this.examplePdfPageRangeErrorEl.style.display = "block";
+			return false;
+		} else {
+			this.examplePdfPageRangeErrorEl.style.display = "none";
+			return true;
+		}
+	}
+
+	/**
+	 * Get the actual selected page range as numbers
+	 */
+	private getSelectedPageRange(): { from: number; to: number; count: number } {
+		const fromValue = this.pageRangeFromInput?.getValue()?.trim() || "";
+		const toValue = this.pageRangeToInput?.getValue()?.trim() || "";
+
+		const fromPage = parseInt(fromValue) || 1;
+		const toPage = parseInt(toValue) || this.totalPdfPages || 1;
+
+		const actualFrom = Math.max(1, fromPage);
+		const actualTo = Math.min(this.totalPdfPages || 1, toPage);
+		const count = Math.max(0, actualTo - actualFrom + 1);
+
+		return { from: actualFrom, to: actualTo, count };
+	}
+
+	/**
+	 * Update smart defaults for 2-phase approach based on selected page count
+	 */
+	private updateSmartDefaults(): void {
+		if (!this.useNuclearOptionToggle) return;
+
+		const { count } = this.getSelectedPageRange();
+		const shouldEnable2Phase = count >= 2;
+		
+		// Only auto-change if user hasn't manually overridden
+		// (We could track this with a flag if needed, for now just set the smart default)
+		if (count === 1 && this.useNuclearOptionToggle.getValue()) {
+			// Don't auto-disable if user explicitly enabled it
+			return;
+		}
+		
+		this.useNuclearOptionToggle.setValue(shouldEnable2Phase);
+		
+		// Update visibility of related controls
+		this.updateTokenControlVisibility();
+	}
+
+	/**
+	 * Update text preview based on current page range
+	 */
+	private updateTextPreview(): void {
+		if (this.selectedFile && this.validatePageRange()) {
+			// Refresh text extraction for the new page range
+			this.extractTextFromPdf(this.selectedFile).catch(error => {
+				console.error("Failed to update text preview:", error);
+			});
+			
+			// Clear preloaded images so they get refreshed for new page range
+			if (this.renderedPages.length > 0) {
+				this.renderedPages = [];
+				// Reset preloading status
+				this.isPreloadingImages = false;
+				this.preloadingPromise = null;
+			}
+		}
+	}
+
 	private setupNuclearOptionSection(): void {
 		const nuclearSection = this.contentEl.createDiv();
 		nuclearSection.createEl("h4", {
-			text: "⚡ Nuclear Option (Maximum Quality)",
+			text: "⚡ 2-Phase Approach (Maximum Quality)",
 		});
 
 		const nuclearWarning = nuclearSection.createEl("div", {
@@ -10187,50 +10501,28 @@ Return ONLY the final, perfected markdown text.`;
 			},
 		});
 		nuclearWarning.createEl("p", {
-			text: "Nuclear option uses 4-pass processing with validation and comprehensive review. This can cost 3-5x more tokens than standard processing but provides maximum accuracy with minimal manual cleanup needed.",
+			text: "2-Phase approach uses per-page multimodal analysis followed by final reconciliation. This costs 2-3x more tokens than standard processing but provides maximum accuracy with minimal manual cleanup needed.",
 			attr: { style: "margin: 0; font-size: 0.9em;" },
 		});
 
 		new Setting(nuclearSection)
-			.setName("Enable Nuclear Option")
+			.setName("Enable 2-Phase Approach")
 			.setDesc(
-				"4-phase processing: Minimal Context → Validation → Deduplication → Final Review"
+				"Per-Page Multimodal → Final Reconciliation for maximum quality"
 			)
 			.addToggle((toggle) => {
 				this.useNuclearOptionToggle = toggle;
 				toggle.setValue(false).onChange((value) => {
 					if (value) {
-						// Auto-enable context when nuclear option is enabled
+						// Auto-enable context when 2-phase approach is enabled
 						this.useContextToggle?.setValue(true);
 						this.contextPagesContainer.style.display = "block";
-						this.nuclearPhaseContainer.style.display = "block";
-					} else {
-						this.nuclearPhaseContainer.style.display = "none";
 					}
 					this.updateTokenControlVisibility();
 					this.costUi?.update();
 				});
 			});
 
-		// Nuclear phase selection
-		this.nuclearPhaseContainer = nuclearSection.createDiv();
-		this.nuclearPhaseContainer.style.display = "none";
-
-		new Setting(this.nuclearPhaseContainer)
-			.setName("Stop After Phase")
-			.setDesc(
-				"Choose which phase to stop at (Phase 1 recommended for preserving image placeholders)"
-			)
-			.addDropdown((dropdown) => {
-				this.nuclearPhaseSelect = dropdown.selectEl;
-				dropdown
-					.addOption("1", "Phase 1: Page Processing Only")
-					.addOption("2", "Phase 2: + Validation")
-					.addOption("3", "Phase 3: + Deduplication")
-					.addOption("4", "Phase 4: + Final Review (Full)")
-					.setValue("1")
-					.onChange(() => this.costUi?.update());
-			});
 	}
 
 	private openExampleNoteSelector(displayElement: HTMLElement): void {
@@ -10345,11 +10637,22 @@ Return ONLY the final, perfected markdown text.`;
 			);
 			const pdf = await pdfjsLib.getDocument(typedArray).promise;
 
+			// Store total pages for validation
+			this.examplePdfTotalPages = pdf.numPages;
+			
+			// Validate page range now that we know total pages
+			this.validateExamplePdfPageRange();
+
 			this.examplePdfPages = [];
 
-			// Process all pages of the example PDF
-			const maxPages = pdf.numPages;
-			for (let pageNum = 1; pageNum <= maxPages; pageNum++) {
+			// Respect the selected page range for example PDF
+			const fromPage = parseInt(this.examplePdfPageRangeFromInput?.getValue() || "1");
+			const toPage = parseInt(this.examplePdfPageRangeToInput?.getValue() || pdf.numPages.toString());
+			const actualFrom = Math.max(1, fromPage);
+			const actualTo = Math.min(pdf.numPages, toPage);
+
+			// Process selected pages of the example PDF
+			for (let pageNum = actualFrom; pageNum <= actualTo; pageNum++) {
 				const page = await pdf.getPage(pageNum);
 
 				// Render page to canvas
@@ -10375,7 +10678,7 @@ Return ONLY the final, perfected markdown text.`;
 				// Always extract text content for example PDF (might be used in text-only mode)
 				let textContent = "";
 				try {
-					const pageTextContent = await page.getTextContent();
+					const pageTextContent = await page.getTextContent({ includeMarkedContent: true });
 					textContent = this.extractParagraphsFromTextContent(
 						pageTextContent.items
 					);
@@ -10545,29 +10848,18 @@ Return ONLY the final, perfected markdown text.`;
 			const typedArray = new Uint8Array(arrayBuffer);
 			const pdf = await pdfjsLib.getDocument(typedArray).promise;
 
-			// Debug: Print PDF object and available operations
-			console.log("=== PDF DEBUG INFO ===");
-			console.log("PDF object:", pdf);
-			console.log("PDF.js Library:", pdfjsLib);
-			console.log("Available OPS:", pdfjsLib.OPS);
-			console.log("OPS keys:", Object.keys(pdfjsLib.OPS));
-			console.log("Image-related OPS:", {
-				paintImageXObject: pdfjsLib.OPS.paintImageXObject,
-				paintJpegXObject: pdfjsLib.OPS.paintJpegXObject,
-				paintInlineImageXObject: pdfjsLib.OPS.paintInlineImageXObject,
-				paintImageMaskXObject: pdfjsLib.OPS.paintImageMaskXObject,
-			});
-
 			const extractedImages: ExtractedImage[] = [];
 			const imageCount = { current: 0 };
 
-			for (let pageNum = 1; pageNum <= pdf.numPages; pageNum++) {
-				// Check all pages
-				const page = await pdf.getPage(pageNum);
+			// Respect the selected page range
+			const fromPage = parseInt(this.pageRangeFromInput?.getValue() || "1");
+			const toPage = parseInt(this.pageRangeToInput?.getValue() || pdf.numPages.toString());
+			const actualFrom = Math.max(1, fromPage);
+			const actualTo = Math.min(pdf.numPages, toPage);
 
-				// Debug: Print page object
-				console.log(`=== PAGE ${pageNum} DEBUG INFO ===`);
-				console.log("Page object:", page);
+			for (let pageNum = actualFrom; pageNum <= actualTo; pageNum++) {
+				// Check only selected pages
+				const page = await pdf.getPage(pageNum);
 
 				const pageImages = await this.extractImagesFromPage(
 					page,
@@ -11286,454 +11578,6 @@ class ExampleNoteSuggester extends Modal {
 			}
 		} else if (e.key === "Escape") {
 			this.close();
-		}
-	}
-
-	onClose() {
-		this.contentEl.empty();
-	}
-}
-
-/**
- * A modal for assisting users in placing extracted images from PDF into their note.
- */
-class ImagePlacementModal extends Modal {
-	private imageListEl!: HTMLElement;
-	private notePreviewEl!: HTMLElement;
-	private selectedImage: ExtractedImage | null = null;
-	private placeholders: {
-		lineIndex: number;
-		placeholderIndex: number;
-		element: HTMLElement;
-	}[] = [];
-	private updatedContent: string;
-
-	constructor(
-		app: App,
-		private extractedImages: ExtractedImage[],
-		private noteFile: TFile,
-		private noteContent: string
-	) {
-		super(app);
-		this.updatedContent = noteContent;
-
-		// Make modal larger and draggable
-		this.modalEl.addClass("gn-image-placement-modal");
-	}
-
-	onOpen() {
-		makeModalDraggable(this, this.app as any);
-
-		this.titleEl.setText(
-			`📷 Found ${this.extractedImages.length} images in PDF`
-		);
-
-		const introEl = this.contentEl.createDiv({
-			cls: "gn-image-placement-intro",
-		});
-		introEl.createEl("p", {
-			text: "Select an image on the left, then click a placeholder on the right to replace it with the selected image.",
-		});
-
-		// Create two-column layout
-		const containerEl = this.contentEl.createDiv({
-			cls: "gn-image-placement-container",
-		});
-		containerEl.setAttribute(
-			"style",
-			"display: flex; gap: 20px; flex: 1; min-height: 0;"
-		);
-
-		// Left column: Image list
-		const leftCol = containerEl.createDiv({ cls: "gn-image-list-column" });
-		leftCol.setAttribute(
-			"style",
-			"flex: 1; overflow-y: auto; border: 1px solid var(--background-modifier-border); padding: 10px;"
-		);
-
-		leftCol.createEl("h3", { text: "Extracted Images" });
-		leftCol.createEl("p", {
-			text: "Click to select an image:",
-			cls: "setting-item-description",
-		});
-		this.imageListEl = leftCol.createDiv({ cls: "gn-image-list" });
-
-		// Right column: Note preview
-		const rightCol = containerEl.createDiv({
-			cls: "gn-note-preview-column",
-		});
-		rightCol.setAttribute(
-			"style",
-			"flex: 1; overflow-y: auto; border: 1px solid var(--background-modifier-border); padding: 10px;"
-		);
-
-		rightCol.createEl("h3", {
-			text: "Note Content with Image Placeholders",
-		});
-		rightCol.createEl("p", {
-			text: "Click on highlighted ![IMAGE_PLACEHOLDER] tags to replace them with the selected image.",
-			cls: "setting-item-description",
-		});
-		this.notePreviewEl = rightCol.createDiv({ cls: "gn-note-preview" });
-
-		this.renderImageList();
-		this.renderNotePreview();
-
-		// Action buttons
-		const buttonContainer = this.contentEl.createDiv({
-			cls: "gn-image-placement-buttons",
-		});
-		buttonContainer.setAttribute(
-			"style",
-			"display: flex; gap: 10px; justify-content: flex-end; margin-top: 20px;"
-		);
-
-		const updateNoteButton = buttonContainer.createEl("button", {
-			text: "✅ Update Note with Changes",
-			cls: "mod-cta",
-		});
-		updateNoteButton.onclick = () => this.updateNoteFile();
-
-		const saveImagesButton = buttonContainer.createEl("button", {
-			text: "💾 Save All Images to Vault",
-		});
-		saveImagesButton.onclick = () => this.saveAllImages();
-
-		const copyButton = buttonContainer.createEl("button", {
-			text: "📋 Copy Results to Clipboard",
-			cls: "mod-muted",
-		});
-		copyButton.onclick = () => this.copyImageResults();
-
-		const closeButton = buttonContainer.createEl("button", {
-			text: "Close",
-		});
-		closeButton.onclick = () => this.close();
-	}
-
-	private renderImageList(): void {
-		this.imageListEl.empty();
-
-		this.extractedImages.forEach((image, index) => {
-			const imageItem = this.imageListEl.createDiv({
-				cls: "gn-image-item",
-			});
-			const isSelected = this.selectedImage === image;
-
-			imageItem.setAttribute(
-				"style",
-				"margin-bottom: 15px; padding: 10px; border-radius: 4px; cursor: pointer; " +
-					`border: 2px solid ${
-						isSelected
-							? "var(--interactive-accent)"
-							: "var(--background-modifier-border)"
-					}; ` +
-					`background: ${
-						isSelected
-							? "var(--background-secondary-alt)"
-							: "transparent"
-					};`
-			);
-
-			// Make entire item clickable to select image
-			imageItem.onclick = () => {
-				this.selectedImage = image;
-				this.renderImageList(); // Re-render to update selection visual
-			};
-
-			// Image preview
-			const imgEl = imageItem.createEl("img", {
-				attr: {
-					src: image.imageData,
-					style: "max-width: 200px; max-height: 150px; object-fit: contain; display: block; margin-bottom: 10px;",
-				},
-			});
-
-			// Image info
-			const infoEl = imageItem.createDiv({ cls: "gn-image-info" });
-			infoEl.createEl("div", {
-				text: `${image.filename}`,
-				attr: { style: "font-weight: 500; margin-bottom: 5px;" },
-			});
-			infoEl.createEl("div", {
-				text: `Page ${image.pageNumber} • ${image.width}x${image.height}px`,
-				attr: {
-					style: "font-size: 0.9em; color: var(--text-muted); margin-bottom: 10px;",
-				},
-			});
-
-			// Selection indicator
-			if (isSelected) {
-				const selectedEl = infoEl.createEl("div", {
-					text: "✓ Selected",
-					attr: {
-						style: "color: var(--interactive-accent); font-weight: 500; margin-bottom: 10px;",
-					},
-				});
-			}
-
-			// Save individual image button
-			const saveButton = infoEl.createEl("button", {
-				text: "💾 Save to Vault",
-				cls: "mod-muted",
-			});
-			saveButton.onclick = (e) => {
-				e.stopPropagation(); // Prevent triggering selection
-				this.saveImage(image);
-			};
-		});
-	}
-
-	private renderNotePreview(): void {
-		this.notePreviewEl.empty();
-		this.placeholders = [];
-
-		// Split content by lines and render with clickable placeholders
-		const lines = this.updatedContent.split("\n");
-
-		lines.forEach((line, lineIndex) => {
-			const lineEl = this.notePreviewEl.createDiv({
-				cls: "gn-note-line",
-			});
-			lineEl.setAttribute(
-				"style",
-				"margin-bottom: 5px; line-height: 1.5;"
-			);
-
-			if (line.includes("![IMAGE_PLACEHOLDER]")) {
-				// Make placeholder clickable
-				const parts = line.split("![IMAGE_PLACEHOLDER]");
-				parts.forEach((part, partIndex) => {
-					if (partIndex > 0) {
-						const placeholderEl = lineEl.createEl("span", {
-							text: "![IMAGE_PLACEHOLDER]",
-							cls: "gn-image-placeholder",
-						});
-						placeholderEl.setAttribute(
-							"style",
-							"background-color: var(--text-selection); " +
-								"padding: 2px 6px; " +
-								"border-radius: 3px; " +
-								"cursor: pointer; " +
-								"font-family: var(--font-monospace); " +
-								"transition: background-color 0.2s;"
-						);
-
-						// Track this placeholder
-						const placeholderIndex = partIndex - 1;
-						this.placeholders.push({
-							lineIndex,
-							placeholderIndex,
-							element: placeholderEl,
-						});
-
-						placeholderEl.onclick = () =>
-							this.insertImageAtPlaceholder(
-								lineIndex,
-								placeholderIndex
-							);
-
-						// Add hover effect
-						placeholderEl.onmouseenter = () => {
-							placeholderEl.style.backgroundColor =
-								"var(--interactive-accent)";
-						};
-						placeholderEl.onmouseleave = () => {
-							placeholderEl.style.backgroundColor =
-								"var(--text-selection)";
-						};
-					}
-					if (part) {
-						lineEl.appendChild(document.createTextNode(part));
-					}
-				});
-			} else {
-				lineEl.textContent = line;
-			}
-		});
-
-		// Show placeholder count
-		const placeholderCount = this.placeholders.length;
-		if (placeholderCount > 0) {
-			const countEl = this.notePreviewEl.createDiv({
-				text: `Found ${placeholderCount} placeholder(s) in the note`,
-				attr: {
-					style: "margin-top: 10px; padding: 8px; background: var(--background-secondary); border-radius: 4px; font-size: 0.9em; color: var(--text-muted);",
-				},
-			});
-		}
-	}
-
-	private async insertImageAtPlaceholder(
-		lineIndex: number,
-		placeholderIndex: number
-	): Promise<void> {
-		if (!this.selectedImage) {
-			new Notice(
-				"Please select an image first by clicking on one of the images on the left."
-			);
-			return;
-		}
-
-		try {
-			// Save the image to vault first
-			const imagePath = await this.saveImageToVault(this.selectedImage);
-
-			// Replace the placeholder in the content
-			const lines = this.updatedContent.split("\n");
-			const line = lines[lineIndex];
-
-			// Find and replace the specific placeholder occurrence
-			const parts = line.split("![IMAGE_PLACEHOLDER]");
-			if (placeholderIndex < parts.length - 1) {
-				// Replace the placeholder at this specific position
-				const beforePlaceholder = parts
-					.slice(0, placeholderIndex + 1)
-					.join("![IMAGE_PLACEHOLDER]");
-				const afterPlaceholder = parts
-					.slice(placeholderIndex + 1)
-					.join("![IMAGE_PLACEHOLDER]");
-
-				// Create the image reference using the saved path
-				const imageRef = `![[${imagePath}]]`;
-				lines[lineIndex] =
-					beforePlaceholder + imageRef + afterPlaceholder;
-
-				this.updatedContent = lines.join("\n");
-
-				// Re-render the preview to show the change
-				this.renderNotePreview();
-
-				new Notice(
-					`Inserted ${this.selectedImage.filename} at line ${
-						lineIndex + 1
-					}`
-				);
-			}
-		} catch (error) {
-			new Notice(`Failed to insert image: ${error}`);
-		}
-	}
-
-	private async saveImageToVault(image: ExtractedImage): Promise<string> {
-		try {
-			// Convert data URL to blob
-			const response = await fetch(image.imageData);
-			const blob = await response.blob();
-			const arrayBuffer = await blob.arrayBuffer();
-
-			// Create a timestamped filename like manual image paste behavior
-			const timestamp = new Date()
-				.toISOString()
-				.replace(/[:.]/g, "-")
-				.replace("T", "_")
-				.substring(0, 19);
-			const ext = ".png"; // Always PNG since we convert to canvas
-			const timestampedFilename = `extracted_image_${timestamp}${ext}`;
-
-			// Use simple attachment folder approach for now (API is giving malformed paths)
-			const attachmentPath = `attachments/${timestampedFilename}`;
-
-			// Ensure parent directory exists
-			const parentPath = attachmentPath.substring(
-				0,
-				attachmentPath.lastIndexOf("/")
-			);
-			if (
-				parentPath &&
-				!this.app.vault.getAbstractFileByPath(parentPath)
-			) {
-				await this.app.vault.createFolder(parentPath);
-			}
-
-			await this.app.vault.createBinary(attachmentPath, arrayBuffer);
-
-			// Return just the filename for the wiki-link
-			const fileName = attachmentPath.substring(
-				attachmentPath.lastIndexOf("/") + 1
-			);
-			return fileName;
-		} catch (error) {
-			console.error("Error saving image:", error);
-			// Fallback to basic attachment folder approach
-			try {
-				// Re-fetch since arrayBuffer is out of scope
-				const response2 = await fetch(image.imageData);
-				const blob2 = await response2.blob();
-				const arrayBuffer2 = await blob2.arrayBuffer();
-
-				const timestamp = new Date()
-					.toISOString()
-					.replace(/[:.]/g, "-")
-					.replace("T", "_")
-					.substring(0, 19);
-				const timestampedFilename = `extracted_image_${timestamp}.png`;
-				const attachmentPath = `attachments/${timestampedFilename}`;
-
-				// Ensure attachments folder exists
-				if (!this.app.vault.getAbstractFileByPath("attachments")) {
-					await this.app.vault.createFolder("attachments");
-				}
-
-				await this.app.vault.createBinary(attachmentPath, arrayBuffer2);
-				return timestampedFilename;
-			} catch (fallbackError) {
-				throw new Error(
-					`Failed to save ${image.filename}: ${fallbackError}`
-				);
-			}
-		}
-	}
-
-	private async saveImage(image: ExtractedImage): Promise<void> {
-		try {
-			await this.saveImageToVault(image);
-			new Notice(`Saved ${image.filename} to vault`);
-		} catch (error) {
-			new Notice(`Failed to save ${image.filename}: ${error}`);
-		}
-	}
-
-	private async updateNoteFile(): Promise<void> {
-		try {
-			// Update the note file with the modified content
-			await this.app.vault.modify(this.noteFile, this.updatedContent);
-			new Notice(`Updated note with image placements`);
-			this.close();
-		} catch (error) {
-			new Notice(`Failed to update note: ${error}`);
-		}
-	}
-
-	private async saveAllImages(): Promise<void> {
-		for (const image of this.extractedImages) {
-			await this.saveImage(image);
-		}
-		new Notice(`Saved all ${this.extractedImages.length} images to vault`);
-	}
-
-	private async copyImageResults(): Promise<void> {
-		const results = [
-			`PDF Image Extraction Results`,
-			`================================`,
-			`Total images found: ${this.extractedImages.length}`,
-			``,
-			...this.extractedImages.map(
-				(img, idx) =>
-					`Image ${idx + 1}: ${img.filename} (${img.width}x${
-						img.height
-					}px) from page ${img.pageNumber}`
-			),
-		];
-
-		try {
-			await navigator.clipboard.writeText(results.join("\n"));
-			new Notice("Image results copied to clipboard!");
-		} catch (error) {
-			console.log("=== IMAGE RESULTS ===");
-			console.log(results.join("\n"));
-			console.log("=== END RESULTS ===");
-			new Notice("Check console for results to copy");
 		}
 	}
 
