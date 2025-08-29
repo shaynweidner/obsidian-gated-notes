@@ -131,6 +131,8 @@ interface Settings {
 	defaultPdfMaxWidth: number;
 	/** The maximum number of tokens the AI should generate per page in PDF hybrid mode. */
 	pdfMaxTokensPerPage: number;
+	/** Whether to show green leaf indicators for new flashcards. */
+	showNewCardIndicators: boolean;
 }
 
 const DEFAULT_SETTINGS: Settings = {
@@ -154,6 +156,7 @@ const DEFAULT_SETTINGS: Settings = {
 	defaultPdfDpi: 200,
 	defaultPdfMaxWidth: 1400,
 	pdfMaxTokensPerPage: 4000,
+	showNewCardIndicators: true,
 };
 
 interface ImageAnalysis {
@@ -3371,10 +3374,40 @@ export default class GatedNotesPlugin extends Plugin {
 
 		const queue = await this.collectReviewPool(activePath);
 		if (!queue.length) {
-			new Notice("🎉 All reviews complete!");
-			return;
+			// Check if there are any future cards to review
+			const futureQueue = await this.collectReviewPool(activePath, 24 * 60 * 60 * 1000); // Check up to 24 hours ahead
+			if (futureQueue.length > 0) {
+				// Ask user if they want to review ahead of schedule
+				new ReviewAheadModal(
+					this.app,
+					this.studyMode,
+					async (timeAheadMs: number) => {
+						const aheadQueue = await this.collectReviewPool(activePath, timeAheadMs);
+						if (aheadQueue.length > 0) {
+							await this.processReviewQueue(aheadQueue, activePath, gateBefore);
+						} else {
+							new Notice("🎉 No cards found within the specified time range!");
+						}
+					},
+					() => {
+						new Notice("🎉 All reviews complete!");
+					}
+				).open();
+				return;
+			} else {
+				new Notice("🎉 All reviews complete!");
+				return;
+			}
 		}
 
+		await this.processReviewQueue(queue, activePath, gateBefore);
+	}
+
+	private async processReviewQueue(
+		queue: { card: Flashcard; deck: TFile }[],
+		activePath: string,
+		gateBefore: number
+	): Promise<void> {
 		let reviewInterrupted = false;
 
 		for (const { card, deck } of queue) {
@@ -3410,13 +3443,15 @@ export default class GatedNotesPlugin extends Plugin {
 		if (gateAfter > gateBefore) {
 			new Notice("✅ New content unlocked!");
 
-			const mdView = await this.navigateToChapter(activeFile);
+			const mdView = await this.navigateToChapter(
+				this.app.vault.getAbstractFileByPath(activePath) as TFile
+			);
 			if (!mdView) return;
 
 			await this.findAndScrollToNextContentfulPara(
 				gateBefore,
 				mdView,
-				activeFile
+				this.app.vault.getAbstractFileByPath(activePath) as TFile
 			);
 		} else {
 			new Notice("All reviews for this section are complete!");
@@ -3462,11 +3497,13 @@ export default class GatedNotesPlugin extends Plugin {
 	}
 
 	private async collectReviewPool(
-		activePath: string
+		activePath: string,
+		futureTimeMs?: number
 	): Promise<{ card: Flashcard; deck: TFile }[]> {
 		const subjectOf = (path: string): string => path.split("/")[0] ?? "";
 		const reviewPool: { card: Flashcard; deck: TFile }[] = [];
 		const now = Date.now();
+		const dueThreshold = futureTimeMs ? now + futureTimeMs : now;
 
 		const allDeckFiles = this.app.vault
 			.getFiles()
@@ -3505,7 +3542,7 @@ export default class GatedNotesPlugin extends Plugin {
 
 			for (const card of cardsInScope) {
 				if (card.suspended) continue;
-				if (card.due > now) continue;
+				if (card.due > dueThreshold) continue;
 
 				if (this.studyMode === StudyMode.CHAPTER) {
 					// In chapter mode, we only want to review cards that are at or before the current content gate.
@@ -5728,7 +5765,10 @@ ${selection}
 				/\.md$/,
 				""
 			);
-			modal.titleEl.setText(`${subject} ► ${chapterName}`);
+			const isNew = isUnseen(card);
+			const showIndicator = this.settings.showNewCardIndicators && isNew;
+			const titleText = showIndicator ? `🌱 ${subject} ► ${chapterName}` : `${subject} ► ${chapterName}`;
+			modal.titleEl.setText(titleText);
 
 			let settled = false;
 			const safeResolve = (v: ReviewResult) => {
@@ -6364,7 +6404,7 @@ ${selection}
 			(await this.readDeck(getDeckPathForChapter(chapterPath)));
 
 		const blockedCards = Object.values(graph).filter(
-			(c) => c.chapter === chapterPath && c.blocked && !c.suspended
+			(c) => c.chapter === chapterPath && c.blocked && !c.suspended && !isBuried(c)
 		);
 
 		if (blockedCards.length === 0) {
@@ -12302,6 +12342,8 @@ class SplitOptionsModal extends Modal {
 class CardBrowser extends Modal {
 	private showOnlyFlagged = false;
 	private showOnlySuspended = false;
+	private showOnlyNew = false;
+	private showOnlyBuried = false;
 	private treePane!: HTMLElement;
 	private editorPane!: HTMLElement;
 
@@ -12331,27 +12373,70 @@ class CardBrowser extends Modal {
 		makeModalDraggable(this, this.plugin);
 
 		const header = this.contentEl.createDiv({ cls: "gn-header" });
-		new Setting(header)
-			.setName("Show only flagged cards")
-			.addToggle((toggle) => {
-				toggle
-					.setValue(this.showOnlyFlagged)
-					.onChange(async (value) => {
-						this.showOnlyFlagged = value;
-						await this.renderContent();
-					});
-			});
+		const filtersContainer = header.createDiv({ cls: "gn-filters" });
+		filtersContainer.style.display = "flex";
+		filtersContainer.style.gap = "8px";
+		filtersContainer.style.flexWrap = "wrap";
+		filtersContainer.style.alignItems = "center";
+		filtersContainer.style.marginBottom = "10px";
+		
+		// Add common filter button styles
+		const addFilterButtonStyles = (button: HTMLElement) => {
+			button.style.padding = "4px 8px";
+			button.style.border = "1px solid var(--interactive-normal)";
+			button.style.borderRadius = "4px";
+			button.style.backgroundColor = "var(--interactive-normal)";
+			button.style.cursor = "pointer";
+			button.style.fontSize = "16px";
+			button.style.minWidth = "32px";
+			button.style.textAlign = "center";
+		};
 
-		new Setting(header)
-			.setName("Show only suspended cards")
-			.addToggle((toggle) => {
-				toggle
-					.setValue(this.showOnlySuspended)
-					.onChange(async (value) => {
-						this.showOnlySuspended = value;
-						await this.renderContent();
-					});
-			});
+		// Flagged cards filter
+		const flagBtn = filtersContainer.createEl("button", { text: "🚩" });
+		addFilterButtonStyles(flagBtn);
+		flagBtn.style.backgroundColor = this.showOnlyFlagged ? "var(--interactive-accent)" : "var(--interactive-normal)";
+		flagBtn.setAttribute("aria-label", "Show only flagged cards");
+		flagBtn.onclick = async () => {
+			this.showOnlyFlagged = !this.showOnlyFlagged;
+			flagBtn.style.backgroundColor = this.showOnlyFlagged ? "var(--interactive-accent)" : "var(--interactive-normal)";
+			await this.renderContent();
+		};
+
+		// Suspended cards filter
+		const suspendBtn = filtersContainer.createEl("button", { text: "⏸️" });
+		addFilterButtonStyles(suspendBtn);
+		suspendBtn.style.backgroundColor = this.showOnlySuspended ? "var(--interactive-accent)" : "var(--interactive-normal)";
+		suspendBtn.setAttribute("aria-label", "Show only suspended cards");
+		suspendBtn.onclick = async () => {
+			this.showOnlySuspended = !this.showOnlySuspended;
+			suspendBtn.style.backgroundColor = this.showOnlySuspended ? "var(--interactive-accent)" : "var(--interactive-normal)";
+			await this.renderContent();
+		};
+
+		// Buried cards filter
+		const buryBtn = filtersContainer.createEl("button", { text: "📄⬇️" });
+		addFilterButtonStyles(buryBtn);
+		buryBtn.style.backgroundColor = this.showOnlyBuried ? "var(--interactive-accent)" : "var(--interactive-normal)";
+		buryBtn.setAttribute("aria-label", "Show only buried cards");
+		buryBtn.onclick = async () => {
+			this.showOnlyBuried = !this.showOnlyBuried;
+			buryBtn.style.backgroundColor = this.showOnlyBuried ? "var(--interactive-accent)" : "var(--interactive-normal)";
+			await this.renderContent();
+		};
+
+		// New cards filter
+		if (this.plugin.settings.showNewCardIndicators) {
+			const newBtn = filtersContainer.createEl("button", { text: "🌱" });
+			addFilterButtonStyles(newBtn);
+			newBtn.style.backgroundColor = this.showOnlyNew ? "var(--interactive-accent)" : "var(--interactive-normal)";
+			newBtn.setAttribute("aria-label", "Show only new cards");
+			newBtn.onclick = async () => {
+				this.showOnlyNew = !this.showOnlyNew;
+				newBtn.style.backgroundColor = this.showOnlyNew ? "var(--interactive-accent)" : "var(--interactive-normal)";
+				await this.renderContent();
+			};
+		}
 
 		const body = this.contentEl.createDiv({ cls: "gn-body" });
 		this.treePane = body.createDiv({ cls: "gn-tree" });
@@ -12411,6 +12496,8 @@ class CardBrowser extends Modal {
 			if (this.showOnlyFlagged) cards = cards.filter((c) => c.flagged);
 			if (this.showOnlySuspended)
 				cards = cards.filter((c) => c.suspended);
+			if (this.showOnlyBuried) cards = cards.filter((c) => isBuried(c));
+			if (this.showOnlyNew) cards = cards.filter((c) => isUnseen(c));
 
 			if (!cards.length) {
 				this.editorPane.setText("No cards match the current filter.");
@@ -12423,6 +12510,8 @@ class CardBrowser extends Modal {
 			for (const card of cards) {
 				const row = this.editorPane.createDiv({ cls: "gn-cardrow" });
 				let cardLabel = card.front || "(empty front)";
+				if (this.plugin.settings.showNewCardIndicators && isUnseen(card)) cardLabel = `🌱 ${cardLabel}`;
+				if (isBuried(card)) cardLabel = `📄⬇️ ${cardLabel}`;
 				if (card.suspended) cardLabel = `⏸️ ${cardLabel}`;
 				if (card.flagged) cardLabel = `🚩 ${cardLabel}`;
 				row.setText(cardLabel);
@@ -12465,6 +12554,10 @@ class CardBrowser extends Modal {
 				cardsInDeck = cardsInDeck.filter((c) => c.flagged);
 			if (this.showOnlySuspended)
 				cardsInDeck = cardsInDeck.filter((c) => c.suspended);
+			if (this.showOnlyBuried)
+				cardsInDeck = cardsInDeck.filter((c) => isBuried(c));
+			if (this.showOnlyNew)
+				cardsInDeck = cardsInDeck.filter((c) => isUnseen(c));
 			if (cardsInDeck.length === 0) continue;
 
 			const subject = deck.path.split("/")[0] || "Vault Root";
@@ -12970,6 +13063,92 @@ class CardInfoModal extends Modal {
 	}
 }
 
+class ReviewAheadModal extends Modal {
+	constructor(
+		app: App,
+		private studyMode: StudyMode,
+		private onConfirm: (timeAheadMs: number) => Promise<void>,
+		private onCancel: () => void
+	) {
+		super(app);
+	}
+
+	onOpen() {
+		const { contentEl } = this;
+		contentEl.empty();
+
+		const modeNames = {
+			[StudyMode.CHAPTER]: "chapter",
+			[StudyMode.SUBJECT]: "subject", 
+			[StudyMode.REVIEW]: "review-only"
+		};
+
+		contentEl.createEl("h2", { text: "No cards due for review" });
+		contentEl.createEl("p", { 
+			text: `There are no cards due for ${modeNames[this.studyMode]} mode. Would you like to review cards that are due in the future?` 
+		});
+
+		const inputContainer = contentEl.createDiv();
+		inputContainer.style.marginBottom = "15px";
+
+		const label = inputContainer.createEl("label", { text: "Review cards due within:" });
+		label.style.display = "block";
+		label.style.marginBottom = "5px";
+
+		const input = inputContainer.createEl("input", {
+			type: "text",
+			placeholder: "e.g., 5m, 2.5h, 1d"
+		});
+		input.style.width = "100%";
+		input.style.padding = "8px";
+		input.style.border = "1px solid var(--interactive-normal)";
+		input.style.borderRadius = "4px";
+
+		const helpText = inputContainer.createEl("div", {
+			text: "Formats: 5m (5 minutes), 2.5h (2.5 hours), 1d (1 day)"
+		});
+		helpText.style.fontSize = "12px";
+		helpText.style.color = "var(--text-muted)";
+		helpText.style.marginTop = "5px";
+
+		const buttonContainer = contentEl.createDiv();
+		buttonContainer.style.display = "flex";
+		buttonContainer.style.gap = "10px";
+		buttonContainer.style.justifyContent = "flex-end";
+
+		const cancelBtn = new ButtonComponent(buttonContainer)
+			.setButtonText("Cancel")
+			.onClick(() => {
+				this.close();
+				this.onCancel();
+			});
+
+		const confirmBtn = new ButtonComponent(buttonContainer)
+			.setButtonText("Review Ahead")
+			.setCta()
+			.onClick(async () => {
+				const timeMs = parseTimeInput(input.value);
+				if (timeMs === null) {
+					new Notice("Invalid time format. Use formats like 5m, 2.5h, or 1d");
+					input.focus();
+					return;
+				}
+				this.close();
+				await this.onConfirm(timeMs);
+			});
+
+		// Focus input and allow Enter to submit
+		input.focus();
+		input.addEventListener("keydown", (e) => {
+			if (e.key === "Enter") {
+				confirmBtn.buttonEl.click();
+			} else if (e.key === "Escape") {
+				cancelBtn.buttonEl.click();
+			}
+		});
+	}
+}
+
 class UnusedImageReviewModal extends Modal {
 	constructor(
 		app: App,
@@ -13355,6 +13534,18 @@ class GNSettingsTab extends PluginSettingTab {
 			);
 
 		new Setting(containerEl)
+			.setName("Show new card indicators")
+			.setDesc("Display green leaf (🌱) indicators for new flashcards in review and browser.")
+			.addToggle((toggle) =>
+				toggle
+					.setValue(this.plugin.settings.showNewCardIndicators)
+					.onChange(async (value) => {
+						this.plugin.settings.showNewCardIndicators = value;
+						await this.plugin.saveSettings();
+					})
+			);
+
+		new Setting(containerEl)
 			.setName("Logging level")
 			.setDesc("Sets the verbosity of messages in the developer console.")
 			.addDropdown((dropdown) =>
@@ -13405,6 +13596,35 @@ class GNSettingsTab extends PluginSettingTab {
 const isUnseen = (card: Flashcard): boolean =>
 	card.status === "new" &&
 	(card.learning_step_index == null || card.learning_step_index === 0);
+
+/**
+ * Checks if a flashcard is buried (due in the future).
+ * @param card The flashcard to check.
+ * @returns True if the card is buried, false otherwise.
+ */
+const isBuried = (card: Flashcard): boolean => card.due > Date.now();
+
+/**
+ * Parses time input strings like "5m", "2.5h", "1d" into milliseconds.
+ * @param input The time string to parse.
+ * @returns Milliseconds, or null if invalid input.
+ */
+const parseTimeInput = (input: string): number | null => {
+	const trimmed = input.trim().toLowerCase();
+	const match = trimmed.match(/^(\d+(?:\.\d+)?)\s*([mhd]?)$/);
+	
+	if (!match) return null;
+	
+	const value = parseFloat(match[1]);
+	const unit = match[2] || 'm'; // default to minutes if no unit
+	
+	switch (unit) {
+		case 'm': return value * 60 * 1000; // minutes to ms
+		case 'h': return value * 60 * 60 * 1000; // hours to ms  
+		case 'd': return value * 24 * 60 * 60 * 1000; // days to ms
+		default: return null;
+	}
+};
 
 /**
  * Encodes a markdown string to be safely used in an HTML attribute.

@@ -5,6 +5,7 @@
 	"main": "main.js",
 	"scripts": {
 		"dev": "cross-env NODE_ENV=development rollup -c -w",
+		"test": "cross-env NODE_ENV=test rollup -c && node copy-plugin.mjs",
 		"build": "cross-env NODE_ENV=production rollup -c && node copy-plugin.mjs"
 	},
 	"author": "Shayn Weidner",
