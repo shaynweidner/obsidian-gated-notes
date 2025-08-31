@@ -14,6 +14,7 @@ import {
 	PluginSettingTab,
 	RequestUrlParam,
 	requestUrl,
+	setIcon,
 	Setting,
 	TAbstractFile,
 	TextComponent,
@@ -95,6 +96,7 @@ interface Flashcard {
 	review_history: ReviewLog[];
 	flagged?: boolean;
 	suspended?: boolean;
+	buried?: boolean;
 }
 
 interface FlashcardGraph {
@@ -133,6 +135,10 @@ interface Settings {
 	pdfMaxTokensPerPage: number;
 	/** Whether to show green leaf indicators for new flashcards. */
 	showNewCardIndicators: boolean;
+	/** Whether to show review cards before new cards in chapter focus mode. */
+	chapterFocusReviewsFirst: boolean;
+	/** Whether to enable smart interleaving for non-chapter modes. */
+	enableInterleaving: boolean;
 }
 
 const DEFAULT_SETTINGS: Settings = {
@@ -157,6 +163,8 @@ const DEFAULT_SETTINGS: Settings = {
 	defaultPdfMaxWidth: 1400,
 	pdfMaxTokensPerPage: 4000,
 	showNewCardIndicators: true,
+	chapterFocusReviewsFirst: true,
+	enableInterleaving: true,
 };
 
 interface ImageAnalysis {
@@ -3403,15 +3411,98 @@ export default class GatedNotesPlugin extends Plugin {
 		await this.processReviewQueue(queue, activePath, gateBefore);
 	}
 
+	/**
+	 * Selects the next card to review using weighted sampling based on overdue seconds.
+	 * @param queue The current review queue
+	 * @returns The index of the selected card, or -1 if queue is empty
+	 */
+	private selectNextCardForReview(queue: { card: Flashcard; deck: TFile }[]): number {
+		if (queue.length === 0) return -1;
+		if (queue.length === 1) {
+			this.logger(LogLevel.VERBOSE, "Interleaving: Only 1 card in queue, selecting index 0");
+			return 0;
+		}
+		
+		// Skip interleaving for chapter mode or if disabled
+		if (this.studyMode === StudyMode.CHAPTER || !this.settings.enableInterleaving) {
+			this.logger(LogLevel.VERBOSE, `Interleaving: Skipped (mode=${this.studyMode}, enabled=${this.settings.enableInterleaving}), selecting index 0`);
+			return 0; // Just take the first card (already sorted)
+		}
+
+		this.logger(LogLevel.VERBOSE, `Interleaving: Starting selection from ${queue.length} cards using direct overdue weighting`);
+
+		return this.selectCardByOverdueWeight(queue);
+	}
+
+	/**
+	 * Select card using direct overdue weighting.
+	 */
+	private selectCardByOverdueWeight(queue: { card: Flashcard; deck: TFile }[]): number {
+		const overdueSeconds = queue.map(({card}) => getOverdueSeconds(card));
+		const cumulativeWeights: number[] = [];
+		let total = 0;
+		
+		// Log overdue seconds for each card
+		this.logger(LogLevel.VERBOSE, "Direct sampling - Card overdue seconds:", 
+			overdueSeconds.map((seconds, i) => `[${i}] ${queue[i].card.front?.substring(0, 30)}... = ${seconds}s`));
+		
+		for (const seconds of overdueSeconds) {
+			total += Math.max(1, seconds); // Minimum weight of 1 to include all cards
+			cumulativeWeights.push(total);
+		}
+		
+		this.logger(LogLevel.VERBOSE, `Direct sampling - Cumulative weights: [${cumulativeWeights.join(', ')}], total=${total}`);
+		
+		const selectedIndex = sampleFromCumulative(cumulativeWeights);
+		this.logger(LogLevel.VERBOSE, `Direct sampling - Selected index ${selectedIndex}: "${queue[selectedIndex].card.front?.substring(0, 50)}..." (${overdueSeconds[selectedIndex]}s overdue)`);
+		
+		return selectedIndex;
+	}
+
+
 	private async processReviewQueue(
 		queue: { card: Flashcard; deck: TFile }[],
 		activePath: string,
 		gateBefore: number
 	): Promise<void> {
 		let reviewInterrupted = false;
+		let remainingQueue = [...queue]; // Work with a copy
+		let reviewCount = 0;
 
-		for (const { card, deck } of queue) {
+		this.logger(LogLevel.VERBOSE, `Review queue processing: Starting with ${remainingQueue.length} cards`);
+
+		while (remainingQueue.length > 0) {
+			reviewCount++;
+			this.logger(LogLevel.VERBOSE, `Review #${reviewCount}: ${remainingQueue.length} cards remaining`);
+			
+			// Select next card using weighted sampling
+			const selectedIndex = this.selectNextCardForReview(remainingQueue);
+			if (selectedIndex === -1) break;
+			
+			const { card, deck } = remainingQueue[selectedIndex];
+			this.logger(LogLevel.VERBOSE, `Review #${reviewCount}: Presenting card "${card.front?.substring(0, 50)}..."`);
+			
+			// Log initial card properties for verbose logging
+			this.logger(LogLevel.VERBOSE, `Card properties before review:`, {
+				id: card.id,
+				due: new Date(card.due).toLocaleString(),
+				dueTimestamp: card.due,
+				currentTime: new Date(Date.now()).toLocaleString(),
+				currentTimestamp: Date.now(),
+				interval: card.interval,
+				ease_factor: card.ease_factor,
+				status: card.status,
+				buried: card.buried,
+				suspended: card.suspended,
+				flagged: card.flagged,
+				blocked: card.blocked
+			});
+			
 			const res = await this.openReviewModal(card, deck);
+
+			// Remove the processed card from the queue
+			remainingQueue.splice(selectedIndex, 1);
+			this.logger(LogLevel.VERBOSE, `Review #${reviewCount}: Card processed (result: ${res}), ${remainingQueue.length} cards remaining`);
 
 			if (res === "abort") {
 				new Notice("Review session aborted.");
@@ -3432,6 +3523,8 @@ export default class GatedNotesPlugin extends Plugin {
 			if (gateAfterLoop > gateBefore) {
 				break;
 			}
+			
+			// Queue recalculates automatically on next iteration
 		}
 
 		if (reviewInterrupted) {
@@ -3538,17 +3631,53 @@ export default class GatedNotesPlugin extends Plugin {
 						...blockedCards.map((c) => c.paraIdx ?? Infinity)
 					);
 				}
+				
+				// Debug logging for the problematic chapter
+				if (activePath.includes("02_True Happiness - Aristotle")) {
+					this.logger(LogLevel.VERBOSE, `Chapter focus mode - blocked card analysis for ${activePath}:`, {
+						totalCardsInScope: cardsInScope.length,
+						blockedCardsCount: blockedCards.length,
+						firstBlockedParaIdx,
+						blockedCardParaIndices: blockedCards.map(c => ({ paraIdx: c.paraIdx, front: c.front?.substring(0, 30) }))
+					});
+				}
 			}
 
 			for (const card of cardsInScope) {
+				// Debug logging for the problematic chapter
+				if (card.chapter.includes("02_True Happiness - Aristotle")) {
+					this.logger(LogLevel.VERBOSE, `Reviewing card filtering for: ${card.front?.substring(0, 50)}...`, {
+						suspended: card.suspended,
+						due: card.due,
+						dueThreshold,
+						isDue: card.due <= dueThreshold,
+						paraIdx: card.paraIdx,
+						firstBlockedParaIdx,
+						isInRange: (card.paraIdx ?? Infinity) <= firstBlockedParaIdx,
+						blocked: card.blocked,
+						status: card.status
+					});
+				}
+				
 				if (card.suspended) continue;
 				if (card.due > dueThreshold) continue;
 
 				if (this.studyMode === StudyMode.CHAPTER) {
-					// In chapter mode, we only want to review cards that are at or before the current content gate.
-					// This includes due review cards and the new cards that are blocking progress.
-					if ((card.paraIdx ?? Infinity) > firstBlockedParaIdx) {
+					// In chapter mode, we want to include:
+					// 1. All cards at or before the first blocked paragraph 
+					// 2. Blocked cards that are due (so they can be reviewed to unblock progress)
+					const cardParaIdx = card.paraIdx ?? Infinity;
+					const isBlockedAndDue = card.blocked && card.due <= dueThreshold;
+					
+					if (cardParaIdx > firstBlockedParaIdx && !isBlockedAndDue) {
+						if (card.chapter.includes("02_True Happiness - Aristotle")) {
+							this.logger(LogLevel.VERBOSE, `EXCLUDED card: "${card.front?.substring(0, 50)}..." (paraIdx: ${cardParaIdx}, blocked: ${card.blocked}, due: ${card.due <= dueThreshold})`);
+						}
 						continue;
+					}
+					
+					if (card.chapter.includes("02_True Happiness - Aristotle")) {
+						this.logger(LogLevel.VERBOSE, `INCLUDED card: "${card.front?.substring(0, 50)}..." (paraIdx: ${cardParaIdx}, blocked: ${card.blocked}, due: ${card.due <= dueThreshold})`);
 					}
 				} else {
 					// In other modes (Subject, Review-only), we don't want to see new cards.
@@ -3559,14 +3688,33 @@ export default class GatedNotesPlugin extends Plugin {
 			}
 		}
 
+		// Debug logging for the final review pool
+		const aristotleCards = reviewPool.filter(({card}) => card.chapter.includes("02_True Happiness - Aristotle"));
+		if (aristotleCards.length > 0) {
+			this.logger(LogLevel.VERBOSE, `Final review pool for Aristotle chapter:`, {
+				totalCards: aristotleCards.length,
+				cards: aristotleCards.map(({card}) => ({
+					front: card.front?.substring(0, 50),
+					paraIdx: card.paraIdx,
+					status: card.status,
+					blocked: card.blocked,
+					due: new Date(card.due).toISOString()
+				}))
+			});
+		} else if (this.studyMode === StudyMode.CHAPTER && reviewPool.length === 0) {
+			this.logger(LogLevel.VERBOSE, `No cards found in review pool for chapter mode`);
+		}
+
 		reviewPool.sort((a, b) => {
 			const aIsNew = isUnseen(a.card);
 			const bIsNew = isUnseen(b.card);
 
-			// In chapter focus mode, we want to see review cards first, then new cards.
+			// In chapter focus mode, respect the review-before-new setting
 			if (this.studyMode === StudyMode.CHAPTER) {
 				if (aIsNew !== bIsNew) {
-					return aIsNew ? 1 : -1; // This sorts non-new cards (reviews) before new cards.
+					return this.settings.chapterFocusReviewsFirst 
+						? (aIsNew ? 1 : -1)  // Reviews first (non-new before new)
+						: (aIsNew ? -1 : 1); // New first (new before non-new) - original behavior
 				}
 			} else {
 				// In other modes, new cards (if they were to be included) would come first.
@@ -3604,6 +3752,9 @@ export default class GatedNotesPlugin extends Plugin {
 
 		if (!card.review_history) card.review_history = [];
 		card.review_history.push({ ...previousState, timestamp: now });
+
+		// Clear buried flag when card is answered
+		card.buried = false;
 
 		if (originalStatus === "new") {
 			card.status = "learning";
@@ -3653,6 +3804,23 @@ export default class GatedNotesPlugin extends Plugin {
 			card.due = now + card.interval * ONE_DAY_MS;
 		}
 		card.last_reviewed = new Date(now).toISOString();
+		
+		// Log final card properties after answering
+		this.logger(LogLevel.VERBOSE, `Card properties after answering with "${rating}":`, {
+			id: card.id,
+			due: new Date(card.due).toLocaleString(),
+			dueTimestamp: card.due,
+			currentTime: new Date(now).toLocaleString(),
+			currentTimestamp: now,
+			interval: card.interval,
+			ease_factor: card.ease_factor,
+			status: card.status,
+			buried: card.buried,
+			suspended: card.suspended,
+			flagged: card.flagged,
+			blocked: card.blocked,
+			timeAdded: `${Math.round((card.due - now) / (1000 * 60 * 60 * 24))} days`
+		});
 	}
 
 	private async autoFinalizeNote(file: TFile): Promise<void> {
@@ -5967,6 +6135,7 @@ ${selection}
 					const graph = await this.readDeck(deck.path);
 					graph[card.id].due =
 						Date.now() + this.settings.buryDelayHours * 3_600_000;
+					graph[card.id].buried = true;
 					await this.writeDeck(deck.path, graph);
 					this.refreshReadingAndPreserveScroll();
 					state = "answered";
@@ -12404,26 +12573,26 @@ class CardBrowser extends Modal {
 		};
 
 		// Suspended cards filter
-		const suspendBtn = filtersContainer.createEl("button", { text: "⏸️" });
-		addFilterButtonStyles(suspendBtn);
-		suspendBtn.style.backgroundColor = this.showOnlySuspended ? "var(--interactive-accent)" : "var(--interactive-normal)";
-		suspendBtn.setAttribute("aria-label", "Show only suspended cards");
-		suspendBtn.onclick = async () => {
+		const suspendBtn = new ButtonComponent(filtersContainer);
+		suspendBtn.setIcon("ban");
+		suspendBtn.setTooltip("Show only suspended cards");
+		suspendBtn.buttonEl.style.backgroundColor = this.showOnlySuspended ? "var(--interactive-accent)" : "var(--interactive-normal)";
+		suspendBtn.onClick(async () => {
 			this.showOnlySuspended = !this.showOnlySuspended;
-			suspendBtn.style.backgroundColor = this.showOnlySuspended ? "var(--interactive-accent)" : "var(--interactive-normal)";
+			suspendBtn.buttonEl.style.backgroundColor = this.showOnlySuspended ? "var(--interactive-accent)" : "var(--interactive-normal)";
 			await this.renderContent();
-		};
+		});
 
 		// Buried cards filter
-		const buryBtn = filtersContainer.createEl("button", { text: "📄⬇️" });
-		addFilterButtonStyles(buryBtn);
-		buryBtn.style.backgroundColor = this.showOnlyBuried ? "var(--interactive-accent)" : "var(--interactive-normal)";
-		buryBtn.setAttribute("aria-label", "Show only buried cards");
-		buryBtn.onclick = async () => {
+		const buryBtn = new ButtonComponent(filtersContainer);
+		buryBtn.setIcon("file-down");
+		buryBtn.setTooltip("Show only buried cards");
+		buryBtn.buttonEl.style.backgroundColor = this.showOnlyBuried ? "var(--interactive-accent)" : "var(--interactive-normal)";
+		buryBtn.onClick(async () => {
 			this.showOnlyBuried = !this.showOnlyBuried;
-			buryBtn.style.backgroundColor = this.showOnlyBuried ? "var(--interactive-accent)" : "var(--interactive-normal)";
+			buryBtn.buttonEl.style.backgroundColor = this.showOnlyBuried ? "var(--interactive-accent)" : "var(--interactive-normal)";
 			await this.renderContent();
-		};
+		});
 
 		// New cards filter
 		if (this.plugin.settings.showNewCardIndicators) {
@@ -12509,12 +12678,30 @@ class CardBrowser extends Modal {
 
 			for (const card of cards) {
 				const row = this.editorPane.createDiv({ cls: "gn-cardrow" });
-				let cardLabel = card.front || "(empty front)";
-				if (this.plugin.settings.showNewCardIndicators && isUnseen(card)) cardLabel = `🌱 ${cardLabel}`;
-				if (isBuried(card)) cardLabel = `📄⬇️ ${cardLabel}`;
-				if (card.suspended) cardLabel = `⏸️ ${cardLabel}`;
-				if (card.flagged) cardLabel = `🚩 ${cardLabel}`;
-				row.setText(cardLabel);
+				
+				// Add status icons
+				if (this.plugin.settings.showNewCardIndicators && isUnseen(card)) {
+					row.createEl("span", { text: "🌱" }).style.marginRight = "4px";
+				}
+				if (isBuried(card)) {
+					const iconSpan = row.createEl("span");
+					iconSpan.style.marginRight = "4px";
+					setIcon(iconSpan, "file-down");
+				}
+				if (card.suspended) {
+					const iconSpan = row.createEl("span");
+					iconSpan.style.marginRight = "4px";
+					setIcon(iconSpan, "ban");
+				}
+				if (card.flagged) {
+					const iconSpan = row.createEl("span");
+					iconSpan.style.marginRight = "4px";
+					setIcon(iconSpan, "flag");
+				}
+				
+				// Add card label
+				const labelSpan = row.createEl("span");
+				labelSpan.setText(card.front || "(empty front)");
 
 				row.onclick = () => {
 					this.plugin.openEditModal(card, graph, deck, async () => {
@@ -13546,6 +13733,30 @@ class GNSettingsTab extends PluginSettingTab {
 			);
 
 		new Setting(containerEl)
+			.setName("Show review cards before new cards (Chapter Focus)")
+			.setDesc("In chapter focus mode, prioritize due review cards over new cards.")
+			.addToggle((toggle) =>
+				toggle
+					.setValue(this.plugin.settings.chapterFocusReviewsFirst)
+					.onChange(async (value) => {
+						this.plugin.settings.chapterFocusReviewsFirst = value;
+						await this.plugin.saveSettings();
+					})
+			);
+
+		new Setting(containerEl)
+			.setName("Enable smart interleaving")
+			.setDesc("Randomly order cards while favoring more overdue ones (Subject/Review-only modes).")
+			.addToggle((toggle) =>
+				toggle
+					.setValue(this.plugin.settings.enableInterleaving)
+					.onChange(async (value) => {
+						this.plugin.settings.enableInterleaving = value;
+						await this.plugin.saveSettings();
+					})
+			);
+
+		new Setting(containerEl)
 			.setName("Logging level")
 			.setDesc("Sets the verbosity of messages in the developer console.")
 			.addDropdown((dropdown) =>
@@ -13598,11 +13809,11 @@ const isUnseen = (card: Flashcard): boolean =>
 	(card.learning_step_index == null || card.learning_step_index === 0);
 
 /**
- * Checks if a flashcard is buried (due in the future).
+ * Checks if a flashcard is buried (was manually buried and due time <= now).
  * @param card The flashcard to check.
  * @returns True if the card is buried, false otherwise.
  */
-const isBuried = (card: Flashcard): boolean => card.due > Date.now();
+const isBuried = (card: Flashcard): boolean => !!card.buried && card.due <= Date.now();
 
 /**
  * Parses time input strings like "5m", "2.5h", "1d" into milliseconds.
@@ -13624,6 +13835,42 @@ const parseTimeInput = (input: string): number | null => {
 		case 'd': return value * 24 * 60 * 60 * 1000; // days to ms
 		default: return null;
 	}
+};
+
+/**
+ * Calculates how many seconds a card is overdue (0 if not overdue).
+ */
+const getOverdueSeconds = (card: Flashcard): number => {
+	const now = Date.now();
+	return Math.max(0, Math.floor((now - card.due) / 1000));
+};
+
+/**
+ * Samples from a weighted cumulative distribution.
+ * @param cumulativeWeights Array of cumulative weights (should end with total weight)
+ * @returns The index of the selected item
+ */
+const sampleFromCumulative = (cumulativeWeights: number[]): number => {
+	if (cumulativeWeights.length === 0) return -1;
+	if (cumulativeWeights.length === 1) return 0;
+	
+	const total = cumulativeWeights[cumulativeWeights.length - 1];
+	if (total <= 0) return Math.floor(Math.random() * cumulativeWeights.length);
+	
+	const random = Math.random() * total;
+	let selectedIndex = cumulativeWeights.length - 1;
+	
+	for (let i = 0; i < cumulativeWeights.length; i++) {
+		if (random <= cumulativeWeights[i]) {
+			selectedIndex = i;
+			break;
+		}
+	}
+	
+	// Note: Could add logging here, but it would be called from plugin context
+	// Individual sampling methods handle their own logging
+	
+	return selectedIndex;
 };
 
 /**
