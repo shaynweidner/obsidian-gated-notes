@@ -79,10 +79,18 @@ interface ReviewLog {
 /**
  * Represents a single flashcard within the system.
  */
-interface Flashcard {
-	id: string;
+interface CardVariant {
 	front: string;
 	back: string;
+}
+
+interface Flashcard {
+	id: string;
+	// Legacy fields for backwards compatibility
+	front?: string;
+	back?: string;
+	// New variants structure
+	variants?: CardVariant[];
 	tag: string;
 	chapter: string;
 	paraIdx?: number;
@@ -235,6 +243,7 @@ interface LlmLogEntry {
 		| "analyze_image"
 		| "generate_from_selection_single"
 		| "generate_from_selection_many"
+		| "generate_variants"
 		| "pdf_to_note";
 	model: string;
 	inputTokens: number;
@@ -3625,7 +3634,9 @@ export default class GatedNotesPlugin extends Plugin {
 
 			let firstBlockedParaIdx = Infinity;
 			if (this.studyMode === StudyMode.CHAPTER) {
-				const blockedCards = cardsInScope.filter((c) => c.blocked);
+				const blockedCards = cardsInScope.filter(
+					(c) => c.blocked && !c.suspended && !isBuried(c)
+				);
 				if (blockedCards.length > 0) {
 					firstBlockedParaIdx = Math.min(
 						...blockedCards.map((c) => c.paraIdx ?? Infinity)
@@ -3633,7 +3644,7 @@ export default class GatedNotesPlugin extends Plugin {
 				}
 				
 				// Debug logging for the problematic chapter
-				if (activePath.includes("02_True Happiness - Aristotle")) {
+				if (activePath.includes("02_True Happiness - Aristotle") || activePath.includes("A History of the Bible/00 Introduction")) {
 					this.logger(LogLevel.VERBOSE, `Chapter focus mode - blocked card analysis for ${activePath}:`, {
 						totalCardsInScope: cardsInScope.length,
 						blockedCardsCount: blockedCards.length,
@@ -3665,19 +3676,20 @@ export default class GatedNotesPlugin extends Plugin {
 				if (this.studyMode === StudyMode.CHAPTER) {
 					// In chapter mode, we want to include:
 					// 1. All cards at or before the first blocked paragraph 
-					// 2. Blocked cards that are due (so they can be reviewed to unblock progress)
+					// 2. Blocked cards that are due AND not new (so they can be reviewed to unblock progress)
 					const cardParaIdx = card.paraIdx ?? Infinity;
-					const isBlockedAndDue = card.blocked && card.due <= dueThreshold;
+					const isNew = isUnseen(card);
+					const isBlockedAndDue = card.blocked && card.due <= dueThreshold && !isNew;
 					
 					if (cardParaIdx > firstBlockedParaIdx && !isBlockedAndDue) {
-						if (card.chapter.includes("02_True Happiness - Aristotle")) {
-							this.logger(LogLevel.VERBOSE, `EXCLUDED card: "${card.front?.substring(0, 50)}..." (paraIdx: ${cardParaIdx}, blocked: ${card.blocked}, due: ${card.due <= dueThreshold})`);
+						if (card.chapter.includes("02_True Happiness - Aristotle") || card.chapter.includes("A History of the Bible/00 Introduction")) {
+							this.logger(LogLevel.VERBOSE, `EXCLUDED card: "${card.front?.substring(0, 50)}..." (paraIdx: ${cardParaIdx}, firstBlockedParaIdx: ${firstBlockedParaIdx}, blocked: ${card.blocked}, due: ${card.due <= dueThreshold}, new: ${isNew})`);
 						}
 						continue;
 					}
 					
-					if (card.chapter.includes("02_True Happiness - Aristotle")) {
-						this.logger(LogLevel.VERBOSE, `INCLUDED card: "${card.front?.substring(0, 50)}..." (paraIdx: ${cardParaIdx}, blocked: ${card.blocked}, due: ${card.due <= dueThreshold})`);
+					if (card.chapter.includes("02_True Happiness - Aristotle") || card.chapter.includes("A History of the Bible/00 Introduction")) {
+						this.logger(LogLevel.VERBOSE, `INCLUDED card: "${card.front?.substring(0, 50)}..." (paraIdx: ${cardParaIdx}, firstBlockedParaIdx: ${firstBlockedParaIdx}, blocked: ${card.blocked}, due: ${card.due <= dueThreshold}, new: ${isNew})`);
 					}
 				} else {
 					// In other modes (Subject, Review-only), we don't want to see new cards.
@@ -3734,6 +3746,69 @@ export default class GatedNotesPlugin extends Plugin {
 		});
 
 		return reviewPool;
+	}
+
+	public getCardVariants(card: Flashcard): CardVariant[] {
+		if (card.variants && card.variants.length > 0) {
+			return card.variants;
+		}
+		// Fallback to legacy structure
+		return [{ front: card.front || "", back: card.back || "" }];
+	}
+
+	public getCurrentVariant(card: Flashcard, index: number = 0): CardVariant {
+		const variants = this.getCardVariants(card);
+		return variants[Math.min(index, variants.length - 1)];
+	}
+
+	private getRandomVariant(card: Flashcard): CardVariant {
+		const variants = this.getCardVariants(card);
+		const randomIndex = Math.floor(Math.random() * variants.length);
+		return variants[randomIndex];
+	}
+
+	public ensureVariantsStructure(card: Flashcard): void {
+		// Convert legacy structure to variants structure if needed
+		if (!card.variants && card.front !== undefined && card.back !== undefined) {
+			card.variants = [{ front: card.front, back: card.back }];
+		}
+		
+		// Always sync front/back with first variant for backwards compatibility
+		if (card.variants && card.variants.length > 0) {
+			card.front = card.variants[0].front;
+			card.back = card.variants[0].back;
+		}
+	}
+
+	private formatDueTime(dueTimestamp: number, currentTime: number, cardStatus: string): string {
+		const diffMs = dueTimestamp - currentTime;
+		
+		// Helper function to format numbers with one decimal place, hiding .0
+		const formatDecimal = (num: number): string => {
+			const rounded = Math.round(num * 10) / 10;
+			return rounded % 1 === 0 ? rounded.toString() : rounded.toFixed(1);
+		};
+		
+		// Convert to different units
+		const seconds = diffMs / 1000;
+		const minutes = seconds / 60;
+		const hours = minutes / 60;
+		const days = hours / 24;
+		
+		// Choose the most appropriate unit
+		if (seconds < 60) {
+			const formatted = formatDecimal(seconds);
+			return formatted === "1" ? "1 second" : `${formatted} seconds`;
+		} else if (minutes < 60) {
+			const formatted = formatDecimal(minutes);
+			return formatted === "1" ? "1 minute" : `${formatted} minutes`;
+		} else if (hours < 24) {
+			const formatted = formatDecimal(hours);
+			return formatted === "1" ? "1 hour" : `${formatted} hours`;
+		} else {
+			const formatted = formatDecimal(days);
+			return formatted === "1" ? "1 day" : `${formatted} days`;
+		}
 	}
 
 	private applySm2(card: Flashcard, rating: CardRating): void {
@@ -5360,13 +5435,13 @@ ${selection}
 	 */
 	public createCardObject(
 		data: Partial<Flashcard> & {
-			front: string;
-			back: string;
+			front?: string;
+			back?: string;
 			tag: string;
 			chapter: string;
 		}
 	): Flashcard {
-		return {
+		const card: Flashcard = {
 			id: `c_${Date.now()}_${Math.random().toString(36).slice(2, 9)}`,
 			front: data.front,
 			back: data.back,
@@ -5382,6 +5457,13 @@ ${selection}
 			review_history: [],
 			suspended: false,
 		};
+
+		// Create variants structure if front/back are provided
+		if (data.front && data.back) {
+			card.variants = [{ front: data.front, back: data.back }];
+		}
+
+		return card;
 	}
 
 	/**
@@ -5949,7 +6031,8 @@ ${selection}
 			modal.onClose = () => safeResolve(state);
 
 			const frontContainer = modal.contentEl.createDiv();
-			this.renderCardContent(card.front, frontContainer, card.chapter);
+			const selectedVariant = this.getRandomVariant(card);
+			this.renderCardContent(selectedVariant.front, frontContainer, card.chapter);
 
 			const bottomBar = modal.contentEl.createDiv({
 				cls: "gn-action-bar",
@@ -5966,7 +6049,7 @@ ${selection}
 
 				const backContainer = modal.contentEl.createDiv();
 				await this.renderCardContent(
-					card.back,
+					selectedVariant.back,
 					backContainer,
 					card.chapter
 				);
@@ -5998,6 +6081,14 @@ ${selection}
 									);
 
 								this.applySm2(cardInGraph, lbl);
+
+								// Show when the card will be due again
+								const dueTimeText = this.formatDueTime(
+									cardInGraph.due,
+									Date.now(),
+									cardInGraph.status
+								);
+								new Notice(`Card will be due again in ${dueTimeText}`, 3000);
 
 								const gateAfter =
 									await this.getFirstBlockedParaIndex(
@@ -6606,7 +6697,25 @@ ${selection}
 		if (!(await this.app.vault.adapter.exists(deckPath))) return {};
 		try {
 			const content = await this.app.vault.adapter.read(deckPath);
-			return JSON.parse(content) as FlashcardGraph;
+			const graph = JSON.parse(content) as FlashcardGraph;
+			
+			// Migrate legacy cards to variants structure
+			let migrated = false;
+			for (const card of Object.values(graph)) {
+				const hadLegacyStructure = !card.variants && card.front !== undefined && card.back !== undefined;
+				this.ensureVariantsStructure(card);
+				if (hadLegacyStructure) {
+					migrated = true;
+				}
+			}
+			
+			// Save the migrated data back to disk
+			if (migrated) {
+				await this.writeDeck(deckPath, graph);
+				this.logger(LogLevel.VERBOSE, `Migrated legacy cards to variants structure in ${deckPath}`);
+			}
+			
+			return graph;
 		} catch (e: unknown) {
 			this.logger(
 				LogLevel.NORMAL,
@@ -6849,8 +6958,8 @@ ${selection}
 						for (const card of Object.values(graph)) {
 							// Check front, back, and tag fields for image hash references
 							if (
-								card.front.includes(hashReference) ||
-								card.back.includes(hashReference) ||
+								(card.front && card.front.includes(hashReference)) ||
+								(card.back && card.back.includes(hashReference)) ||
 								card.tag.includes(hashReference)
 							) {
 								isUsed = true;
@@ -11845,6 +11954,12 @@ class ActionConfirmationModal extends Modal {
  * The primary modal for editing a flashcard's content and properties.
  */
 class EditModal extends Modal {
+	private currentVariantIndex: number = 0;
+	private variantDropdown!: HTMLSelectElement;
+	private variantLabelEl!: HTMLLabelElement;
+	private frontInput!: HTMLTextAreaElement;
+	private backInput!: HTMLTextAreaElement;
+
 	constructor(
 		private plugin: GatedNotesPlugin,
 		private card: Flashcard,
@@ -11855,6 +11970,8 @@ class EditModal extends Modal {
 		private parentContext?: "edit" | "review"
 	) {
 		super(plugin.app);
+		// Ensure card has variants structure
+		this.plugin.ensureVariantsStructure(this.card);
 	}
 
 	onOpen() {
@@ -11886,15 +12003,42 @@ class EditModal extends Modal {
 			return row;
 		};
 
-		const frontInput = createRow("Front:", editPane).createEl("textarea", {
-			attr: { rows: 3 },
-		});
-		frontInput.value = this.card.front;
+		// Variant selector
+		const variantRow = createRow("", editPane); // Start with empty label, will be updated dynamically
+		this.variantLabelEl = variantRow.querySelector('label') as HTMLLabelElement;
+		this.variantDropdown = variantRow.createEl("select");
+		this.refreshVariantDropdown();
+		
+		const addVariantBtn = variantRow.createEl("button", { text: "Add" });
+		addVariantBtn.style.marginLeft = "8px";
+		addVariantBtn.onclick = () => this.addVariant();
+		
+		const deleteVariantBtn = variantRow.createEl("button", { text: "Delete" });
+		deleteVariantBtn.style.marginLeft = "4px";
+		deleteVariantBtn.onclick = () => this.deleteCurrentVariant();
+		
+		const generateVariantsBtn = variantRow.createEl("button", { text: "🤖 Generate" });
+		generateVariantsBtn.style.marginLeft = "4px";
+		generateVariantsBtn.id = "generate-variants-btn"; // Add ID for easier reference
+		generateVariantsBtn.onclick = () => this.generateVariantsWithAI();
 
-		const backInput = createRow("Back:", editPane).createEl("textarea", {
+		this.frontInput = createRow("Front:", editPane).createEl("textarea", {
 			attr: { rows: 3 },
-		});
-		backInput.value = this.card.back;
+		}) as HTMLTextAreaElement;
+
+		this.backInput = createRow("Back:", editPane).createEl("textarea", {
+			attr: { rows: 3 },
+		}) as HTMLTextAreaElement;
+
+		// Populate fields from current variant
+		this.populateFieldsFromCurrentVariant();
+
+		// Handle variant dropdown changes
+		this.variantDropdown.onchange = () => {
+			this.saveCurrentVariant();
+			this.currentVariantIndex = parseInt(this.variantDropdown.value);
+			this.populateFieldsFromCurrentVariant();
+		};
 
 		const tagInput = createRow("Tag:", editPane).createEl("textarea", {
 			attr: { rows: 2 },
@@ -11945,7 +12089,7 @@ class EditModal extends Modal {
 
 			previewFrontContainer.createEl("h4", { text: "Front Preview" });
 			await this.plugin.renderCardContent(
-				frontInput.value,
+				this.frontInput.value,
 				previewFrontContainer,
 				this.card.chapter
 			);
@@ -11953,7 +12097,7 @@ class EditModal extends Modal {
 			previewBackContainer.createEl("hr");
 			previewBackContainer.createEl("h4", { text: "Back Preview" });
 			await this.plugin.renderCardContent(
-				backInput.value,
+				this.backInput.value,
 				previewBackContainer,
 				this.card.chapter
 			);
@@ -11976,8 +12120,8 @@ class EditModal extends Modal {
 
 					this.plugin.resetCardProgress(this.card);
 					await this.saveCardState(
-						frontInput,
-						backInput,
+						this.frontInput,
+						this.backInput,
 						tagInput,
 						paraInput
 					);
@@ -12016,8 +12160,8 @@ class EditModal extends Modal {
 				.setButtonText("Save & Close Review")
 				.onClick(async () => {
 					await this.saveCardState(
-						frontInput,
-						backInput,
+						this.frontInput,
+						this.backInput,
 						tagInput,
 						paraInput
 					);
@@ -12033,8 +12177,8 @@ class EditModal extends Modal {
 					.setCta()
 					.onClick(async () => {
 						await this.saveCardState(
-							frontInput,
-							backInput,
+							this.frontInput,
+							this.backInput,
 							tagInput,
 							paraInput
 						);
@@ -12047,8 +12191,8 @@ class EditModal extends Modal {
 					.setCta()
 					.onClick(async () => {
 						await this.saveCardState(
-							frontInput,
-							backInput,
+							this.frontInput,
+							this.backInput,
 							tagInput,
 							paraInput
 						);
@@ -12062,8 +12206,8 @@ class EditModal extends Modal {
 				.setCta()
 				.onClick(async () => {
 					await this.saveCardState(
-						frontInput,
-						backInput,
+						this.frontInput,
+						this.backInput,
 						tagInput,
 						paraInput
 					);
@@ -12080,14 +12224,393 @@ class EditModal extends Modal {
 		tagInput: HTMLTextAreaElement,
 		paraInput: HTMLInputElement
 	) {
-		this.card.front = frontInput.value.trim();
-		this.card.back = backInput.value.trim();
+		// Save current variant before saving other fields
+		this.saveCurrentVariant();
+		
 		this.card.tag = tagInput.value.trim();
 		this.card.paraIdx = Number(paraInput.value) || undefined;
+		
+		// Sync front/back fields with first variant for backwards compatibility
+		if (this.card.variants && this.card.variants.length > 0) {
+			this.card.front = this.card.variants[0].front;
+			this.card.back = this.card.variants[0].back;
+		}
+		
 		this.graph[this.card.id] = this.card;
 		await this.plugin.writeDeck(this.deck.path, this.graph);
 		this.plugin.refreshReading();
 		this.plugin.refreshAllStatuses();
+	}
+
+	private refreshVariantDropdown() {
+		this.variantDropdown.innerHTML = "";
+		const variants = this.plugin.getCardVariants(this.card);
+		
+		// Update the label to be more informative
+		if (this.variantLabelEl) {
+			if (variants.length === 1) {
+				this.variantLabelEl.textContent = "Variant (1 only):";
+			} else {
+				this.variantLabelEl.textContent = `Variant (${variants.length} total):`;
+			}
+		}
+		
+		variants.forEach((variant, index) => {
+			const option = this.variantDropdown.createEl("option");
+			option.value = index.toString();
+			// Make options more descriptive
+			const preview = variant.front.length > 30 
+				? variant.front.substring(0, 30) + "..."
+				: variant.front;
+			option.text = `${index + 1}: ${preview || "(empty)"}`;
+		});
+		this.variantDropdown.value = this.currentVariantIndex.toString();
+	}
+
+	private populateFieldsFromCurrentVariant() {
+		const currentVariant = this.plugin.getCurrentVariant(this.card, this.currentVariantIndex);
+		this.frontInput.value = currentVariant.front;
+		this.backInput.value = currentVariant.back;
+	}
+
+	private saveCurrentVariant() {
+		if (!this.card.variants) {
+			this.card.variants = [];
+		}
+		
+		// Ensure the variants array is large enough
+		while (this.card.variants.length <= this.currentVariantIndex) {
+			this.card.variants.push({ front: "", back: "" });
+		}
+		
+		this.card.variants[this.currentVariantIndex] = {
+			front: this.frontInput.value.trim(),
+			back: this.backInput.value.trim()
+		};
+		
+		// If we're editing the first variant, sync front/back fields
+		if (this.currentVariantIndex === 0) {
+			this.syncFrontBackWithFirstVariant();
+		}
+	}
+
+	private addVariant() {
+		if (!this.card.variants) {
+			this.card.variants = [];
+		}
+		
+		this.card.variants.push({ front: "", back: "" });
+		this.currentVariantIndex = this.card.variants.length - 1;
+		this.refreshVariantDropdown();
+		this.populateFieldsFromCurrentVariant();
+		this.syncFrontBackWithFirstVariant();
+	}
+
+	private deleteCurrentVariant() {
+		const variants = this.plugin.getCardVariants(this.card);
+		if (variants.length <= 1) {
+			new Notice("Cannot delete the only variant");
+			return;
+		}
+		
+		if (!this.card.variants) return;
+		
+		// Remove the variant
+		this.card.variants.splice(this.currentVariantIndex, 1);
+		
+		// Adjust current index if needed
+		if (this.currentVariantIndex >= this.card.variants.length) {
+			this.currentVariantIndex = this.card.variants.length - 1;
+		}
+		
+		this.refreshVariantDropdown();
+		this.populateFieldsFromCurrentVariant();
+		this.syncFrontBackWithFirstVariant();
+	}
+
+	private syncFrontBackWithFirstVariant() {
+		if (this.card.variants && this.card.variants.length > 0) {
+			this.card.front = this.card.variants[0].front;
+			this.card.back = this.card.variants[0].back;
+		}
+	}
+
+	private async generateVariantsWithAI() {
+		try {
+			// Save current variant first
+			this.saveCurrentVariant();
+			
+			const currentVariant = this.plugin.getCurrentVariant(this.card, this.currentVariantIndex);
+			
+			if (!currentVariant.front.trim() || !currentVariant.back.trim()) {
+				new Notice("Please fill in both front and back fields before generating variants");
+				return;
+			}
+
+			const existingVariants = this.plugin.getCardVariants(this.card);
+			let includeExisting = false;
+
+			// If there are multiple variants, ask if we should include existing ones
+			if (existingVariants.length > 1) {
+				includeExisting = await this.showIncludeExistingDialog();
+			}
+
+			// Show quantity selection modal
+			const options = await this.showVariantOptionsModal();
+			if (!options) {
+				return;
+			}
+
+			// Show cost confirmation modal
+			const confirmed = await this.showGenerateVariantsConfirmation(currentVariant, existingVariants, includeExisting, options.quantity);
+			if (!confirmed) {
+				return;
+			}
+
+			// Show loading state
+			const generateBtn = document.getElementById("generate-variants-btn") as HTMLButtonElement;
+			if (generateBtn) {
+				generateBtn.textContent = "⏳ Generating...";
+				generateBtn.disabled = true;
+			}
+
+			// Execute the actual generation
+			await this.executeVariantGeneration(currentVariant, existingVariants, includeExisting, options.quantity);
+			
+		} catch (error) {
+			console.error("Error generating variants:", error);
+			new Notice(`Error generating variants: ${error instanceof Error ? error.message : String(error)}`);
+		} finally {
+			// Reset button state
+			const generateBtn = document.getElementById("generate-variants-btn") as HTMLButtonElement;
+			if (generateBtn) {
+				generateBtn.textContent = "🤖 Generate";
+				generateBtn.disabled = false;
+			}
+		}
+	}
+
+	private showVariantOptionsModal(): Promise<{ quantity: "one" | "many" } | null> {
+		return new Promise((resolve) => {
+			new VariantOptionsModal(
+				this.plugin,
+				(result) => resolve(result)
+			).open();
+		});
+	}
+
+	private showGenerateVariantsConfirmation(
+		currentVariant: CardVariant,
+		existingVariants: CardVariant[], 
+		includeExisting: boolean,
+		quantity: "one" | "many"
+	): Promise<boolean> {
+		return new Promise((resolve) => {
+			const modal = new ActionConfirmationModal(
+				this.plugin,
+				"Generate Card Variants",
+				() => {
+					// Build prompt for cost estimation
+					let promptVariants = "";
+					if (includeExisting) {
+						promptVariants = existingVariants.map((variant, index) => 
+							`${index + 1}. Front: ${variant.front}\n   Back: ${variant.back}`
+						).join("\n");
+					} else {
+						promptVariants = `1. Front: ${currentVariant.front}\n   Back: ${currentVariant.back}`;
+					}
+
+					const isMultiple = quantity === "many";
+					const quantityText = isMultiple ? "2–3 NEW" : "1 NEW";
+					const exampleCount = isMultiple ? 3 : 1;
+					
+					const prompt = `You are a flashcard variant generator.
+I will give you ${includeExisting ? 'existing flashcard variants' : 'a flashcard'} with "front" (question or prompt) and "back" (answer).
+Your task is to create ${quantityText} alternative version${isMultiple ? 's' : ''} that quiz${isMultiple ? '' : 'es'} the same knowledge.
+
+Rules for variants:
+- Each variant should quiz the **same knowledge** as the existing ones.
+- Rephrase the wording, structure, or phrasing, but do not change the meaning.
+- Keep the answer semantically equivalent, just optionally rephrased.
+- Variants should still be suitable for spaced repetition flashcards.
+- Do NOT repeat any of the existing variants - create NEW ones.
+
+${includeExisting ? 'Existing variants:' : 'Flashcard:'}
+${promptVariants}
+
+
+Now return JSON with ${quantityText.toLowerCase()} variant${isMultiple ? 's' : ''} in this format:
+
+{
+  "variants": [
+${Array.from({length: exampleCount}, (_, i) => `    {"front": "…", "back": "…"}${i < exampleCount - 1 ? ',' : ''}`).join('\n')}
+  ]
+}`;
+
+					return {
+						promptText: prompt,
+						imageCount: 0,
+						action: "generate_variants" as const,
+						details: { cardCount: isMultiple ? 3 : 1, isVariableOutput: isMultiple } // Estimate based on quantity
+					};
+				},
+				() => resolve(true)
+			);
+			
+			modal.onClose = () => resolve(false);
+			modal.open();
+		});
+	}
+
+	private async executeVariantGeneration(
+		currentVariant: CardVariant,
+		existingVariants: CardVariant[],
+		includeExisting: boolean,
+		quantity: "one" | "many"
+	) {
+
+		// Build prompt with existing variants if requested
+		let promptVariants = "";
+		if (includeExisting) {
+			promptVariants = existingVariants.map((variant, index) => 
+				`${index + 1}. Front: ${variant.front}\n   Back: ${variant.back}`
+			).join("\n");
+		} else {
+			promptVariants = `1. Front: ${currentVariant.front}\n   Back: ${currentVariant.back}`;
+		}
+
+		const isMultiple = quantity === "many";
+		const quantityText = isMultiple ? "2–3 NEW" : "1 NEW";
+		
+		const prompt = `You are a flashcard variant generator.
+I will give you ${includeExisting ? 'existing flashcard variants' : 'a flashcard'} with "front" (question or prompt) and "back" (answer).
+Your task is to create ${quantityText} alternative version${isMultiple ? 's' : ''} that quiz${isMultiple ? '' : 'es'} the same knowledge.
+
+Rules for variants:
+- Each variant should quiz the **same knowledge** as the existing ones.
+- Rephrase the wording, structure, or phrasing, but do not change the meaning.
+- Keep the answer semantically equivalent, just optionally rephrased.
+- Variants should still be suitable for spaced repetition flashcards.
+- Do NOT repeat any of the existing variants - create NEW ones.
+
+${includeExisting ? 'Existing variants:' : 'Flashcard:'}
+${promptVariants}
+
+Now return JSON with ${quantityText.toLowerCase()} variant${isMultiple ? 's' : ''} in this format:
+
+{
+  "variants": [
+${Array.from({length: isMultiple ? 3 : 1}, (_, i) => `    {"front": "…", "back": "…"}${i < (isMultiple ? 2 : 0) ? ',' : ''}`).join('\n')}
+  ]
+}`;
+
+		const response = await this.plugin.sendToLlm(prompt, [], {});
+		
+		// Parse the response
+		const variants = this.parseVariantResponse(response.content);
+		
+		if (variants && variants.length > 0) {
+			// Add the generated variants
+			if (!this.card.variants) {
+				this.card.variants = [];
+			}
+			
+			// Add new variants to the card
+			variants.forEach(variant => {
+				this.card.variants!.push({
+					front: variant.front.trim(),
+					back: variant.back.trim()
+				});
+			});
+			
+			// Refresh UI
+			this.refreshVariantDropdown();
+			this.syncFrontBackWithFirstVariant();
+			
+			new Notice(`✅ Generated ${variants.length} new variants!`);
+		} else {
+			throw new Error("No valid variants were generated");
+		}
+	}
+
+	private async showIncludeExistingDialog(): Promise<boolean> {
+		return new Promise((resolve) => {
+			const modal = new Modal(this.plugin.app);
+			modal.setTitle("Generate Variants");
+			
+			modal.contentEl.createEl("p", { 
+				text: "This card already has multiple variants. Should the AI consider all existing variants when generating new ones, or just use the current variant?" 
+			});
+			
+			const radioContainer = modal.contentEl.createDiv();
+			radioContainer.style.margin = "20px 0";
+			
+			const includeLabel = radioContainer.createEl("label");
+			includeLabel.style.display = "block";
+			includeLabel.style.marginBottom = "10px";
+			const includeRadio = includeLabel.createEl("input", { type: "radio", value: "include" });
+			includeRadio.name = "variant-generation-mode";
+			includeRadio.checked = true; // Default to true as requested
+			includeLabel.appendText(" Include all existing variants (recommended for better variety)");
+			
+			const currentOnlyLabel = radioContainer.createEl("label");
+			currentOnlyLabel.style.display = "block";
+			const currentOnlyRadio = currentOnlyLabel.createEl("input", { type: "radio", value: "current" });
+			currentOnlyRadio.name = "variant-generation-mode";
+			currentOnlyLabel.appendText(" Use only the current variant");
+			
+			const buttonContainer = modal.contentEl.createDiv();
+			buttonContainer.style.display = "flex";
+			buttonContainer.style.justifyContent = "flex-end";
+			buttonContainer.style.gap = "10px";
+			buttonContainer.style.marginTop = "20px";
+			
+			const generateBtn = buttonContainer.createEl("button", { text: "Generate", cls: "mod-cta" });
+			generateBtn.onclick = () => {
+				const includeExisting = (modal.contentEl.querySelector('input[name="variant-generation-mode"]:checked') as HTMLInputElement)?.value === "include";
+				modal.close();
+				resolve(includeExisting);
+			};
+			
+			const cancelBtn = buttonContainer.createEl("button", { text: "Cancel" });
+			cancelBtn.onclick = () => {
+				modal.close();
+				resolve(false);
+			};
+			
+			modal.onClose = () => resolve(false);
+			modal.open();
+		});
+	}
+
+	private parseVariantResponse(response: string): Array<{front: string, back: string}> | null {
+		try {
+			// Try to extract JSON from the response
+			const jsonMatch = response.match(/\{[\s\S]*\}/);
+			if (!jsonMatch) {
+				throw new Error("No JSON found in response");
+			}
+			
+			const parsed = JSON.parse(jsonMatch[0]);
+			
+			if (!parsed.variants || !Array.isArray(parsed.variants)) {
+				throw new Error("Response doesn't contain variants array");
+			}
+			
+			// Validate each variant
+			const validVariants = parsed.variants.filter((variant: any) => 
+				variant.front && variant.back && 
+				typeof variant.front === 'string' && 
+				typeof variant.back === 'string' &&
+				variant.front.trim().length > 0 && 
+				variant.back.trim().length > 0
+			);
+			
+			return validVariants;
+		} catch (error) {
+			console.error("Error parsing variant response:", error);
+			return null;
+		}
 	}
 
 	private _createCardsFromLlmResponse(response: string): Flashcard[] {
@@ -12459,6 +12982,62 @@ class RefocusOptionsModal extends Modal {
 }
 
 /**
+ * A modal for selecting options before "generating variants" for a card with AI.
+ */
+class VariantOptionsModal extends Modal {
+	constructor(
+		private plugin: GatedNotesPlugin,
+		private onDone: (
+			result: {
+				quantity: "one" | "many";
+			} | null
+		) => void
+	) {
+		super(plugin.app);
+	}
+
+	onOpen() {
+		this.titleEl.setText("Generate Variants");
+		makeModalDraggable(this, this.plugin);
+
+		let choiceMade = false;
+
+		this.contentEl.createEl("p", {
+			text: "How many variant flashcards would you like to generate?",
+		});
+
+		const btnRow = this.contentEl.createDiv({ cls: "gn-edit-btnrow" });
+
+		new ButtonComponent(btnRow).setButtonText("Cancel").onClick(() => {
+			choiceMade = true;
+			this.close();
+			this.onDone(null);
+		});
+
+		new ButtonComponent(btnRow).setButtonText("Just One").onClick(() => {
+			choiceMade = true;
+			this.close();
+			this.onDone({ quantity: "one" });
+		});
+
+		new ButtonComponent(btnRow)
+			.setButtonText("One or More")
+			.setCta()
+			.onClick(() => {
+				choiceMade = true;
+				this.close();
+				this.onDone({ quantity: "many" });
+			});
+
+		this.onClose = () => {
+			if (!choiceMade) {
+				this.onDone(null);
+			}
+		};
+	}
+}
+
+/**
  * A modal for selecting options before "splitting" a card with AI.
  */
 class SplitOptionsModal extends Modal {
@@ -12699,9 +13278,10 @@ class CardBrowser extends Modal {
 					setIcon(iconSpan, "flag");
 				}
 				
-				// Add card label
+				// Add card label (using first variant)
 				const labelSpan = row.createEl("span");
-				labelSpan.setText(card.front || "(empty front)");
+				const firstVariant = this.plugin.getCurrentVariant(card, 0);
+				labelSpan.setText(firstVariant.front || "(empty front)");
 
 				row.onclick = () => {
 					this.plugin.openEditModal(card, graph, deck, async () => {
