@@ -31,6 +31,7 @@ export default {
 	file: 'main.js',
 	format: 'cjs',
 	sourcemap: true,
+	inlineDynamicImports: true,
   },
   external: ['obsidian'],
   plugins: [

@@ -84,6 +84,15 @@ interface CardVariant {
 	back: string;
 }
 
+interface MnemonicEntry {
+	number: string;
+	words: string[];
+	selected?: string;
+	position: 'front' | 'back';
+	story?: string;
+	source?: string; // The original text that generated this number (e.g., "4:9")
+}
+
 interface Flashcard {
 	id: string;
 	// Legacy fields for backwards compatibility
@@ -105,6 +114,10 @@ interface Flashcard {
 	flagged?: boolean;
 	suspended?: boolean;
 	buried?: boolean;
+	mnemonics?: {
+		majorSystem?: MnemonicEntry[];
+		enabled?: boolean;
+	};
 }
 
 interface FlashcardGraph {
@@ -2660,6 +2673,362 @@ class SnippingTool {
 }
 
 /**
+ * Major System utilities for mnemonic generation
+ * Based on jmandel/mnemonics project (MIT License)
+ * Converts numbers to memorable words using phonetic encoding
+ */
+class MajorSystemUtils {
+	private static readonly PHONEME_TO_DIGIT: Record<string, string> = {
+		"S": "0", "Z": "0",
+		"T": "1", "D": "1", "TH": "1", "DH": "1",
+		"N": "2",
+		"M": "3",
+		"R": "4",
+		"L": "5",
+		"CH": "6", "JH": "6", "SH": "6", "ZH": "6",
+		"K": "7", "G": "7", "NG": "7",
+		"F": "8", "V": "8",
+		"P": "9", "B": "9"
+	};
+
+	private static cmuDictionary: Record<string, Array<{word: string, freq: number}>> | null = null;
+	private static isLoading = false;
+
+	// Fallback dictionary while CMU loads
+	private static readonly FALLBACK_WORDS: Record<string, string[]> = {
+		// Single digits
+		"0": ["sea", "zoo", "sew", "say", "sue", "so", "saw", "soy", "ass", "ice", "ace", "eyes"],
+		"1": ["tea", "toe", "day", "die", "tie", "two", "do", "ate", "it", "at", "eat", "out"],
+		"2": ["no", "new", "knee", "gnu", "now", "nay", "in", "an", "on", "own", "any", "ion"],
+		"3": ["me", "may", "mow", "ma", "my", "am", "him", "home", "aim", "mime", "mama", "memo"],
+		"4": ["row", "ray", "rye", "are", "ear", "ore", "eye", "air", "our", "hour", "hero", "rear"],
+		"5": ["law", "lay", "lie", "low", "Lee", "loo", "ally", "owl", "ale", "oil", "all", "ill"],
+		"6": ["shoe", "jay", "shy", "show", "she", "ash", "age", "edge", "huge", "wash", "wish", "josh"],
+		"7": ["key", "go", "gay", "cue", "cow", "guy", "oak", "ago", "ego", "awe", "ache", "hook"],
+		"8": ["fee", "vie", "foe", "via", "if", "off", "ivy", "have", "wave", "wife", "ove", "eff"],
+		"9": ["bee", "pay", "pie", "bow", "boy", "ape", "pub", "bay", "buy", "by", "hope", "baby"],
+		
+		// Two digits - common combinations
+		"10": ["test", "taste", "dust", "toast", "twist", "toss", "tease", "dose", "daze", "dice"],
+		"11": ["toad", "dude", "dead", "dot", "deed", "did", "dad", "date", "diet", "donut", "tent"],
+		"12": ["tan", "ton", "den", "tune", "tin", "down", "teen", "den", "dawn", "dine", "tune"],
+		"13": ["team", "dam", "time", "tomb", "dime", "tame", "dome", "dime", "atom", "item"],
+		"14": ["tire", "door", "tear", "tree", "tar", "deer", "dear", "dare", "draw", "true"],
+		"15": ["tail", "dale", "doll", "tool", "tall", "deal", "dial", "till", "dull", "tile"],
+		"16": ["dish", "touch", "teach", "ditch", "dutch", "tissue", "dosage", "damage", "dodge"],
+		"17": ["dog", "twig", "duck", "take", "deck", "dug", "tag", "took", "thick", "toy"],
+		"18": ["dove", "deaf", "tough", "dive", "taffy", "turf", "tooth", "depth", "thief"],
+		"19": ["dip", "top", "tape", "tap", "type", "tip", "deep", "tab", "tub", "tube"],
+		
+		"20": ["nose", "news", "noose", "nice", "noise", "nase", "nurse", "knows", "nice", "nets"],
+		"21": ["net", "note", "knot", "neat", "night", "nut", "not", "ant", "aunt", "nude"],
+		"30": ["mouse", "miss", "moss", "mess", "mass", "moose", "maze", "music", "mask", "mesa"],
+		"40": ["rose", "rice", "race", "ruse", "rays", "raise", "rose", "rush", "rich", "reach"],
+		"49": ["rope", "robe", "rap", "rib", "rip", "ruby", "rep", "rub", "rab", "rape", "reap"],
+		"50": ["lace", "loss", "loose", "lease", "lose", "lasso", "lazy", "lies", "laws", "less"],
+		
+		// Three digits - some common ones
+		"100": ["doses", "daisies", "tissues", "teaches", "touches", "tosses", "dazzles", "tassels"],
+		"101": ["test", "toast", "tasted", "twisted", "dusted", "totted", "tutted", "toasted"],
+		"123": ["dynamite", "detonate", "dainty", "distant", "destiny", "dustman", "dustmen"]
+	};
+
+	static detectNumbers(text: string): Array<{number: string, position: number, source: string}> {
+		console.log('🔍 Detecting numbers in text:', `"${text}"`);
+		const numbers: Array<{number: string, position: number, source: string}> = [];
+		
+		// First, find patterns with digits separated by non-word characters
+		// Examples: "4:9" -> "49", "14:3" -> "143", "1-2-3" -> "123"
+		const combinedMatches = text.matchAll(/\b\d+(?:[^\w\s]+\d+)+\b/g);
+		const combinedSources = new Set<string>();
+		
+		for (const match of combinedMatches) {
+			const sourceText = match[0]; // e.g., "4:9"
+			const combined = sourceText.replace(/[^\d]/g, ''); // e.g., "49"
+			const individualDigits = sourceText.match(/\d+/g) || []; // e.g., ["4", "9"]
+			
+			console.log(`🔍 Found combined pattern: "${sourceText}" -> combined: "${combined}", individual: [${individualDigits.join(', ')}]`);
+			
+			combinedSources.add(sourceText);
+			
+			// Add the combined number
+			if (combined.length > 1) {
+				numbers.push({
+					number: combined,
+					position: match.index || 0,
+					source: sourceText
+				});
+			}
+			
+			// Add individual numbers from this source
+			individualDigits.forEach(digit => {
+				numbers.push({
+					number: digit,
+					position: match.index || 0,
+					source: sourceText // Same source as the combined number!
+				});
+			});
+		}
+
+		// Then find standalone individual numbers (not part of combined patterns)
+		const individualMatches = text.matchAll(/\b\d+\b/g);
+		for (const match of individualMatches) {
+			// Check if this number is already part of a combined pattern
+			const matchText = match[0];
+			const matchPos = match.index || 0;
+			
+			let isPartOfCombined = false;
+			for (const combinedMatch of text.matchAll(/\b\d+(?:[^\w\s]+\d+)+\b/g)) {
+				const combinedStart = combinedMatch.index || 0;
+				const combinedEnd = combinedStart + combinedMatch[0].length;
+				if (matchPos >= combinedStart && matchPos < combinedEnd) {
+					isPartOfCombined = true;
+					break;
+				}
+			}
+			
+			if (!isPartOfCombined) {
+				numbers.push({
+					number: matchText,
+					position: matchPos,
+					source: matchText // Standalone numbers are their own source
+				});
+			}
+		}
+
+		// Remove duplicates and sort by position
+		const unique = numbers.filter((num, index, arr) => 
+			arr.findIndex(n => n.number === num.number && n.position === num.position && n.source === num.source) === index
+		);
+		
+		const sorted = unique.sort((a, b) => a.position - b.position);
+		console.log('🔍 Final detected numbers:', sorted.map(n => `${n.number}(from: ${n.source})`));
+		return sorted;
+	}
+
+	static async loadCMUDictionary(plugin: GatedNotesPlugin): Promise<void> {
+		if (this.cmuDictionary || this.isLoading) return;
+		
+		console.log('🧠 Starting CMU dictionary loading...');
+		this.isLoading = true;
+		try {
+			// Load from embedded base64 dictionary
+			console.log('🧠 Loading compressed dictionary data...');
+			const { CMU_DICT_COMPRESSED_BASE64 } = await import('./cmudict-data');
+			console.log('🧠 Base64 data length:', CMU_DICT_COMPRESSED_BASE64.length, 'chars');
+			
+			// Decode base64 to binary data
+			const binaryString = atob(CMU_DICT_COMPRESSED_BASE64);
+			const bytes = new Uint8Array(binaryString.length);
+			for (let i = 0; i < binaryString.length; i++) {
+				bytes[i] = binaryString.charCodeAt(i);
+			}
+			console.log('🧠 Decoded to binary, size:', bytes.length, 'bytes');
+			
+			// Decompress using pako
+			console.log('🧠 Decompressing with pako...');
+			const pako = await import('pako');
+			const decompressedData = pako.inflate(bytes, { to: 'string' });
+			const decompressed = decompressedData;
+			console.log('🧠 Decompressed size:', decompressed.length, 'chars');
+			
+			// Parse the JSON dictionary
+			const rawDict = JSON.parse(decompressed);
+			console.log('🧠 CMU dictionary parsed successfully, raw entries:', Object.keys(rawDict).length);
+			
+			// Process the dictionary - it's already organized by Major System digits!
+			console.log('🧠 Processing dictionary entries (already in Major System format)...');
+			this.cmuDictionary = {};
+			let processedDigits = 0;
+			let totalWords = 0;
+			
+			for (const [digits, wordList] of Object.entries(rawDict)) {
+				processedDigits++;
+				
+				// Debug first few entries to understand format
+				if (processedDigits <= 3) {
+					console.log(`🧠 Sample entry: digit "${digits}" ->`, wordList, `(type: ${typeof wordList}, length: ${Array.isArray(wordList) ? wordList.length : 'N/A'})`);
+				}
+				
+				// Validate that wordList is an array of word objects
+				if (Array.isArray(wordList)) {
+					const validWords = wordList
+						.filter(entry => entry && typeof entry === 'object' && entry.word && typeof entry.word === 'string')
+						.map(entry => ({
+							word: entry.word.toLowerCase(),
+							freq: entry.freq || 1000 // Use existing frequency or default
+						}));
+					
+					if (validWords.length > 0) {
+						// Sort by frequency (descending)
+						this.cmuDictionary[digits] = validWords.sort((a, b) => b.freq - a.freq);
+						totalWords += validWords.length;
+					}
+				}
+			}
+			
+			console.log('🧠 CMU dictionary processed successfully!');
+			console.log('🧠 Processed digit patterns:', processedDigits);
+			console.log('🧠 Valid digit patterns with words:', Object.keys(this.cmuDictionary).length);
+			console.log('🧠 Total words loaded:', totalWords);
+			
+			// Log some examples for debugging
+			console.log('🧠 Sample mappings:');
+			const sampleDigits = ['8', '3', '83', '1', '2', '12'];
+			for (const digits of sampleDigits) {
+				const words = this.cmuDictionary[digits];
+				if (words && words.length > 0) {
+					console.log(`🧠   ${digits} -> [${words.slice(0, 3).map(w => w.word).join(', ')}] (${words.length} total)`);
+				} else {
+					console.log(`🧠   ${digits} -> no words found`);
+				}
+			}
+			
+		} catch (error) {
+			console.warn('Failed to load CMU dictionary, using fallback:', error);
+		} finally {
+			this.isLoading = false;
+		}
+	}
+
+	private static pronunciationToDigits(pronunciation: any): string | null {
+		const digits: string[] = [];
+		
+		// Handle different possible formats
+		let phonemes: string[] = [];
+		if (Array.isArray(pronunciation)) {
+			phonemes = pronunciation;
+		} else if (typeof pronunciation === 'string') {
+			// If it's a string, split by spaces
+			phonemes = pronunciation.split(' ');
+		} else {
+			console.warn('🧠 Unexpected pronunciation format:', pronunciation);
+			return null;
+		}
+		
+		for (const phoneme of phonemes) {
+			if (typeof phoneme !== 'string') {
+				console.warn('🧠 Non-string phoneme:', phoneme);
+				continue;
+			}
+			
+			// Remove stress markers (digits) from phonemes
+			const cleanPhoneme = phoneme.replace(/\d+$/, '');
+			const digit = this.PHONEME_TO_DIGIT[cleanPhoneme];
+			if (digit !== undefined) {
+				digits.push(digit);
+			}
+		}
+		
+		return digits.length > 0 ? digits.join('') : null;
+	}
+
+	private static getWordFrequency(word: string): number {
+		// Basic frequency estimation based on word length and common patterns
+		// This is a simplified approach - ideally we'd use actual frequency data
+		const baseFreq = 1000;
+		const lengthBonus = Math.max(0, 5 - word.length) * 100; // Prefer shorter words
+		
+		// Bonus for common words
+		const commonWords = ['the', 'and', 'you', 'are', 'not', 'can', 'had', 'her', 'was', 'one', 'our', 'out', 'day', 'get', 'has', 'him', 'his', 'how', 'its', 'may', 'new', 'now', 'old', 'see', 'two', 'way', 'who', 'boy', 'did', 'man', 'car', 'eat', 'job', 'let', 'put', 'end', 'far', 'fun', 'got', 'home', 'left', 'life', 'live', 'look', 'made', 'make', 'move', 'must', 'name', 'need', 'open', 'over', 'play', 'read', 'right', 'run', 'same', 'show', 'take', 'tell', 'turn', 'walk', 'want', 'well', 'went', 'were', 'what', 'when', 'will', 'work', 'year'];
+		const commonBonus = commonWords.includes(word.toLowerCase()) ? 2000 : 0;
+		
+		return baseFreq + lengthBonus + commonBonus;
+	}
+
+	static getWordCandidates(number: string, maxCandidates: number = 12): string[] {
+		console.log(`💭 Getting word candidates for number "${number}"`);
+		
+		// Use CMU dictionary if available
+		if (this.cmuDictionary) {
+			console.log(`💭 Using CMU dictionary (${Object.keys(this.cmuDictionary).length} patterns available)`);
+			const entries = this.cmuDictionary[number] || [];
+			console.log(`💭 Found ${entries.length} CMU entries for "${number}"`);
+			
+			// Sort by frequency (descending) and take top candidates
+			const sorted = entries
+				.filter(entry => entry.word && entry.word.length > 0)
+				.sort((a, b) => b.freq - a.freq)
+				.slice(0, maxCandidates)
+				.map(entry => entry.word);
+			
+			if (sorted.length > 0) {
+				console.log(`💭 Returning ${sorted.length} CMU words for "${number}":`, sorted);
+				return sorted;
+			} else {
+				console.log(`💭 No valid CMU words found for "${number}", trying fallback...`);
+			}
+		} else {
+			console.log(`💭 CMU dictionary not available, using fallback dictionary`);
+		}
+		
+		// Fallback to basic dictionary
+		const words = this.FALLBACK_WORDS[number] || [];
+		console.log(`💭 Returning ${words.length} fallback words for "${number}":`, words.slice(0, maxCandidates));
+		return words.slice(0, maxCandidates);
+	}
+
+	static generateMnemonics(text: string, position: 'front' | 'back'): MnemonicEntry[] {
+		console.log(`🎯 Generating mnemonics for ${position} text: "${text}"`);
+		const detectedNumbers = this.detectNumbers(text);
+		const mnemonics: MnemonicEntry[] = [];
+
+		for (const {number, source} of detectedNumbers) {
+			console.log(`🎯 Processing number "${number}" from source "${source}"`);
+			const words = this.getWordCandidates(number);
+			if (words.length > 0) {
+				mnemonics.push({
+					number,
+					words,
+					position,
+					selected: undefined, // No default selection
+					source: source // Track what text generated this number
+				});
+				console.log(`🎯 Added mnemonic for "${number}": ${words.length} words`);
+			} else {
+				console.log(`🎯 No words found for "${number}", skipping`);
+			}
+		}
+
+		console.log(`🎯 Generated ${mnemonics.length} mnemonics total`);
+		return mnemonics;
+	}
+
+	// Helper method to detect conflicting numbers (overlapping digits)
+	static getConflictingNumbers(mnemonics: MnemonicEntry[]): Map<string, string[]> {
+		const conflicts = new Map<string, string[]>();
+		
+		// Helper function to add bidirectional conflicts
+		const addConflict = (num1: string, num2: string) => {
+			if (!conflicts.has(num1)) conflicts.set(num1, []);
+			if (!conflicts.has(num2)) conflicts.set(num2, []);
+			conflicts.get(num1)!.push(num2);
+			conflicts.get(num2)!.push(num1);
+		};
+		
+		for (let i = 0; i < mnemonics.length; i++) {
+			for (let j = i + 1; j < mnemonics.length; j++) {
+				const m1 = mnemonics[i];
+				const m2 = mnemonics[j];
+				
+				if (m1.source === m2.source) {
+					// They're from the same source
+					const longerNum = m1.number.length > m2.number.length ? m1.number : m2.number;
+					const shorterNum = m1.number.length > m2.number.length ? m2.number : m1.number;
+					
+					// If one number contains the other's digits, they conflict
+					// e.g., "49" contains "4" and "9"
+					if (longerNum.length > shorterNum.length && longerNum.includes(shorterNum)) {
+						addConflict(m1.number, m2.number);
+					}
+				}
+			}
+		}
+		return conflicts;
+	}
+}
+
+/**
  * The main class for the Gated Notes plugin, handling all logic and UI.
  */
 export default class GatedNotesPlugin extends Plugin {
@@ -2761,6 +3130,11 @@ export default class GatedNotesPlugin extends Plugin {
 		this.imageManager = new ImageManager(this);
 		this.imageStitcher = new ImageStitcher(this);
 		this.snippingTool = new SnippingTool(this);
+
+		// Load CMU dictionary for mnemonic generation (async, non-blocking)
+		MajorSystemUtils.loadCMUDictionary(this).catch(err => {
+			console.warn('Failed to load CMU dictionary:', err);
+		});
 
 		this.setupStatusBar();
 		this.addSettingTab(new GNSettingsTab(this.app, this));
@@ -6189,6 +6563,11 @@ ${selection}
 				.setButtonText("Show Answer")
 				.setCta();
 
+			const mnemonicBtn = new ButtonComponent(bottomBar)
+				.setIcon("brain")
+				.setTooltip("View mnemonics")
+				.onClick(() => this.showMnemonicsPanel(card, selectedVariant, modal));
+
 			modal.contentEl.createEl("hr");
 
 			const showAnswer = async () => {
@@ -6387,6 +6766,66 @@ ${selection}
 
 			modal.open();
 		});
+	}
+
+	private showMnemonicsPanel(card: Flashcard, variant: CardVariant, parentModal: Modal): void {
+		// Check if card has saved mnemonics
+		if (!card.mnemonics?.majorSystem || card.mnemonics.majorSystem.length === 0) {
+			new Notice("No mnemonics saved for this card. Use the Edit modal to create mnemonics first.");
+			return;
+		}
+
+		// Create a modal for viewing saved mnemonics
+		const mnemonicModal = new Modal(this.app);
+		mnemonicModal.titleEl.setText("🧠 Saved Mnemonics");
+		
+		const content = mnemonicModal.contentEl;
+		content.createEl("p", { text: "Your saved mnemonic words:" });
+
+		card.mnemonics.majorSystem.forEach((mnemonic, index) => {
+			const mnemonicDiv = content.createDiv({ cls: "mnemonic-entry" });
+			
+			// Number and position
+			const header = mnemonicDiv.createEl("h4", { 
+				text: `${mnemonic.number} (${mnemonic.position})${mnemonic.source && mnemonic.source !== mnemonic.number ? ` from "${mnemonic.source}"` : ""}`
+			});
+			
+			// Show selected word (read-only)
+			const selectedWord = mnemonicDiv.createDiv({ cls: "mnemonic-selected" });
+			selectedWord.createEl("strong", { text: mnemonic.selected || "No word selected" });
+
+			// Add some spacing
+			if (index < card.mnemonics!.majorSystem!.length - 1) {
+				mnemonicDiv.createEl("hr");
+			}
+		});
+
+		// Close button
+		const buttonDiv = content.createDiv({ cls: "mnemonic-buttons" });
+		new ButtonComponent(buttonDiv)
+			.setButtonText("Close")
+			.setCta()
+			.onClick(() => mnemonicModal.close());
+
+		// Style the modal
+		content.createEl("style", {
+			text: `
+				.mnemonic-entry { margin: 15px 0; }
+				.mnemonic-selected { 
+					margin: 10px 0; 
+					padding: 8px 12px; 
+					background: var(--background-primary-alt);
+					border-radius: 6px;
+					font-size: 16px;
+				}
+				.mnemonic-buttons { 
+					margin-top: 20px; 
+					text-align: center; 
+				}
+			`
+		});
+
+		mnemonicModal.open();
 	}
 
 	/**
@@ -12113,6 +12552,8 @@ class EditModal extends Modal {
 	private variantLabelEl!: HTMLLabelElement;
 	private frontInput!: HTMLTextAreaElement;
 	private backInput!: HTMLTextAreaElement;
+	private mnemonicContainer!: HTMLDivElement;
+	private currentMnemonics: MnemonicEntry[] = [];
 
 	constructor(
 		private plugin: GatedNotesPlugin,
@@ -12192,7 +12633,11 @@ class EditModal extends Modal {
 			this.saveCurrentVariant();
 			this.currentVariantIndex = parseInt(this.variantDropdown.value);
 			this.populateFieldsFromCurrentVariant();
+			this.updateMnemonicsDisplay(); // Update mnemonics display when variant changes
 		};
+
+		// Add mnemonic section
+		this.createMnemonicSection(editPane);
 
 		const tagInput = createRow("Tag:", editPane).createEl("textarea", {
 			attr: { rows: 2 },
@@ -13063,6 +13508,318 @@ Return ONLY valid JSON array of this shape: [{"front":"...","back":"..."}]`;
 				}
 			).open();
 		}).open();
+	}
+
+	private createMnemonicSection(editPane: HTMLElement): void {
+		const mnemonicRow = editPane.createDiv({ cls: "gn-edit-row" });
+		mnemonicRow.createEl("label", { text: "🧠 Mnemonics:" });
+		
+		this.mnemonicContainer = mnemonicRow.createDiv({ cls: "mnemonic-container" });
+		
+		// Button to open mnemonics modal
+		const editMnemonicsBtn = mnemonicRow.createEl("button", { text: "Edit Mnemonics" });
+		editMnemonicsBtn.style.marginLeft = "10px";
+		editMnemonicsBtn.onclick = () => this.openMnemonicsModal();
+		
+		// Initialize display
+		this.updateMnemonicsDisplay();
+	}
+
+	private updateMnemonicsDisplay(): void {
+		// Clear existing content
+		this.mnemonicContainer.empty();
+		
+		// Show saved mnemonics if any
+		if (this.card.mnemonics?.majorSystem && this.card.mnemonics.majorSystem.length > 0) {
+			this.card.mnemonics.majorSystem.forEach((mnemonic, index) => {
+				const mnemonicDiv = this.mnemonicContainer.createDiv({ cls: "saved-mnemonic" });
+				
+				const headerText = `${mnemonic.number} (${mnemonic.position})${
+					mnemonic.source && mnemonic.source !== mnemonic.number 
+						? ` from "${mnemonic.source}"` 
+						: ""
+				}`;
+				
+				mnemonicDiv.createEl("span", { text: headerText, cls: "mnemonic-header" });
+				mnemonicDiv.createEl("span", { text: " → ", cls: "mnemonic-arrow" });
+				mnemonicDiv.createEl("strong", { text: mnemonic.selected || "No word selected" });
+			});
+		} else {
+			this.mnemonicContainer.createEl("div", { 
+				text: "No mnemonics configured",
+				cls: "mnemonic-empty"
+			});
+		}
+	}
+	
+	private openMnemonicsModal(): void {
+		// Save current variant first to ensure we're working with latest content
+		this.saveCurrentVariant();
+		const currentVariant = this.plugin.getCurrentVariant(this.card, this.currentVariantIndex);
+		
+		new MnemonicsModal(
+			this.plugin,
+			this.card,
+			currentVariant,
+			async (selectedMnemonics: MnemonicEntry[]) => {
+				// Save mnemonics to card
+				if (!this.card.mnemonics) {
+					this.card.mnemonics = {};
+				}
+				this.card.mnemonics.majorSystem = selectedMnemonics;
+				this.card.mnemonics.enabled = selectedMnemonics.length > 0;
+				
+				// Update display
+				this.updateMnemonicsDisplay();
+				
+				new Notice(`${selectedMnemonics.length} mnemonics saved!`);
+			}
+		).open();
+	}
+}
+
+/**
+ * A dedicated modal for viewing and editing mnemonic selections
+ */
+class MnemonicsModal extends Modal {
+	private currentMnemonics: MnemonicEntry[] = [];
+
+	constructor(
+		private plugin: GatedNotesPlugin,
+		private card: Flashcard,
+		private variant: CardVariant,
+		private onSave: (mnemonics: MnemonicEntry[]) => void
+	) {
+		super(plugin.app);
+	}
+
+	onOpen() {
+		this.titleEl.setText("🧠 Configure Mnemonics");
+		makeModalDraggable(this, this.plugin);
+		
+		// Generate mnemonics from current variant
+		const frontMnemonics = MajorSystemUtils.generateMnemonics(this.variant.front, 'front');
+		const backMnemonics = MajorSystemUtils.generateMnemonics(this.variant.back, 'back');
+		this.currentMnemonics = [...frontMnemonics, ...backMnemonics];
+		
+		// Load existing selections if available
+		if (this.card.mnemonics?.majorSystem) {
+			this.currentMnemonics.forEach(current => {
+				const existing = this.card.mnemonics!.majorSystem!.find(
+					saved => saved.number === current.number && saved.position === current.position
+				);
+				if (existing?.selected) {
+					current.selected = existing.selected;
+				}
+			});
+		}
+		
+		if (this.currentMnemonics.length === 0) {
+			this.contentEl.createEl("p", { text: "No numbers detected in this card for mnemonic generation." });
+			this.addCloseButton();
+			this.addStyles();
+			return;
+		}
+		
+		this.contentEl.createEl("p", { text: "Select mnemonic words for each number:" });
+		this.renderMnemonics();
+		this.addButtons();
+		this.addStyles();
+	}
+	
+	private renderMnemonics(): void {
+		const conflicts = MajorSystemUtils.getConflictingNumbers(this.currentMnemonics);
+		
+		this.currentMnemonics.forEach((mnemonic, index) => {
+			const mnemonicDiv = this.contentEl.createDiv({ cls: "mnemonic-entry" });
+			
+			// Number header
+			const headerText = `${mnemonic.number} (${mnemonic.position})${
+				mnemonic.source && mnemonic.source !== mnemonic.number 
+					? ` from "${mnemonic.source}"` 
+					: ""
+			}`;
+			mnemonicDiv.createEl("h4", { text: headerText });
+			
+			// Word selection area
+			const wordContainer = mnemonicDiv.createDiv({ cls: "mnemonic-words" });
+			
+			// Show first 8 words by default
+			const initialWords = mnemonic.words.slice(0, 8);
+			const remainingWords = mnemonic.words.slice(8);
+			
+			this.renderWordButtons(wordContainer, initialWords, mnemonic, conflicts);
+			
+			// "Show more" functionality
+			if (remainingWords.length > 0) {
+				const showMoreBtn = wordContainer.createEl("button", { 
+					text: `Show ${remainingWords.length} more`,
+					cls: "mnemonic-show-more"
+				});
+				
+				showMoreBtn.addEventListener('click', () => {
+					showMoreBtn.remove();
+					this.renderWordButtons(wordContainer, remainingWords, mnemonic, conflicts);
+				});
+			}
+			
+			if (index < this.currentMnemonics.length - 1) {
+				mnemonicDiv.createEl("hr");
+			}
+		});
+	}
+	
+	private renderWordButtons(
+		container: HTMLElement, 
+		words: string[], 
+		mnemonic: MnemonicEntry, 
+		conflicts: Map<string, string[]>
+	): void {
+		words.forEach(word => {
+			const wordBtn = container.createEl("button", { 
+				text: word,
+				cls: mnemonic.selected === word ? "mnemonic-word selected" : "mnemonic-word"
+			});
+			
+			wordBtn.addEventListener('click', () => {
+				// If clicking the same word, deselect it
+				if (mnemonic.selected === word) {
+					mnemonic.selected = undefined;
+				} else {
+					// Handle mutual exclusion - clear conflicting selections
+					if (conflicts.has(mnemonic.number)) {
+						const conflictingNumbers = conflicts.get(mnemonic.number)!;
+						this.currentMnemonics.forEach(m => {
+							if (conflictingNumbers.includes(m.number)) {
+								m.selected = undefined;
+							}
+						});
+					}
+					
+					// Set new selection
+					mnemonic.selected = word;
+				}
+				
+				this.updateSelectionDisplay();
+			});
+		});
+	}
+	
+	private refreshDisplay(): void {
+		this.contentEl.empty();
+		this.renderMnemonics();
+		this.addButtons();
+	}
+	
+	private updateSelectionDisplay(): void {
+		// Update all word button states without rebuilding the entire modal
+		const wordButtons = this.contentEl.querySelectorAll('.mnemonic-word') as NodeListOf<HTMLButtonElement>;
+		
+		wordButtons.forEach(button => {
+			const buttonText = button.textContent;
+			let isSelected = false;
+			
+			// Find which mnemonic this button belongs to
+			for (const mnemonic of this.currentMnemonics) {
+				if (mnemonic.selected === buttonText) {
+					isSelected = true;
+					break;
+				}
+			}
+			
+			// Update button appearance
+			if (isSelected) {
+				button.classList.add('selected');
+			} else {
+				button.classList.remove('selected');
+			}
+		});
+	}
+	
+	private addButtons(): void {
+		const buttonContainer = this.contentEl.createDiv({ cls: "mnemonic-modal-buttons" });
+		
+		new ButtonComponent(buttonContainer)
+			.setButtonText("Save")
+			.setCta()
+			.onClick(() => {
+				const selectedMnemonics = this.currentMnemonics.filter(m => m.selected);
+				this.onSave(selectedMnemonics);
+				this.close();
+			});
+			
+		new ButtonComponent(buttonContainer)
+			.setButtonText("Cancel")
+			.onClick(() => this.close());
+	}
+	
+	private addCloseButton(): void {
+		const buttonContainer = this.contentEl.createDiv({ cls: "mnemonic-modal-buttons" });
+		new ButtonComponent(buttonContainer)
+			.setButtonText("Close")
+			.onClick(() => this.close());
+	}
+	
+	private addStyles(): void {
+		this.contentEl.createEl("style", {
+			text: `
+				.mnemonic-entry { margin: 15px 0; }
+				.mnemonic-words { margin: 10px 0; }
+				.mnemonic-word { 
+					display: inline-block; 
+					margin: 3px 5px; 
+					padding: 6px 12px; 
+					background: var(--background-modifier-border);
+					border: 1px solid var(--background-modifier-border);
+					border-radius: 6px;
+					cursor: pointer;
+					transition: all 0.2s ease;
+					font-size: 14px;
+				}
+				.mnemonic-word:hover { 
+					background: var(--background-modifier-hover);
+					border-color: var(--background-modifier-hover);
+				}
+				.mnemonic-word.selected { 
+					background: var(--interactive-accent); 
+					color: var(--text-on-accent);
+					border-color: var(--interactive-accent);
+					font-weight: bold;
+				}
+				.mnemonic-show-more {
+					margin: 5px;
+					padding: 4px 8px;
+					background: var(--background-secondary);
+					border: 1px dashed var(--background-modifier-border);
+					border-radius: 4px;
+					cursor: pointer;
+					font-size: 12px;
+					opacity: 0.7;
+				}
+				.mnemonic-show-more:hover {
+					opacity: 1;
+					background: var(--background-modifier-hover);
+				}
+				.mnemonic-modal-buttons { 
+					margin-top: 20px; 
+					text-align: center; 
+				}
+				.mnemonic-modal-buttons button { margin: 0 5px; }
+				.saved-mnemonic {
+					margin: 5px 0;
+					padding: 4px 0;
+					font-size: 14px;
+				}
+				.mnemonic-arrow {
+					color: var(--text-muted);
+					margin: 0 5px;
+				}
+			`
+		});
+	}
+	
+	onClose() {
+		this.contentEl.empty();
 	}
 }
 
