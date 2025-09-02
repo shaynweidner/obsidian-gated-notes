@@ -2673,6 +2673,8 @@ export default class GatedNotesPlugin extends Plugin {
 		editorScroll: 0,
 		isFirstRender: true,
 	};
+	private explorerObserver: MutationObserver | null = null;
+	private decorateTimeout: NodeJS.Timeout | null = null;
 
 	private statusBar!: HTMLElement;
 	private gatingStatus!: HTMLElement;
@@ -2685,6 +2687,71 @@ export default class GatedNotesPlugin extends Plugin {
 	public imageManager!: ImageManager;
 	public imageStitcher!: ImageStitcher;
 	public snippingTool!: SnippingTool;
+
+	private subjectOf(path: string): string {
+		return path.split("/")[0] ?? "";
+	}
+
+	public async gatherVaultStatistics(): Promise<{
+		totalCards: number;
+		byStatus: { new: number; learning: number; review: number; relearn: number };
+		byState: { due: number; blocked: number; suspended: number; buried: number; flagged: number; missingParaIdx: number };
+		bySubject: Array<{ subject: string; total: number; due: number; blocked: number }>;
+	}> {
+		const stats = {
+			totalCards: 0,
+			byStatus: { new: 0, learning: 0, review: 0, relearn: 0 },
+			byState: { due: 0, blocked: 0, suspended: 0, buried: 0, flagged: 0, missingParaIdx: 0 },
+			bySubject: [] as Array<{ subject: string; total: number; due: number; blocked: number }>
+		};
+
+		const subjectMap = new Map<string, { total: number; due: number; blocked: number }>();
+		const now = Date.now();
+
+		// Get all deck files
+		const deckFiles = this.app.vault.getFiles()
+			.filter(file => file.name === "_flashcards.json");
+
+		for (const deckFile of deckFiles) {
+			const graph = await this.readDeck(deckFile.path);
+			const allCards = Object.values(graph);
+
+			for (const card of allCards) {
+				stats.totalCards++;
+
+				// Status counts
+				if (card.status === "new") stats.byStatus.new++;
+				else if (card.status === "learning") stats.byStatus.learning++;
+				else if (card.status === "review") stats.byStatus.review++;
+				else if (card.status === "relearn") stats.byStatus.relearn++;
+
+				// State counts - only count non-blocked cards as due
+				if (card.due <= now && !card.blocked) stats.byState.due++;
+				if (card.blocked) stats.byState.blocked++;
+				if (card.suspended) stats.byState.suspended++;
+				if (card.buried) stats.byState.buried++;
+				if (card.flagged) stats.byState.flagged++;
+				if (card.paraIdx === undefined || card.paraIdx === null) stats.byState.missingParaIdx++;
+
+				// Subject counts - only count non-blocked cards as due
+				const subject = this.subjectOf(card.chapter);
+				if (!subjectMap.has(subject)) {
+					subjectMap.set(subject, { total: 0, due: 0, blocked: 0 });
+				}
+				const subjectStats = subjectMap.get(subject)!;
+				subjectStats.total++;
+				if (card.due <= now && !card.blocked) subjectStats.due++;
+				if (card.blocked) subjectStats.blocked++;
+			}
+		}
+
+		// Convert subject map to sorted array
+		stats.bySubject = Array.from(subjectMap.entries())
+			.map(([subject, counts]) => ({ subject, ...counts }))
+			.sort((a, b) => b.total - a.total);
+
+		return stats;
+	}
 
 	async onload(): Promise<void> {
 		await this.loadSettings();
@@ -2709,7 +2776,22 @@ export default class GatedNotesPlugin extends Plugin {
 		this.app.workspace.onLayoutReady(() => {
 			this.refreshAllStatuses();
 			this.decorateExplorer();
+			this.setupExplorerObserver();
 		});
+	}
+
+	onunload(): void {
+		// Clean up the explorer observer
+		if (this.explorerObserver) {
+			this.explorerObserver.disconnect();
+			this.explorerObserver = null;
+		}
+		
+		// Clear any pending timeout
+		if (this.decorateTimeout) {
+			clearTimeout(this.decorateTimeout);
+			this.decorateTimeout = null;
+		}
 	}
 
 	/**
@@ -2820,6 +2902,12 @@ export default class GatedNotesPlugin extends Plugin {
 			id: "gn-browse-cards",
 			name: "Browse cards",
 			callback: () => new CardBrowser(this, this.cardBrowserState).open(),
+		});
+
+		this.addCommand({
+			id: "gn-study-overview",
+			name: "Study overview",
+			callback: () => new StudyOverviewModal(this).open(),
 		});
 
 		this.addCommand({
@@ -3223,6 +3311,10 @@ export default class GatedNotesPlugin extends Plugin {
 		this.addRibbonIcon("wallet-cards", "Card Browser", () => {
 			new CardBrowser(this, this.cardBrowserState).open();
 		});
+
+		this.addRibbonIcon("bar-chart", "Study Overview", () => {
+			new StudyOverviewModal(this).open();
+		});
 	}
 
 	private registerEvents(): void {
@@ -3602,7 +3694,6 @@ export default class GatedNotesPlugin extends Plugin {
 		activePath: string,
 		futureTimeMs?: number
 	): Promise<{ card: Flashcard; deck: TFile }[]> {
-		const subjectOf = (path: string): string => path.split("/")[0] ?? "";
 		const reviewPool: { card: Flashcard; deck: TFile }[] = [];
 		const now = Date.now();
 		const dueThreshold = futureTimeMs ? now + futureTimeMs : now;
@@ -3623,7 +3714,7 @@ export default class GatedNotesPlugin extends Plugin {
 					break;
 				case StudyMode.SUBJECT:
 					cardsInScope = Object.values(graph).filter(
-						(c) => subjectOf(c.chapter) === subjectOf(activePath)
+						(c) => this.subjectOf(c.chapter) === this.subjectOf(activePath)
 					);
 					break;
 				case StudyMode.REVIEW:
@@ -4825,6 +4916,62 @@ ${selection}
 			el.classList.remove("gn-done", "gn-due", "gn-blocked");
 			if (state) el.classList.add(`gn-${state}`);
 		}
+	}
+
+	private setupExplorerObserver(): void {
+		// Clean up existing observer
+		if (this.explorerObserver) {
+			this.explorerObserver.disconnect();
+		}
+
+		// Find the file explorer container
+		const explorerContainer = document.querySelector('.nav-files-container');
+		if (!explorerContainer) {
+			// Retry after a short delay if explorer isn't ready yet
+			setTimeout(() => this.setupExplorerObserver(), 1000);
+			return;
+		}
+
+		// Create observer to watch for changes in the file explorer DOM
+		this.explorerObserver = new MutationObserver((mutations) => {
+			let shouldRedecorate = false;
+			
+			for (const mutation of mutations) {
+				// Check if any nodes were added that might be file items
+				if (mutation.type === 'childList') {
+					for (const node of mutation.addedNodes) {
+						if (node.nodeType === Node.ELEMENT_NODE) {
+							const element = node as Element;
+							// Check if the added node contains file items or is a file item
+							if (element.classList.contains('nav-file') || 
+								element.classList.contains('nav-folder') ||
+								element.querySelector('.nav-file-title')) {
+								shouldRedecorate = true;
+								break;
+							}
+						}
+					}
+				}
+				
+				if (shouldRedecorate) break;
+			}
+			
+			if (shouldRedecorate) {
+				// Debounce the redecoration to avoid excessive calls
+				if (this.decorateTimeout) {
+					clearTimeout(this.decorateTimeout);
+				}
+				this.decorateTimeout = setTimeout(() => {
+					this.decorateExplorer();
+				}, 100);
+			}
+		});
+
+		// Start observing the explorer container and all its children
+		this.explorerObserver.observe(explorerContainer, {
+			childList: true,
+			subtree: true
+		});
 	}
 
 	private async navigateToChapter(file: TFile): Promise<MarkdownView | null> {
@@ -6506,8 +6653,15 @@ ${selection}
 		);
 
 		if (cards.length === 0) return undefined;
-		if (cards.some((c) => c.blocked)) return "blocked";
-		if (cards.some((c) => c.due <= Date.now())) return "due";
+		
+		// Filter out blocked cards for due/done status calculation
+		const nonBlockedCards = cards.filter((c) => !c.blocked);
+		
+		// If there are any blocked cards and no non-blocked cards, show blocked
+		if (nonBlockedCards.length === 0 && cards.some((c) => c.blocked)) return "blocked";
+		
+		// Only check due status on non-blocked cards
+		if (nonBlockedCards.some((c) => c.due <= Date.now())) return "due";
 		return "done";
 	}
 
@@ -15317,4 +15471,108 @@ async function logLlmCall(
 	log.push(newEntry);
 
 	await plugin.app.vault.adapter.write(logPath, JSON.stringify(log, null, 2));
+}
+
+class StudyOverviewModal extends Modal {
+	constructor(private plugin: GatedNotesPlugin) {
+		super(plugin.app);
+	}
+
+	async onOpen() {
+		this.titleEl.setText("Study Overview");
+		makeModalDraggable(this, this.plugin);
+
+		// Show loading message
+		const loadingEl = this.contentEl.createEl("p", {
+			text: "Gathering statistics..."
+		});
+
+		try {
+			// Gather statistics
+			const stats = await this.plugin.gatherVaultStatistics();
+
+			// Remove loading message
+			loadingEl.remove();
+
+			// Create main container
+			const container = this.contentEl.createDiv({
+				attr: {
+					style: "font-family: var(--font-monospace); white-space: pre-line; font-size: 14px; line-height: 1.4;"
+				}
+			});
+
+			// Build the overview text
+			let overview = "=== Vault Study Overview ===\n\n";
+			
+			overview += `Total Cards: ${stats.totalCards.toLocaleString()}\n`;
+			if (stats.totalCards > 0) {
+				overview += `├─ New: ${stats.byStatus.new.toLocaleString()}\n`;
+				overview += `├─ Learning: ${stats.byStatus.learning.toLocaleString()}\n`;
+				overview += `├─ Review: ${stats.byStatus.review.toLocaleString()}\n`;
+				overview += `└─ Relearn: ${stats.byStatus.relearn.toLocaleString()}\n\n`;
+
+				overview += "Status Breakdown:\n";
+				
+				// Build status items array first, then format with correct tree structure
+				const statusItems = [
+					`Due: ${stats.byState.due.toLocaleString()}`
+				];
+				if (stats.byState.blocked > 0) statusItems.push(`Blocked: ${stats.byState.blocked.toLocaleString()}`);
+				if (stats.byState.suspended > 0) statusItems.push(`Suspended: ${stats.byState.suspended.toLocaleString()}`);
+				if (stats.byState.buried > 0) statusItems.push(`Buried: ${stats.byState.buried.toLocaleString()}`);
+				if (stats.byState.flagged > 0) statusItems.push(`Flagged: ${stats.byState.flagged.toLocaleString()}`);
+				if (stats.byState.missingParaIdx > 0) statusItems.push(`Missing Paragraph Index: ${stats.byState.missingParaIdx.toLocaleString()}`);
+				
+				statusItems.forEach((item, index) => {
+					const isLast = index === statusItems.length - 1;
+					const prefix = isLast ? "└─" : "├─";
+					overview += `${prefix} ${item}\n`;
+				});
+
+				if (stats.bySubject.length > 0) {
+					overview += "\nBy Subject:\n";
+					stats.bySubject.forEach((subject, index) => {
+						const isLast = index === stats.bySubject.length - 1;
+						const prefix = isLast ? "└─" : "├─";
+						let subjectLine = `${prefix} ${subject.subject}: ${subject.total.toLocaleString()} cards`;
+						
+						const details = [];
+						if (subject.due > 0) details.push(`${subject.due} due`);
+						if (subject.blocked > 0) details.push(`${subject.blocked} blocked`);
+						
+						if (details.length > 0) {
+							subjectLine += ` (${details.join(", ")})`;
+						}
+						overview += subjectLine + "\n";
+					});
+				}
+			} else {
+				overview += "\nNo flashcards found in vault.\n";
+			}
+
+			container.setText(overview);
+
+			// Add refresh button
+			const buttonContainer = this.contentEl.createDiv({
+				attr: { style: "margin-top: 20px; text-align: center;" }
+			});
+
+			const refreshButton = buttonContainer.createEl("button", {
+				text: "Refresh",
+				attr: { style: "padding: 8px 16px;" }
+			});
+
+			refreshButton.onclick = async () => {
+				this.close();
+				new StudyOverviewModal(this.plugin).open();
+			};
+
+		} catch (error) {
+			loadingEl.setText("Error gathering statistics: " + error);
+		}
+	}
+
+	onClose() {
+		this.contentEl.empty();
+	}
 }
