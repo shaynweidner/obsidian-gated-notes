@@ -36,7 +36,9 @@ export default {
   external: ['obsidian'],
   plugins: [
     typescript(),
-    resolve(),
+    resolve({
+      preferBuiltins: true
+    }),
     commonjs(),
     isProd && terser({
       compress: true,

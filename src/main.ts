@@ -117,6 +117,7 @@ interface Flashcard {
 	mnemonics?: {
 		majorSystem?: MnemonicEntry[];
 		enabled?: boolean;
+		freeformNotes?: string;
 	};
 }
 
@@ -6769,8 +6770,11 @@ ${selection}
 	}
 
 	private showMnemonicsPanel(card: Flashcard, variant: CardVariant, parentModal: Modal): void {
-		// Check if card has saved mnemonics
-		if (!card.mnemonics?.majorSystem || card.mnemonics.majorSystem.length === 0) {
+		// Check if card has any mnemonics (either major system or freeform notes)
+		const hasMajorSystem = card.mnemonics?.majorSystem && card.mnemonics.majorSystem.length > 0;
+		const hasFreeformNotes = card.mnemonics?.freeformNotes && card.mnemonics.freeformNotes.trim().length > 0;
+		
+		if (!hasMajorSystem && !hasFreeformNotes) {
 			new Notice("No mnemonics saved for this card. Use the Edit modal to create mnemonics first.");
 			return;
 		}
@@ -6780,25 +6784,43 @@ ${selection}
 		mnemonicModal.titleEl.setText("🧠 Saved Mnemonics");
 		
 		const content = mnemonicModal.contentEl;
-		content.createEl("p", { text: "Your saved mnemonic words:" });
-
-		card.mnemonics.majorSystem.forEach((mnemonic, index) => {
-			const mnemonicDiv = content.createDiv({ cls: "mnemonic-entry" });
+		
+		// Show freeform notes section if available
+		if (hasFreeformNotes) {
+			content.createEl("h3", { text: "💭 Personal Mnemonic Notes", cls: "mnemonic-section-header" });
+			const notesDiv = content.createDiv({ cls: "freeform-notes-display" });
+			// Preserve line breaks by using pre-wrap
+			notesDiv.textContent = card.mnemonics!.freeformNotes!;
+			notesDiv.style.whiteSpace = "pre-wrap";
 			
-			// Number and position
-			const header = mnemonicDiv.createEl("h4", { 
-				text: `${mnemonic.number} (${mnemonic.position})${mnemonic.source && mnemonic.source !== mnemonic.number ? ` from "${mnemonic.source}"` : ""}`
-			});
-			
-			// Show selected word (read-only)
-			const selectedWord = mnemonicDiv.createDiv({ cls: "mnemonic-selected" });
-			selectedWord.createEl("strong", { text: mnemonic.selected || "No word selected" });
-
-			// Add some spacing
-			if (index < card.mnemonics!.majorSystem!.length - 1) {
-				mnemonicDiv.createEl("hr");
+			// Add separator if there are also major system mnemonics
+			if (hasMajorSystem) {
+				content.createEl("hr", { cls: "mnemonic-display-separator" });
 			}
-		});
+		}
+		
+		// Show major system section if available
+		if (hasMajorSystem) {
+			content.createEl("h3", { text: "🔢 Major System Words", cls: "mnemonic-section-header" });
+			
+			card.mnemonics!.majorSystem!.forEach((mnemonic, index) => {
+				const mnemonicDiv = content.createDiv({ cls: "mnemonic-entry" });
+				
+				// Number and position
+				const header = mnemonicDiv.createEl("h4", { 
+					text: `${mnemonic.number} (${mnemonic.position})${mnemonic.source && mnemonic.source !== mnemonic.number ? ` from "${mnemonic.source}"` : ""}`
+				});
+				
+				// Show selected word (read-only)
+				const selectedWord = mnemonicDiv.createDiv({ cls: "mnemonic-selected" });
+				selectedWord.createEl("strong", { text: mnemonic.selected || "No word selected" });
+
+				// Add some spacing
+				if (index < card.mnemonics!.majorSystem!.length - 1) {
+					mnemonicDiv.createEl("hr");
+				}
+			});
+		}
 
 		// Close button
 		const buttonDiv = content.createDiv({ cls: "mnemonic-buttons" });
@@ -6810,6 +6832,31 @@ ${selection}
 		// Style the modal
 		content.createEl("style", {
 			text: `
+				.mnemonic-section-header {
+					margin: 20px 0 10px 0;
+					color: var(--text-accent);
+					border-bottom: 1px solid var(--background-modifier-border);
+					padding-bottom: 5px;
+				}
+				.mnemonic-section-header:first-child {
+					margin-top: 10px;
+				}
+				.freeform-notes-display {
+					margin: 10px 0 15px 0;
+					padding: 15px;
+					background: var(--background-secondary);
+					border: 1px solid var(--background-modifier-border);
+					border-radius: 8px;
+					font-family: var(--font-interface);
+					font-size: 14px;
+					line-height: 1.4;
+					color: var(--text-normal);
+				}
+				.mnemonic-display-separator {
+					margin: 25px 0;
+					border: none;
+					border-top: 2px dashed var(--background-modifier-border);
+				}
 				.mnemonic-entry { margin: 15px 0; }
 				.mnemonic-selected { 
 					margin: 10px 0; 
@@ -13561,13 +13608,14 @@ Return ONLY valid JSON array of this shape: [{"front":"...","back":"..."}]`;
 			this.plugin,
 			this.card,
 			currentVariant,
-			async (selectedMnemonics: MnemonicEntry[]) => {
+			async (selectedMnemonics: MnemonicEntry[], freeformNotes: string) => {
 				// Save mnemonics to card
 				if (!this.card.mnemonics) {
 					this.card.mnemonics = {};
 				}
 				this.card.mnemonics.majorSystem = selectedMnemonics;
 				this.card.mnemonics.enabled = selectedMnemonics.length > 0;
+				this.card.mnemonics.freeformNotes = freeformNotes;
 				
 				// Update display
 				this.updateMnemonicsDisplay();
@@ -13583,12 +13631,13 @@ Return ONLY valid JSON array of this shape: [{"front":"...","back":"..."}]`;
  */
 class MnemonicsModal extends Modal {
 	private currentMnemonics: MnemonicEntry[] = [];
+	private freeformNotesTextarea!: HTMLTextAreaElement;
 
 	constructor(
 		private plugin: GatedNotesPlugin,
 		private card: Flashcard,
 		private variant: CardVariant,
-		private onSave: (mnemonics: MnemonicEntry[]) => void
+		private onSave: (mnemonics: MnemonicEntry[], freeformNotes: string) => void
 	) {
 		super(plugin.app);
 	}
@@ -13596,6 +13645,9 @@ class MnemonicsModal extends Modal {
 	onOpen() {
 		this.titleEl.setText("🧠 Configure Mnemonics");
 		makeModalDraggable(this, this.plugin);
+		
+		// Add freeform notes section at the top
+		this.addFreeformNotesSection();
 		
 		// Generate mnemonics from current variant
 		const frontMnemonics = MajorSystemUtils.generateMnemonics(this.variant.front, 'front');
@@ -13621,10 +13673,50 @@ class MnemonicsModal extends Modal {
 			return;
 		}
 		
+		// Add separator between freeform section and major system section
+		this.contentEl.createEl("hr", { cls: "mnemonic-separator" });
+		
 		this.contentEl.createEl("p", { text: "Select mnemonic words for each number:" });
 		this.renderMnemonics();
 		this.addButtons();
 		this.addStyles();
+	}
+	
+	private addFreeformNotesSection(): void {
+		// Create section header
+		const freeformSection = this.contentEl.createDiv({ cls: "freeform-mnemonic-section" });
+		freeformSection.createEl("h3", { text: "💭 Personal Mnemonic Notes" });
+		freeformSection.createEl("p", { 
+			text: "Add your own mnemonic notes or use AI to generate memory aids:",
+			cls: "mnemonic-section-description"
+		});
+		
+		// Create textarea for freeform notes
+		this.freeformNotesTextarea = freeformSection.createEl("textarea", {
+			cls: "freeform-mnemonic-textarea",
+			placeholder: "Add your personal mnemonic notes here...\n\nFor example:\n🪖✉️=👨☕→🪲🎵\n\nGeneral Epistles go from Hebrews ('He Brews') to Jude (a song by the Beatles)"
+		});
+		this.freeformNotesTextarea.rows = 6;
+		
+		// Load existing freeform notes if available
+		if (this.card.mnemonics?.freeformNotes) {
+			this.freeformNotesTextarea.value = this.card.mnemonics.freeformNotes;
+		}
+		
+		// Create AI buttons container
+		const aiButtonsContainer = freeformSection.createDiv({ cls: "ai-buttons-container" });
+		
+		// Generate with AI button (for mental imagery)
+		const generateAIBtn = new ButtonComponent(aiButtonsContainer)
+			.setButtonText("🧠 Generate with AI")
+			.setTooltip("Generate mental imagery description using AI")
+			.onClick(() => this.generateMentalImagery());
+		
+		// Generate emoji sequence button
+		const generateEmojiBtn = new ButtonComponent(aiButtonsContainer)
+			.setButtonText("😊 Generate Emojis")
+			.setTooltip("Generate emoji sequence using AI")
+			.onClick(() => this.generateEmojiSequence());
 	}
 	
 	private renderMnemonics(): void {
@@ -13744,7 +13836,8 @@ class MnemonicsModal extends Modal {
 			.setCta()
 			.onClick(() => {
 				const selectedMnemonics = this.currentMnemonics.filter(m => m.selected);
-				this.onSave(selectedMnemonics);
+				const freeformNotes = this.freeformNotesTextarea.value.trim();
+				this.onSave(selectedMnemonics, freeformNotes);
 				this.close();
 			});
 			
@@ -13814,8 +13907,159 @@ class MnemonicsModal extends Modal {
 					color: var(--text-muted);
 					margin: 0 5px;
 				}
+				.freeform-mnemonic-section {
+					margin-bottom: 20px;
+					padding: 15px;
+					background: var(--background-secondary);
+					border-radius: 8px;
+					border: 1px solid var(--background-modifier-border);
+				}
+				.freeform-mnemonic-section h3 {
+					margin: 0 0 8px 0;
+					color: var(--text-accent);
+				}
+				.mnemonic-section-description {
+					margin: 0 0 12px 0;
+					color: var(--text-muted);
+					font-size: 13px;
+				}
+				.freeform-mnemonic-textarea {
+					width: 100%;
+					min-height: 120px;
+					padding: 12px;
+					border: 1px solid var(--background-modifier-border);
+					border-radius: 6px;
+					background: var(--background-primary);
+					color: var(--text-normal);
+					font-family: var(--font-interface);
+					font-size: 14px;
+					resize: vertical;
+					margin-bottom: 12px;
+				}
+				.freeform-mnemonic-textarea:focus {
+					outline: none;
+					border-color: var(--interactive-accent);
+					box-shadow: 0 0 0 2px var(--interactive-accent-alpha);
+				}
+				.ai-buttons-container {
+					display: flex;
+					gap: 8px;
+					justify-content: flex-start;
+				}
+				.mnemonic-separator {
+					margin: 25px 0;
+					border: none;
+					border-top: 2px dashed var(--background-modifier-border);
+				}
 			`
 		});
+	}
+	
+	private async generateMentalImagery(): Promise<void> {
+		const front = this.variant.front;
+		const back = this.variant.back;
+		
+		try {
+			new Notice("Generating mental imagery...", 3000);
+			
+			// Build Major System context if numbers are detected
+			let majorSystemContext = "";
+			if (this.currentMnemonics.length > 0) {
+				majorSystemContext = "\n\nAVAILABLE MAJOR SYSTEM WORDS (you can optionally incorporate these):\n";
+				this.currentMnemonics.forEach(mnemonic => {
+					const wordList = mnemonic.words.slice(0, 10).join(", "); // Show first 10 words
+					const moreCount = mnemonic.words.length > 10 ? ` (+${mnemonic.words.length - 10} more)` : "";
+					majorSystemContext += `• Number "${mnemonic.number}" (${mnemonic.position}): ${wordList}${moreCount}\n`;
+				});
+				majorSystemContext += "\nYou can use any of these words in your mental imagery if it helps create a memorable story.";
+			}
+			
+			const prompt = `Create a vivid mental image description to help remember this flashcard. Be creative and memorable:
+
+FRONT: ${front}
+BACK: ${back}${majorSystemContext}
+
+Please create a short, vivid mental image description that connects the front and back of this flashcard. Use concrete, visual, and memorable imagery that tells a story or creates an association. Keep it concise but memorable.
+
+Example: If the card is about "General Epistles go from Hebrews to Jude", you might say: "Picture a military GENERAL (🪖) holding LETTERS (✉️) while a HEBREW person drinks COFFEE (☕) and the BEATLES (🎵) play music for JUDE."
+
+If Major System words are available above, feel free to incorporate any that would make the mental image more memorable, but don't force it if they don't fit naturally.
+
+Provide only the mental imagery description, no additional explanation.`;
+
+			const response = await this.plugin.sendToLlm(prompt, undefined, { temperature: 0.7 });
+			
+			if (response.content.trim()) {
+				// Append to existing content or replace if empty
+				const currentValue = this.freeformNotesTextarea.value.trim();
+				if (currentValue) {
+					this.freeformNotesTextarea.value = currentValue + "\n\n" + response.content.trim();
+				} else {
+					this.freeformNotesTextarea.value = response.content.trim();
+				}
+				new Notice("Mental imagery generated!");
+			} else {
+				new Notice("Failed to generate mental imagery. Please try again.");
+			}
+		} catch (error) {
+			console.error("Error generating mental imagery:", error);
+			new Notice("Error generating mental imagery. Please try again.");
+		}
+	}
+	
+	private async generateEmojiSequence(): Promise<void> {
+		const front = this.variant.front;
+		const back = this.variant.back;
+		
+		try {
+			new Notice("Generating emoji sequence...", 3000);
+			
+			// Build Major System context if numbers are detected
+			let majorSystemContext = "";
+			if (this.currentMnemonics.length > 0) {
+				majorSystemContext = "\n\nAVAILABLE MAJOR SYSTEM WORDS (you can optionally incorporate these):\n";
+				this.currentMnemonics.forEach(mnemonic => {
+					const wordList = mnemonic.words.slice(0, 10).join(", "); // Show first 10 words
+					const moreCount = mnemonic.words.length > 10 ? ` (+${mnemonic.words.length - 10} more)` : "";
+					majorSystemContext += `• Number "${mnemonic.number}" (${mnemonic.position}): ${wordList}${moreCount}\n`;
+				});
+				majorSystemContext += "\nYou can use any of these words in your emoji sequence if they help create memorable phonetic or visual connections.";
+			}
+			
+			const prompt = `Create a creative emoji sequence to help remember this flashcard:
+
+FRONT: ${front}
+BACK: ${back}${majorSystemContext}
+
+Create a memorable emoji sequence that connects the front and back of this flashcard. Use creative wordplay, phonetic connections, and visual associations.
+
+Example formats:
+- 🪖✉️=👨☕→🪲🎵 (General Epistles go from Hebrews (He+brews) to Jude (Hey Jude is a song by the Beatles))
+
+Use emojis, arrows (→), equals (=), and brief explanations in curly braces when needed. Be creative with phonetic connections and visual wordplay. Keep it concise but memorable.
+
+If Major System words are available above, feel free to incorporate any that create clever phonetic or visual connections in your emoji sequence.
+
+Provide only the emoji sequence, no additional explanation.`;
+
+			const response = await this.plugin.sendToLlm(prompt, undefined, { temperature: 0.8 });
+			
+			if (response.content.trim()) {
+				// Append to existing content or replace if empty
+				const currentValue = this.freeformNotesTextarea.value.trim();
+				if (currentValue) {
+					this.freeformNotesTextarea.value = currentValue + "\n\n" + response.content.trim();
+				} else {
+					this.freeformNotesTextarea.value = response.content.trim();
+				}
+				new Notice("Emoji sequence generated!");
+			} else {
+				new Notice("Failed to generate emoji sequence. Please try again.");
+			}
+		} catch (error) {
+			console.error("Error generating emoji sequence:", error);
+			new Notice("Error generating emoji sequence. Please try again.");
+		}
 	}
 	
 	onClose() {
