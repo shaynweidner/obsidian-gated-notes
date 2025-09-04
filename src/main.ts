@@ -32,6 +32,7 @@ import OpenAI from "openai";
 import * as JSZip from "jszip";
 
 const DECK_FILE_NAME = "_flashcards.json";
+const CENTRAL_DECK_PATH = "_flashcards.json";
 const SPLIT_TAG = "---GATED-NOTES-SPLIT---";
 const PARA_CLASS = "gn-paragraph";
 const PARA_ID_ATTR = "data-para-id";
@@ -54,8 +55,8 @@ const HIGHLIGHT_COLORS = {
 
 enum StudyMode {
 	REVIEW = "review",
-	CHAPTER = "chapter",
-	SUBJECT = "subject",
+	NOTE = "note",
+	CUSTOM_SESSION = "custom_session",
 }
 
 enum LogLevel {
@@ -88,7 +89,7 @@ interface MnemonicEntry {
 	number: string;
 	words: string[];
 	selected?: string;
-	position: 'front' | 'back';
+	position: "front" | "back";
 	story?: string;
 	source?: string; // The original text that generated this number (e.g., "4:9")
 }
@@ -119,6 +120,9 @@ interface Flashcard {
 		enabled?: boolean;
 		freeformNotes?: string;
 	};
+	// Migration fields
+	migrated_from?: string; // Track original file location
+	migration_version?: string; // Track migration version
 }
 
 interface FlashcardGraph {
@@ -145,6 +149,10 @@ interface Settings {
 	maxTagCorrectionRetries: number;
 	/** The OpenAI model to use for multimodal (image analysis) tasks. */
 	openaiMultimodalModel: string;
+
+	// Migration settings
+	migrationCompleted: boolean;
+	migrationVersion: string;
 	/** Whether to analyze images and include their descriptions during card generation. */
 	analyzeImagesOnGenerate: boolean;
 	/** The default processing mode for PDF-to-note conversion. */
@@ -179,6 +187,10 @@ const DEFAULT_SETTINGS: Settings = {
 	autoCorrectTags: true,
 	maxTagCorrectionRetries: 2,
 	openaiMultimodalModel: "gpt-4o-mini",
+
+	// Migration settings
+	migrationCompleted: false,
+	migrationVersion: "",
 	analyzeImagesOnGenerate: true,
 	defaultPdfMode: "text",
 	defaultPdfDpi: 200,
@@ -368,7 +380,11 @@ class ImageManager {
 
 		// Get attachment folder from Obsidian settings
 		const attachmentFolder = this.getAttachmentFolder(noteFile);
-		const imagePath = await this.saveImageToVault(imageData, finalFilename, attachmentFolder);
+		const imagePath = await this.saveImageToVault(
+			imageData,
+			finalFilename,
+			attachmentFolder
+		);
 		const imageMarkdown = `![[${finalFilename}]]`;
 
 		const content = await this.plugin.app.vault.read(noteFile);
@@ -633,7 +649,8 @@ class InteractiveEditor extends Modal {
 		editorPreviewPanel.style.flexDirection = "column";
 
 		// Toggle button container
-		const toggleContainer = editorPreviewPanel.createDiv("toggle-container");
+		const toggleContainer =
+			editorPreviewPanel.createDiv("toggle-container");
 		toggleContainer.style.display = "flex";
 		toggleContainer.style.alignItems = "center";
 		toggleContainer.style.marginBottom = "10px";
@@ -643,12 +660,13 @@ class InteractiveEditor extends Modal {
 
 		const toggleButton = toggleContainer.createEl("button", {
 			text: "📝 Edit Mode",
-			cls: "mod-cta"
+			cls: "mod-cta",
 		});
 		toggleButton.onclick = () => this.toggleEditPreview();
 
 		// Editor
-		const editorContainer = editorPreviewPanel.createDiv("editor-container");
+		const editorContainer =
+			editorPreviewPanel.createDiv("editor-container");
 		editorContainer.style.flex = "1";
 		editorContainer.style.display = "flex";
 		editorContainer.style.flexDirection = "column";
@@ -681,14 +699,16 @@ class InteractiveEditor extends Modal {
 		});
 
 		// Preview (initially hidden)
-		const previewContainer = editorPreviewPanel.createDiv("preview-container");
+		const previewContainer =
+			editorPreviewPanel.createDiv("preview-container");
 		previewContainer.style.flex = "1";
 		previewContainer.style.display = "none";
 		previewContainer.style.flexDirection = "column";
 
 		this.preview = previewContainer.createDiv("preview-content");
 		this.preview.style.flex = "1";
-		this.preview.style.border = "1px solid var(--background-modifier-border)";
+		this.preview.style.border =
+			"1px solid var(--background-modifier-border)";
 		this.preview.style.padding = "10px";
 		this.preview.style.overflow = "auto";
 		this.preview.style.backgroundColor = "var(--background-primary)";
@@ -756,20 +776,22 @@ class InteractiveEditor extends Modal {
 			this.editorContainer.style.display = "none";
 			this.previewContainer.style.display = "flex";
 			this.toggleButton.textContent = "👁️ Preview Mode";
-			
+
 			// Update preview content
-			this.updatePreview().then(() => {
-				// Sync scroll position from editor to preview
-				this.preview.scrollTop = this.scrollSyncPosition;
-			}).catch(error => {
-				console.error("Failed to update preview:", error);
-			});
+			this.updatePreview()
+				.then(() => {
+					// Sync scroll position from editor to preview
+					this.preview.scrollTop = this.scrollSyncPosition;
+				})
+				.catch((error) => {
+					console.error("Failed to update preview:", error);
+				});
 		} else {
-			// Switch to edit mode  
+			// Switch to edit mode
 			this.previewContainer.style.display = "none";
 			this.editorContainer.style.display = "flex";
 			this.toggleButton.textContent = "📝 Edit Mode";
-			
+
 			// Sync scroll position from preview to editor
 			setTimeout(() => {
 				this.editor.scrollTop = this.scrollSyncPosition;
@@ -780,10 +802,13 @@ class InteractiveEditor extends Modal {
 	/**
 	 * Rotate an image 90 degrees clockwise
 	 */
-	private async rotateImage(imageIndex: number, imgElement: HTMLImageElement): Promise<void> {
+	private async rotateImage(
+		imageIndex: number,
+		imgElement: HTMLImageElement
+	): Promise<void> {
 		try {
 			const image = this.images[imageIndex];
-			
+
 			// Create a canvas to rotate the image
 			const canvas = document.createElement("canvas");
 			const ctx = canvas.getContext("2d");
@@ -811,7 +836,7 @@ class InteractiveEditor extends Modal {
 					...image,
 					imageData: rotatedDataUrl,
 					width: image.height, // Swap dimensions
-					height: image.width
+					height: image.width,
 				};
 				this.images[imageIndex] = updatedImage;
 
@@ -821,7 +846,7 @@ class InteractiveEditor extends Modal {
 				// Show feedback
 				new Notice("Image rotated 90° clockwise");
 			};
-			
+
 			img.src = image.imageData;
 		} catch (error) {
 			console.error("Failed to rotate image:", error);
@@ -880,7 +905,7 @@ class InteractiveEditor extends Modal {
 			// Rotate button
 			const rotateButton = actionButtons.createEl("button", {
 				text: "↻ Rotate",
-				cls: "mod-cta"
+				cls: "mod-cta",
 			});
 			rotateButton.style.fontSize = "11px";
 			rotateButton.style.padding = "2px 8px";
@@ -1722,9 +1747,12 @@ class PDFViewerModal extends Modal {
 
 			this.currentPdf = await loadingTask.promise;
 			this.totalPages = this.currentPdf.numPages;
-			this.currentPage = this.startingPage && this.startingPage >= 1 && this.startingPage <= this.totalPages 
-				? this.startingPage 
-				: 1;
+			this.currentPage =
+				this.startingPage &&
+				this.startingPage >= 1 &&
+				this.startingPage <= this.totalPages
+					? this.startingPage
+					: 1;
 
 			// Render first page (or starting page)
 			await this.renderCurrentPage();
@@ -2680,93 +2708,450 @@ class SnippingTool {
  */
 class MajorSystemUtils {
 	private static readonly PHONEME_TO_DIGIT: Record<string, string> = {
-		"S": "0", "Z": "0",
-		"T": "1", "D": "1", "TH": "1", "DH": "1",
-		"N": "2",
-		"M": "3",
-		"R": "4",
-		"L": "5",
-		"CH": "6", "JH": "6", "SH": "6", "ZH": "6",
-		"K": "7", "G": "7", "NG": "7",
-		"F": "8", "V": "8",
-		"P": "9", "B": "9"
+		S: "0",
+		Z: "0",
+		T: "1",
+		D: "1",
+		TH: "1",
+		DH: "1",
+		N: "2",
+		M: "3",
+		R: "4",
+		L: "5",
+		CH: "6",
+		JH: "6",
+		SH: "6",
+		ZH: "6",
+		K: "7",
+		G: "7",
+		NG: "7",
+		F: "8",
+		V: "8",
+		P: "9",
+		B: "9",
 	};
 
-	private static cmuDictionary: Record<string, Array<{word: string, freq: number}>> | null = null;
+	private static cmuDictionary: Record<
+		string,
+		Array<{ word: string; freq: number }>
+	> | null = null;
 	private static isLoading = false;
 
 	// Fallback dictionary while CMU loads
 	private static readonly FALLBACK_WORDS: Record<string, string[]> = {
 		// Single digits
-		"0": ["sea", "zoo", "sew", "say", "sue", "so", "saw", "soy", "ass", "ice", "ace", "eyes"],
-		"1": ["tea", "toe", "day", "die", "tie", "two", "do", "ate", "it", "at", "eat", "out"],
-		"2": ["no", "new", "knee", "gnu", "now", "nay", "in", "an", "on", "own", "any", "ion"],
-		"3": ["me", "may", "mow", "ma", "my", "am", "him", "home", "aim", "mime", "mama", "memo"],
-		"4": ["row", "ray", "rye", "are", "ear", "ore", "eye", "air", "our", "hour", "hero", "rear"],
-		"5": ["law", "lay", "lie", "low", "Lee", "loo", "ally", "owl", "ale", "oil", "all", "ill"],
-		"6": ["shoe", "jay", "shy", "show", "she", "ash", "age", "edge", "huge", "wash", "wish", "josh"],
-		"7": ["key", "go", "gay", "cue", "cow", "guy", "oak", "ago", "ego", "awe", "ache", "hook"],
-		"8": ["fee", "vie", "foe", "via", "if", "off", "ivy", "have", "wave", "wife", "ove", "eff"],
-		"9": ["bee", "pay", "pie", "bow", "boy", "ape", "pub", "bay", "buy", "by", "hope", "baby"],
-		
+		"0": [
+			"sea",
+			"zoo",
+			"sew",
+			"say",
+			"sue",
+			"so",
+			"saw",
+			"soy",
+			"ass",
+			"ice",
+			"ace",
+			"eyes",
+		],
+		"1": [
+			"tea",
+			"toe",
+			"day",
+			"die",
+			"tie",
+			"two",
+			"do",
+			"ate",
+			"it",
+			"at",
+			"eat",
+			"out",
+		],
+		"2": [
+			"no",
+			"new",
+			"knee",
+			"gnu",
+			"now",
+			"nay",
+			"in",
+			"an",
+			"on",
+			"own",
+			"any",
+			"ion",
+		],
+		"3": [
+			"me",
+			"may",
+			"mow",
+			"ma",
+			"my",
+			"am",
+			"him",
+			"home",
+			"aim",
+			"mime",
+			"mama",
+			"memo",
+		],
+		"4": [
+			"row",
+			"ray",
+			"rye",
+			"are",
+			"ear",
+			"ore",
+			"eye",
+			"air",
+			"our",
+			"hour",
+			"hero",
+			"rear",
+		],
+		"5": [
+			"law",
+			"lay",
+			"lie",
+			"low",
+			"Lee",
+			"loo",
+			"ally",
+			"owl",
+			"ale",
+			"oil",
+			"all",
+			"ill",
+		],
+		"6": [
+			"shoe",
+			"jay",
+			"shy",
+			"show",
+			"she",
+			"ash",
+			"age",
+			"edge",
+			"huge",
+			"wash",
+			"wish",
+			"josh",
+		],
+		"7": [
+			"key",
+			"go",
+			"gay",
+			"cue",
+			"cow",
+			"guy",
+			"oak",
+			"ago",
+			"ego",
+			"awe",
+			"ache",
+			"hook",
+		],
+		"8": [
+			"fee",
+			"vie",
+			"foe",
+			"via",
+			"if",
+			"off",
+			"ivy",
+			"have",
+			"wave",
+			"wife",
+			"ove",
+			"eff",
+		],
+		"9": [
+			"bee",
+			"pay",
+			"pie",
+			"bow",
+			"boy",
+			"ape",
+			"pub",
+			"bay",
+			"buy",
+			"by",
+			"hope",
+			"baby",
+		],
+
 		// Two digits - common combinations
-		"10": ["test", "taste", "dust", "toast", "twist", "toss", "tease", "dose", "daze", "dice"],
-		"11": ["toad", "dude", "dead", "dot", "deed", "did", "dad", "date", "diet", "donut", "tent"],
-		"12": ["tan", "ton", "den", "tune", "tin", "down", "teen", "den", "dawn", "dine", "tune"],
-		"13": ["team", "dam", "time", "tomb", "dime", "tame", "dome", "dime", "atom", "item"],
-		"14": ["tire", "door", "tear", "tree", "tar", "deer", "dear", "dare", "draw", "true"],
-		"15": ["tail", "dale", "doll", "tool", "tall", "deal", "dial", "till", "dull", "tile"],
-		"16": ["dish", "touch", "teach", "ditch", "dutch", "tissue", "dosage", "damage", "dodge"],
-		"17": ["dog", "twig", "duck", "take", "deck", "dug", "tag", "took", "thick", "toy"],
-		"18": ["dove", "deaf", "tough", "dive", "taffy", "turf", "tooth", "depth", "thief"],
-		"19": ["dip", "top", "tape", "tap", "type", "tip", "deep", "tab", "tub", "tube"],
-		
-		"20": ["nose", "news", "noose", "nice", "noise", "nase", "nurse", "knows", "nice", "nets"],
-		"21": ["net", "note", "knot", "neat", "night", "nut", "not", "ant", "aunt", "nude"],
-		"30": ["mouse", "miss", "moss", "mess", "mass", "moose", "maze", "music", "mask", "mesa"],
-		"40": ["rose", "rice", "race", "ruse", "rays", "raise", "rose", "rush", "rich", "reach"],
-		"49": ["rope", "robe", "rap", "rib", "rip", "ruby", "rep", "rub", "rab", "rape", "reap"],
-		"50": ["lace", "loss", "loose", "lease", "lose", "lasso", "lazy", "lies", "laws", "less"],
-		
+		"10": [
+			"test",
+			"taste",
+			"dust",
+			"toast",
+			"twist",
+			"toss",
+			"tease",
+			"dose",
+			"daze",
+			"dice",
+		],
+		"11": [
+			"toad",
+			"dude",
+			"dead",
+			"dot",
+			"deed",
+			"did",
+			"dad",
+			"date",
+			"diet",
+			"donut",
+			"tent",
+		],
+		"12": [
+			"tan",
+			"ton",
+			"den",
+			"tune",
+			"tin",
+			"down",
+			"teen",
+			"den",
+			"dawn",
+			"dine",
+			"tune",
+		],
+		"13": [
+			"team",
+			"dam",
+			"time",
+			"tomb",
+			"dime",
+			"tame",
+			"dome",
+			"dime",
+			"atom",
+			"item",
+		],
+		"14": [
+			"tire",
+			"door",
+			"tear",
+			"tree",
+			"tar",
+			"deer",
+			"dear",
+			"dare",
+			"draw",
+			"true",
+		],
+		"15": [
+			"tail",
+			"dale",
+			"doll",
+			"tool",
+			"tall",
+			"deal",
+			"dial",
+			"till",
+			"dull",
+			"tile",
+		],
+		"16": [
+			"dish",
+			"touch",
+			"teach",
+			"ditch",
+			"dutch",
+			"tissue",
+			"dosage",
+			"damage",
+			"dodge",
+		],
+		"17": [
+			"dog",
+			"twig",
+			"duck",
+			"take",
+			"deck",
+			"dug",
+			"tag",
+			"took",
+			"thick",
+			"toy",
+		],
+		"18": [
+			"dove",
+			"deaf",
+			"tough",
+			"dive",
+			"taffy",
+			"turf",
+			"tooth",
+			"depth",
+			"thief",
+		],
+		"19": [
+			"dip",
+			"top",
+			"tape",
+			"tap",
+			"type",
+			"tip",
+			"deep",
+			"tab",
+			"tub",
+			"tube",
+		],
+
+		"20": [
+			"nose",
+			"news",
+			"noose",
+			"nice",
+			"noise",
+			"nase",
+			"nurse",
+			"knows",
+			"nice",
+			"nets",
+		],
+		"21": [
+			"net",
+			"note",
+			"knot",
+			"neat",
+			"night",
+			"nut",
+			"not",
+			"ant",
+			"aunt",
+			"nude",
+		],
+		"30": [
+			"mouse",
+			"miss",
+			"moss",
+			"mess",
+			"mass",
+			"moose",
+			"maze",
+			"music",
+			"mask",
+			"mesa",
+		],
+		"40": [
+			"rose",
+			"rice",
+			"race",
+			"ruse",
+			"rays",
+			"raise",
+			"rose",
+			"rush",
+			"rich",
+			"reach",
+		],
+		"49": [
+			"rope",
+			"robe",
+			"rap",
+			"rib",
+			"rip",
+			"ruby",
+			"rep",
+			"rub",
+			"rab",
+			"rape",
+			"reap",
+		],
+		"50": [
+			"lace",
+			"loss",
+			"loose",
+			"lease",
+			"lose",
+			"lasso",
+			"lazy",
+			"lies",
+			"laws",
+			"less",
+		],
+
 		// Three digits - some common ones
-		"100": ["doses", "daisies", "tissues", "teaches", "touches", "tosses", "dazzles", "tassels"],
-		"101": ["test", "toast", "tasted", "twisted", "dusted", "totted", "tutted", "toasted"],
-		"123": ["dynamite", "detonate", "dainty", "distant", "destiny", "dustman", "dustmen"]
+		"100": [
+			"doses",
+			"daisies",
+			"tissues",
+			"teaches",
+			"touches",
+			"tosses",
+			"dazzles",
+			"tassels",
+		],
+		"101": [
+			"test",
+			"toast",
+			"tasted",
+			"twisted",
+			"dusted",
+			"totted",
+			"tutted",
+			"toasted",
+		],
+		"123": [
+			"dynamite",
+			"detonate",
+			"dainty",
+			"distant",
+			"destiny",
+			"dustman",
+			"dustmen",
+		],
 	};
 
-	static detectNumbers(text: string): Array<{number: string, position: number, source: string}> {
-		console.log('🔍 Detecting numbers in text:', `"${text}"`);
-		const numbers: Array<{number: string, position: number, source: string}> = [];
-		
+	static detectNumbers(
+		text: string
+	): Array<{ number: string; position: number; source: string }> {
+		console.log("🔍 Detecting numbers in text:", `"${text}"`);
+		const numbers: Array<{
+			number: string;
+			position: number;
+			source: string;
+		}> = [];
+
 		// First, find patterns with digits separated by non-word characters
 		// Examples: "4:9" -> "49", "14:3" -> "143", "1-2-3" -> "123"
 		const combinedMatches = text.matchAll(/\b\d+(?:[^\w\s]+\d+)+\b/g);
 		const combinedSources = new Set<string>();
-		
+
 		for (const match of combinedMatches) {
 			const sourceText = match[0]; // e.g., "4:9"
-			const combined = sourceText.replace(/[^\d]/g, ''); // e.g., "49"
+			const combined = sourceText.replace(/[^\d]/g, ""); // e.g., "49"
 			const individualDigits = sourceText.match(/\d+/g) || []; // e.g., ["4", "9"]
-			
-			console.log(`🔍 Found combined pattern: "${sourceText}" -> combined: "${combined}", individual: [${individualDigits.join(', ')}]`);
-			
+
+			console.log(
+				`🔍 Found combined pattern: "${sourceText}" -> combined: "${combined}", individual: [${individualDigits.join(
+					", "
+				)}]`
+			);
+
 			combinedSources.add(sourceText);
-			
+
 			// Add the combined number
 			if (combined.length > 1) {
 				numbers.push({
 					number: combined,
 					position: match.index || 0,
-					source: sourceText
+					source: sourceText,
 				});
 			}
-			
+
 			// Add individual numbers from this source
-			individualDigits.forEach(digit => {
+			individualDigits.forEach((digit) => {
 				numbers.push({
 					number: digit,
 					position: match.index || 0,
-					source: sourceText // Same source as the combined number!
+					source: sourceText, // Same source as the combined number!
 				});
 			});
 		}
@@ -2777,9 +3162,11 @@ class MajorSystemUtils {
 			// Check if this number is already part of a combined pattern
 			const matchText = match[0];
 			const matchPos = match.index || 0;
-			
+
 			let isPartOfCombined = false;
-			for (const combinedMatch of text.matchAll(/\b\d+(?:[^\w\s]+\d+)+\b/g)) {
+			for (const combinedMatch of text.matchAll(
+				/\b\d+(?:[^\w\s]+\d+)+\b/g
+			)) {
 				const combinedStart = combinedMatch.index || 0;
 				const combinedEnd = combinedStart + combinedMatch[0].length;
 				if (matchPos >= combinedStart && matchPos < combinedEnd) {
@@ -2787,195 +3174,165 @@ class MajorSystemUtils {
 					break;
 				}
 			}
-			
+
 			if (!isPartOfCombined) {
 				numbers.push({
 					number: matchText,
 					position: matchPos,
-					source: matchText // Standalone numbers are their own source
+					source: matchText, // Standalone numbers are their own source
 				});
 			}
 		}
 
 		// Remove duplicates and sort by position
-		const unique = numbers.filter((num, index, arr) => 
-			arr.findIndex(n => n.number === num.number && n.position === num.position && n.source === num.source) === index
+		const unique = numbers.filter(
+			(num, index, arr) =>
+				arr.findIndex(
+					(n) =>
+						n.number === num.number &&
+						n.position === num.position &&
+						n.source === num.source
+				) === index
 		);
-		
+
 		const sorted = unique.sort((a, b) => a.position - b.position);
-		console.log('🔍 Final detected numbers:', sorted.map(n => `${n.number}(from: ${n.source})`));
+		console.log(
+			"🔍 Final detected numbers:",
+			sorted.map((n) => `${n.number}(from: ${n.source})`)
+		);
 		return sorted;
 	}
 
 	static async loadCMUDictionary(plugin: GatedNotesPlugin): Promise<void> {
 		if (this.cmuDictionary || this.isLoading) return;
-		
-		console.log('🧠 Starting CMU dictionary loading...');
+
 		this.isLoading = true;
 		try {
 			// Load from embedded base64 dictionary
-			console.log('🧠 Loading compressed dictionary data...');
-			const { CMU_DICT_COMPRESSED_BASE64 } = await import('./cmudict-data');
-			console.log('🧠 Base64 data length:', CMU_DICT_COMPRESSED_BASE64.length, 'chars');
-			
+			const { CMU_DICT_COMPRESSED_BASE64 } = await import(
+				"./cmudict-data"
+			);
+
 			// Decode base64 to binary data
 			const binaryString = atob(CMU_DICT_COMPRESSED_BASE64);
 			const bytes = new Uint8Array(binaryString.length);
 			for (let i = 0; i < binaryString.length; i++) {
 				bytes[i] = binaryString.charCodeAt(i);
 			}
-			console.log('🧠 Decoded to binary, size:', bytes.length, 'bytes');
-			
+
 			// Decompress using pako
-			console.log('🧠 Decompressing with pako...');
-			const pako = await import('pako');
-			const decompressedData = pako.inflate(bytes, { to: 'string' });
+			const pako = await import("pako");
+			const decompressedData = pako.inflate(bytes, { to: "string" });
 			const decompressed = decompressedData;
-			console.log('🧠 Decompressed size:', decompressed.length, 'chars');
-			
+
 			// Parse the JSON dictionary
 			const rawDict = JSON.parse(decompressed);
-			console.log('🧠 CMU dictionary parsed successfully, raw entries:', Object.keys(rawDict).length);
-			
+
 			// Process the dictionary - it's already organized by Major System digits!
-			console.log('🧠 Processing dictionary entries (already in Major System format)...');
 			this.cmuDictionary = {};
 			let processedDigits = 0;
 			let totalWords = 0;
-			
+
 			for (const [digits, wordList] of Object.entries(rawDict)) {
 				processedDigits++;
-				
-				// Debug first few entries to understand format
-				if (processedDigits <= 3) {
-					console.log(`🧠 Sample entry: digit "${digits}" ->`, wordList, `(type: ${typeof wordList}, length: ${Array.isArray(wordList) ? wordList.length : 'N/A'})`);
-				}
-				
+
 				// Validate that wordList is an array of word objects
 				if (Array.isArray(wordList)) {
 					const validWords = wordList
-						.filter(entry => entry && typeof entry === 'object' && entry.word && typeof entry.word === 'string')
-						.map(entry => ({
+						.filter(
+							(entry) =>
+								entry &&
+								typeof entry === "object" &&
+								entry.word &&
+								typeof entry.word === "string"
+						)
+						.map((entry) => ({
 							word: entry.word.toLowerCase(),
-							freq: entry.freq || 1000 // Use existing frequency or default
+							freq: entry.freq || 1000, // Use existing frequency or default
 						}));
-					
+
 					if (validWords.length > 0) {
 						// Sort by frequency (descending)
-						this.cmuDictionary[digits] = validWords.sort((a, b) => b.freq - a.freq);
+						this.cmuDictionary[digits] = validWords.sort(
+							(a, b) => b.freq - a.freq
+						);
 						totalWords += validWords.length;
 					}
 				}
 			}
-			
-			console.log('🧠 CMU dictionary processed successfully!');
-			console.log('🧠 Processed digit patterns:', processedDigits);
-			console.log('🧠 Valid digit patterns with words:', Object.keys(this.cmuDictionary).length);
-			console.log('🧠 Total words loaded:', totalWords);
-			
-			// Log some examples for debugging
-			console.log('🧠 Sample mappings:');
-			const sampleDigits = ['8', '3', '83', '1', '2', '12'];
-			for (const digits of sampleDigits) {
-				const words = this.cmuDictionary[digits];
-				if (words && words.length > 0) {
-					console.log(`🧠   ${digits} -> [${words.slice(0, 3).map(w => w.word).join(', ')}] (${words.length} total)`);
-				} else {
-					console.log(`🧠   ${digits} -> no words found`);
-				}
-			}
-			
 		} catch (error) {
-			console.warn('Failed to load CMU dictionary, using fallback:', error);
+			console.warn(
+				"Failed to load CMU dictionary, using fallback:",
+				error
+			);
 		} finally {
 			this.isLoading = false;
 		}
 	}
 
-	private static pronunciationToDigits(pronunciation: any): string | null {
-		const digits: string[] = [];
-		
-		// Handle different possible formats
-		let phonemes: string[] = [];
-		if (Array.isArray(pronunciation)) {
-			phonemes = pronunciation;
-		} else if (typeof pronunciation === 'string') {
-			// If it's a string, split by spaces
-			phonemes = pronunciation.split(' ');
-		} else {
-			console.warn('🧠 Unexpected pronunciation format:', pronunciation);
-			return null;
-		}
-		
-		for (const phoneme of phonemes) {
-			if (typeof phoneme !== 'string') {
-				console.warn('🧠 Non-string phoneme:', phoneme);
-				continue;
-			}
-			
-			// Remove stress markers (digits) from phonemes
-			const cleanPhoneme = phoneme.replace(/\d+$/, '');
-			const digit = this.PHONEME_TO_DIGIT[cleanPhoneme];
-			if (digit !== undefined) {
-				digits.push(digit);
-			}
-		}
-		
-		return digits.length > 0 ? digits.join('') : null;
-	}
-
-	private static getWordFrequency(word: string): number {
-		// Basic frequency estimation based on word length and common patterns
-		// This is a simplified approach - ideally we'd use actual frequency data
-		const baseFreq = 1000;
-		const lengthBonus = Math.max(0, 5 - word.length) * 100; // Prefer shorter words
-		
-		// Bonus for common words
-		const commonWords = ['the', 'and', 'you', 'are', 'not', 'can', 'had', 'her', 'was', 'one', 'our', 'out', 'day', 'get', 'has', 'him', 'his', 'how', 'its', 'may', 'new', 'now', 'old', 'see', 'two', 'way', 'who', 'boy', 'did', 'man', 'car', 'eat', 'job', 'let', 'put', 'end', 'far', 'fun', 'got', 'home', 'left', 'life', 'live', 'look', 'made', 'make', 'move', 'must', 'name', 'need', 'open', 'over', 'play', 'read', 'right', 'run', 'same', 'show', 'take', 'tell', 'turn', 'walk', 'want', 'well', 'went', 'were', 'what', 'when', 'will', 'work', 'year'];
-		const commonBonus = commonWords.includes(word.toLowerCase()) ? 2000 : 0;
-		
-		return baseFreq + lengthBonus + commonBonus;
-	}
-
-	static getWordCandidates(number: string, maxCandidates: number = 12): string[] {
+	static getWordCandidates(
+		number: string,
+		maxCandidates: number = 12
+	): string[] {
 		console.log(`💭 Getting word candidates for number "${number}"`);
-		
+
 		// Use CMU dictionary if available
 		if (this.cmuDictionary) {
-			console.log(`💭 Using CMU dictionary (${Object.keys(this.cmuDictionary).length} patterns available)`);
+			console.log(
+				`💭 Using CMU dictionary (${
+					Object.keys(this.cmuDictionary).length
+				} patterns available)`
+			);
 			const entries = this.cmuDictionary[number] || [];
-			console.log(`💭 Found ${entries.length} CMU entries for "${number}"`);
-			
+			console.log(
+				`💭 Found ${entries.length} CMU entries for "${number}"`
+			);
+
 			// Sort by frequency (descending) and take top candidates
 			const sorted = entries
-				.filter(entry => entry.word && entry.word.length > 0)
+				.filter((entry) => entry.word && entry.word.length > 0)
 				.sort((a, b) => b.freq - a.freq)
 				.slice(0, maxCandidates)
-				.map(entry => entry.word);
-			
+				.map((entry) => entry.word);
+
 			if (sorted.length > 0) {
-				console.log(`💭 Returning ${sorted.length} CMU words for "${number}":`, sorted);
+				console.log(
+					`💭 Returning ${sorted.length} CMU words for "${number}":`,
+					sorted
+				);
 				return sorted;
 			} else {
-				console.log(`💭 No valid CMU words found for "${number}", trying fallback...`);
+				console.log(
+					`💭 No valid CMU words found for "${number}", trying fallback...`
+				);
 			}
 		} else {
-			console.log(`💭 CMU dictionary not available, using fallback dictionary`);
+			console.log(
+				`💭 CMU dictionary not available, using fallback dictionary`
+			);
 		}
-		
+
 		// Fallback to basic dictionary
 		const words = this.FALLBACK_WORDS[number] || [];
-		console.log(`💭 Returning ${words.length} fallback words for "${number}":`, words.slice(0, maxCandidates));
+		console.log(
+			`💭 Returning ${words.length} fallback words for "${number}":`,
+			words.slice(0, maxCandidates)
+		);
 		return words.slice(0, maxCandidates);
 	}
 
-	static generateMnemonics(text: string, position: 'front' | 'back'): MnemonicEntry[] {
+	static generateMnemonics(
+		text: string,
+		position: "front" | "back"
+	): MnemonicEntry[] {
 		console.log(`🎯 Generating mnemonics for ${position} text: "${text}"`);
 		const detectedNumbers = this.detectNumbers(text);
 		const mnemonics: MnemonicEntry[] = [];
 
-		for (const {number, source} of detectedNumbers) {
-			console.log(`🎯 Processing number "${number}" from source "${source}"`);
+		for (const { number, source } of detectedNumbers) {
+			console.log(
+				`🎯 Processing number "${number}" from source "${source}"`
+			);
 			const words = this.getWordCandidates(number);
 			if (words.length > 0) {
 				mnemonics.push({
@@ -2983,9 +3340,11 @@ class MajorSystemUtils {
 					words,
 					position,
 					selected: undefined, // No default selection
-					source: source // Track what text generated this number
+					source: source, // Track what text generated this number
 				});
-				console.log(`🎯 Added mnemonic for "${number}": ${words.length} words`);
+				console.log(
+					`🎯 Added mnemonic for "${number}": ${words.length} words`
+				);
 			} else {
 				console.log(`🎯 No words found for "${number}", skipping`);
 			}
@@ -2996,9 +3355,11 @@ class MajorSystemUtils {
 	}
 
 	// Helper method to detect conflicting numbers (overlapping digits)
-	static getConflictingNumbers(mnemonics: MnemonicEntry[]): Map<string, string[]> {
+	static getConflictingNumbers(
+		mnemonics: MnemonicEntry[]
+	): Map<string, string[]> {
 		const conflicts = new Map<string, string[]>();
-		
+
 		// Helper function to add bidirectional conflicts
 		const addConflict = (num1: string, num2: string) => {
 			if (!conflicts.has(num1)) conflicts.set(num1, []);
@@ -3006,20 +3367,29 @@ class MajorSystemUtils {
 			conflicts.get(num1)!.push(num2);
 			conflicts.get(num2)!.push(num1);
 		};
-		
+
 		for (let i = 0; i < mnemonics.length; i++) {
 			for (let j = i + 1; j < mnemonics.length; j++) {
 				const m1 = mnemonics[i];
 				const m2 = mnemonics[j];
-				
+
 				if (m1.source === m2.source) {
 					// They're from the same source
-					const longerNum = m1.number.length > m2.number.length ? m1.number : m2.number;
-					const shorterNum = m1.number.length > m2.number.length ? m2.number : m1.number;
-					
+					const longerNum =
+						m1.number.length > m2.number.length
+							? m1.number
+							: m2.number;
+					const shorterNum =
+						m1.number.length > m2.number.length
+							? m2.number
+							: m1.number;
+
 					// If one number contains the other's digits, they conflict
 					// e.g., "49" contains "4" and "9"
-					if (longerNum.length > shorterNum.length && longerNum.includes(shorterNum)) {
+					if (
+						longerNum.length > shorterNum.length &&
+						longerNum.includes(shorterNum)
+					) {
 						addConflict(m1.number, m2.number);
 					}
 				}
@@ -3030,12 +3400,125 @@ class MajorSystemUtils {
 }
 
 /**
+ * Centralized card data manager that handles migration between scattered and unified storage
+ */
+class CentralizedCardManager {
+	constructor(private plugin: GatedNotesPlugin) {}
+
+	/**
+	 * Gets the appropriate deck path based on migration status
+	 */
+	getDeckPath(chapterPath: string): string {
+		if (this.plugin.settings.migrationCompleted) {
+			return CENTRAL_DECK_PATH;
+		} else {
+			return getDeckPathForChapter(chapterPath);
+		}
+	}
+
+	/**
+	 * Reads cards for a specific chapter, handling both legacy and centralized modes
+	 */
+	async readCardsForChapter(chapterPath: string): Promise<FlashcardGraph> {
+		const allCards = await this.readCentralizedCards();
+		if (chapterPath === ".") {
+			return allCards;
+		}
+		const filteredCards: FlashcardGraph = {};
+
+		for (const [id, card] of Object.entries(allCards)) {
+			if (card.chapter === chapterPath) {
+				filteredCards[id] = card;
+			}
+		}
+
+		return filteredCards;
+	}
+
+	/**
+	 * Writes cards for a specific chapter, handling both legacy and centralized modes
+	 */
+	async writeCardsForChapter(
+		chapterPath: string,
+		chapterCards: FlashcardGraph
+	): Promise<void> {
+		const allCards = await this.readCentralizedCards();
+
+		// Remove existing cards for this chapter
+		for (const [id, card] of Object.entries(allCards)) {
+			if (card.chapter === chapterPath) {
+				delete allCards[id];
+			}
+		}
+
+		// Add the updated cards
+		for (const [id, card] of Object.entries(chapterCards)) {
+			card.migration_version = "3.0.0";
+			allCards[id] = card;
+		}
+
+		await this.writeCentralizedCards(allCards);
+	}
+
+	/**
+	 * Reads all cards from centralized storage
+	 */
+	async readCentralizedCards(): Promise<FlashcardGraph> {
+		if (!(await this.plugin.app.vault.adapter.exists(CENTRAL_DECK_PATH))) {
+			this.plugin.logger(
+				LogLevel.VERBOSE,
+				`Central deck file does not exist: ${CENTRAL_DECK_PATH}`
+			);
+			return {};
+		}
+
+		try {
+			const content = await this.plugin.app.vault.adapter.read(
+				CENTRAL_DECK_PATH
+			);
+			const parsed = JSON.parse(content);
+
+			return parsed;
+		} catch (error) {
+			console.error("Failed to read centralized flashcards:", error);
+			return {};
+		}
+	}
+
+	/**
+	 * Writes all cards to centralized storage
+	 */
+	async writeCentralizedCards(allCards: FlashcardGraph): Promise<void> {
+		try {
+			const content = JSON.stringify(allCards, null, 2);
+			await this.plugin.app.vault.adapter.write(
+				CENTRAL_DECK_PATH,
+				content
+			);
+		} catch (error) {
+			console.error("Failed to write centralized flashcards:", error);
+			throw error;
+		}
+	}
+
+	/**
+	 * Gets all deck files in the vault (for migration detection)
+	 */
+	async findAllDeckFiles(): Promise<TFile[]> {
+		return this.plugin.app.vault
+			.getFiles()
+			.filter((file) => file.name === DECK_FILE_NAME);
+	}
+}
+
+/**
  * The main class for the Gated Notes plugin, handling all logic and UI.
  */
 export default class GatedNotesPlugin extends Plugin {
 	settings!: Settings;
 	public lastModalTransform: string | null = null;
 	private openai: OpenAI | null = null;
+	public cardManager!: CentralizedCardManager;
 	private cardBrowserState: CardBrowserState = {
 		openSubjects: new Set(),
 		activeChapterPath: null,
@@ -3050,7 +3533,8 @@ export default class GatedNotesPlugin extends Plugin {
 	private gatingStatus!: HTMLElement;
 	private cardsMissingParaIdxStatus!: HTMLElement;
 	private statusRefreshQueued = false;
-	private studyMode: StudyMode = StudyMode.CHAPTER;
+	private studyMode: StudyMode = StudyMode.NOTE;
+	private customSessionPath: string = ""; // Selected folder for custom session
 	private isRecalculatingAll = false;
 
 	// Enhanced image management services
@@ -3058,61 +3542,111 @@ export default class GatedNotesPlugin extends Plugin {
 	public imageStitcher!: ImageStitcher;
 	public snippingTool!: SnippingTool;
 
-	private subjectOf(path: string): string {
+	public subjectOf(path: string): string {
 		return path.split("/")[0] ?? "";
+	}
+
+	private showCustomSessionDialog(): void {
+		const modal = new CustomSessionDialog(this.app, (selectedPath) => {
+			this.customSessionPath = selectedPath;
+			this.studyMode = StudyMode.CUSTOM_SESSION;
+			const pathDisplay = selectedPath || "Vault Root";
+			new Notice(`📁 Custom session: ${pathDisplay}`);
+			this.reviewDue();
+		});
+		modal.open();
+	}
+
+	private getCardsForCustomSession(allCards: FlashcardGraph): Flashcard[] {
+		if (!this.customSessionPath) {
+			return Object.values(allCards); // Fallback to all cards
+		}
+
+		return Object.values(allCards).filter((card) => {
+			// Include cards that are in the selected path or any of its subfolders
+			return card.chapter.startsWith(this.customSessionPath);
+		});
 	}
 
 	public async gatherVaultStatistics(): Promise<{
 		totalCards: number;
-		byStatus: { new: number; learning: number; review: number; relearn: number };
-		byState: { due: number; blocked: number; suspended: number; buried: number; flagged: number; missingParaIdx: number };
-		bySubject: Array<{ subject: string; total: number; due: number; blocked: number }>;
+		byStatus: {
+			new: number;
+			learning: number;
+			review: number;
+			relearn: number;
+		};
+		byState: {
+			due: number;
+			blocked: number;
+			suspended: number;
+			buried: number;
+			flagged: number;
+			missingParaIdx: number;
+		};
+		bySubject: Array<{
+			subject: string;
+			total: number;
+			due: number;
+			blocked: number;
+		}>;
 	}> {
 		const stats = {
 			totalCards: 0,
 			byStatus: { new: 0, learning: 0, review: 0, relearn: 0 },
-			byState: { due: 0, blocked: 0, suspended: 0, buried: 0, flagged: 0, missingParaIdx: 0 },
-			bySubject: [] as Array<{ subject: string; total: number; due: number; blocked: number }>
+			byState: {
+				due: 0,
+				blocked: 0,
+				suspended: 0,
+				buried: 0,
+				flagged: 0,
+				missingParaIdx: 0,
+			},
+			bySubject: [] as Array<{
+				subject: string;
+				total: number;
+				due: number;
+				blocked: number;
+			}>,
 		};
 
-		const subjectMap = new Map<string, { total: number; due: number; blocked: number }>();
+		const subjectMap = new Map<
+			string,
+			{ total: number; due: number; blocked: number }
+		>();
 		const now = Date.now();
 
-		// Get all deck files
-		const deckFiles = this.app.vault.getFiles()
-			.filter(file => file.name === "_flashcards.json");
+		// Get all cards from centralized storage
+		const graph = await this.cardManager.readCentralizedCards();
+		const allCards = Object.values(graph);
 
-		for (const deckFile of deckFiles) {
-			const graph = await this.readDeck(deckFile.path);
-			const allCards = Object.values(graph);
+		for (const card of allCards) {
+			stats.totalCards++;
 
-			for (const card of allCards) {
-				stats.totalCards++;
+			// Status counts
+			if (card.status === "new") stats.byStatus.new++;
+			else if (card.status === "learning") stats.byStatus.learning++;
+			else if (card.status === "review") stats.byStatus.review++;
+			else if (card.status === "relearn") stats.byStatus.relearn++;
 
-				// Status counts
-				if (card.status === "new") stats.byStatus.new++;
-				else if (card.status === "learning") stats.byStatus.learning++;
-				else if (card.status === "review") stats.byStatus.review++;
-				else if (card.status === "relearn") stats.byStatus.relearn++;
+			// State counts - only count non-blocked cards as due
+			if (card.due <= now && !card.blocked) stats.byState.due++;
+			if (card.blocked) stats.byState.blocked++;
+			if (card.suspended) stats.byState.suspended++;
+			if (card.buried) stats.byState.buried++;
+			if (card.flagged) stats.byState.flagged++;
+			if (card.paraIdx === undefined || card.paraIdx === null)
+				stats.byState.missingParaIdx++;
 
-				// State counts - only count non-blocked cards as due
-				if (card.due <= now && !card.blocked) stats.byState.due++;
-				if (card.blocked) stats.byState.blocked++;
-				if (card.suspended) stats.byState.suspended++;
-				if (card.buried) stats.byState.buried++;
-				if (card.flagged) stats.byState.flagged++;
-				if (card.paraIdx === undefined || card.paraIdx === null) stats.byState.missingParaIdx++;
-
-				// Subject counts - only count non-blocked cards as due
-				const subject = this.subjectOf(card.chapter);
-				if (!subjectMap.has(subject)) {
-					subjectMap.set(subject, { total: 0, due: 0, blocked: 0 });
-				}
-				const subjectStats = subjectMap.get(subject)!;
-				subjectStats.total++;
-				if (card.due <= now && !card.blocked) subjectStats.due++;
-				if (card.blocked) subjectStats.blocked++;
+			// Subject counts - only count non-blocked cards as due
+			const subject = this.subjectOf(card.chapter);
+			if (!subjectMap.has(subject)) {
+				subjectMap.set(subject, { total: 0, due: 0, blocked: 0 });
 			}
+			const subjectStats = subjectMap.get(subject)!;
+			subjectStats.total++;
+			if (card.due <= now && !card.blocked) subjectStats.due++;
+			if (card.blocked) subjectStats.blocked++;
 		}
 
 		// Convert subject map to sorted array
@@ -3127,14 +3661,20 @@ export default class GatedNotesPlugin extends Plugin {
 		await this.loadSettings();
 		this.initializeOpenAIClient();
 
+		// Initialize centralized card manager
+		this.cardManager = new CentralizedCardManager(this);
+
+		// Check for migration needs
+		await this.checkMigrationNeeded();
+
 		// Initialize enhanced image services
 		this.imageManager = new ImageManager(this);
 		this.imageStitcher = new ImageStitcher(this);
 		this.snippingTool = new SnippingTool(this);
 
 		// Load CMU dictionary for mnemonic generation (async, non-blocking)
-		MajorSystemUtils.loadCMUDictionary(this).catch(err => {
-			console.warn('Failed to load CMU dictionary:', err);
+		MajorSystemUtils.loadCMUDictionary(this).catch((err) => {
+			console.warn("Failed to load CMU dictionary:", err);
 		});
 
 		this.setupStatusBar();
@@ -3161,7 +3701,7 @@ export default class GatedNotesPlugin extends Plugin {
 			this.explorerObserver.disconnect();
 			this.explorerObserver = null;
 		}
-		
+
 		// Clear any pending timeout
 		if (this.decorateTimeout) {
 			clearTimeout(this.decorateTimeout);
@@ -3352,8 +3892,7 @@ export default class GatedNotesPlugin extends Plugin {
 				if (!checking) {
 					(async () => {
 						const file = view.file!;
-						const deckPath = getDeckPathForChapter(file.path);
-						const graph = await this.readDeck(deckPath);
+						const graph = await this.cardManager.readCentralizedCards();
 						const existingCards = Object.values(graph).filter(
 							(c) => c.chapter === file.path
 						);
@@ -3433,15 +3972,7 @@ export default class GatedNotesPlugin extends Plugin {
 				if (!checking) {
 					(async () => {
 						const file = view.file!;
-						const deckPath = getDeckPathForChapter(file.path);
-						if (!(await this.app.vault.adapter.exists(deckPath))) {
-							new Notice(
-								"No flashcard deck found for this chapter."
-							);
-							return;
-						}
-
-						const graph = await this.readDeck(deckPath);
+						const graph = await this.cardManager.readCentralizedCards();
 						const cardsForChapter = Object.values(graph).filter(
 							(c) => c.chapter === file.path
 						);
@@ -3470,7 +4001,7 @@ export default class GatedNotesPlugin extends Plugin {
 							delete card.learning_step_index;
 						}
 
-						await this.writeDeck(deckPath, graph);
+						await this.cardManager.writeCentralizedCards(graph);
 						new Notice(
 							`Reset ${cardsForChapter.length} card(s) for "${file.basename}".`
 						);
@@ -3665,16 +4196,14 @@ export default class GatedNotesPlugin extends Plugin {
 	}
 
 	private registerRibbonIcons(): void {
-		this.addRibbonIcon("target", "Chapter focus", () => {
-			this.studyMode = StudyMode.CHAPTER;
-			new Notice("🎯 Chapter focus mode");
+		this.addRibbonIcon("target", "Note focus", () => {
+			this.studyMode = StudyMode.NOTE;
+			new Notice("🎯 Note focus mode");
 			this.reviewDue();
 		});
 
-		this.addRibbonIcon("library", "Subject focus", () => {
-			this.studyMode = StudyMode.SUBJECT;
-			new Notice("📚 Subject focus mode");
-			this.reviewDue();
+		this.addRibbonIcon("library", "Custom session", () => {
+			this.showCustomSessionDialog();
 		});
 
 		this.addRibbonIcon("brain", "Review-only focus", () => {
@@ -3704,7 +4233,7 @@ export default class GatedNotesPlugin extends Plugin {
 		);
 
 		const refreshOnDeckChange = (file: TAbstractFile) => {
-			if (file.path.endsWith(DECK_FILE_NAME)) {
+			if (file.path === CENTRAL_DECK_PATH || file.path.endsWith(DECK_FILE_NAME)) {
 				this.refreshAllStatuses();
 			}
 		};
@@ -3859,18 +4388,30 @@ export default class GatedNotesPlugin extends Plugin {
 		const queue = await this.collectReviewPool(activePath);
 		if (!queue.length) {
 			// Check if there are any future cards to review
-			const futureQueue = await this.collectReviewPool(activePath, 24 * 60 * 60 * 1000); // Check up to 24 hours ahead
+			const futureQueue = await this.collectReviewPool(
+				activePath,
+				24 * 60 * 60 * 1000
+			); // Check up to 24 hours ahead
 			if (futureQueue.length > 0) {
 				// Ask user if they want to review ahead of schedule
 				new ReviewAheadModal(
 					this.app,
 					this.studyMode,
 					async (timeAheadMs: number) => {
-						const aheadQueue = await this.collectReviewPool(activePath, timeAheadMs);
+						const aheadQueue = await this.collectReviewPool(
+							activePath,
+							timeAheadMs
+						);
 						if (aheadQueue.length > 0) {
-							await this.processReviewQueue(aheadQueue, activePath, gateBefore);
+							await this.processReviewQueue(
+								aheadQueue,
+								activePath,
+								gateBefore
+							);
 						} else {
-							new Notice("🎉 No cards found within the specified time range!");
+							new Notice(
+								"🎉 No cards found within the specified time range!"
+							);
 						}
 					},
 					() => {
@@ -3892,20 +4433,34 @@ export default class GatedNotesPlugin extends Plugin {
 	 * @param queue The current review queue
 	 * @returns The index of the selected card, or -1 if queue is empty
 	 */
-	private selectNextCardForReview(queue: { card: Flashcard; deck: TFile }[]): number {
+	private selectNextCardForReview(
+		queue: { card: Flashcard; deck: TFile }[]
+	): number {
 		if (queue.length === 0) return -1;
 		if (queue.length === 1) {
-			this.logger(LogLevel.VERBOSE, "Interleaving: Only 1 card in queue, selecting index 0");
+			this.logger(
+				LogLevel.VERBOSE,
+				"Interleaving: Only 1 card in queue, selecting index 0"
+			);
 			return 0;
 		}
-		
+
 		// Skip interleaving for chapter mode or if disabled
-		if (this.studyMode === StudyMode.CHAPTER || !this.settings.enableInterleaving) {
-			this.logger(LogLevel.VERBOSE, `Interleaving: Skipped (mode=${this.studyMode}, enabled=${this.settings.enableInterleaving}), selecting index 0`);
+		if (
+			this.studyMode === StudyMode.NOTE ||
+			!this.settings.enableInterleaving
+		) {
+			this.logger(
+				LogLevel.VERBOSE,
+				`Interleaving: Skipped (mode=${this.studyMode}, enabled=${this.settings.enableInterleaving}), selecting index 0`
+			);
 			return 0; // Just take the first card (already sorted)
 		}
 
-		this.logger(LogLevel.VERBOSE, `Interleaving: Starting selection from ${queue.length} cards using direct overdue weighting`);
+		this.logger(
+			LogLevel.VERBOSE,
+			`Interleaving: Starting selection from ${queue.length} cards using direct overdue weighting`
+		);
 
 		return this.selectCardByOverdueWeight(queue);
 	}
@@ -3913,28 +4468,50 @@ export default class GatedNotesPlugin extends Plugin {
 	/**
 	 * Select card using direct overdue weighting.
 	 */
-	private selectCardByOverdueWeight(queue: { card: Flashcard; deck: TFile }[]): number {
-		const overdueSeconds = queue.map(({card}) => getOverdueSeconds(card));
+	private selectCardByOverdueWeight(
+		queue: { card: Flashcard; deck: TFile }[]
+	): number {
+		const overdueSeconds = queue.map(({ card }) => getOverdueSeconds(card));
 		const cumulativeWeights: number[] = [];
 		let total = 0;
-		
+
 		// Log overdue seconds for each card
-		this.logger(LogLevel.VERBOSE, "Direct sampling - Card overdue seconds:", 
-			overdueSeconds.map((seconds, i) => `[${i}] ${queue[i].card.front?.substring(0, 30)}... = ${seconds}s`));
-		
+		this.logger(
+			LogLevel.VERBOSE,
+			"Direct sampling - Card overdue seconds:",
+			overdueSeconds.map(
+				(seconds, i) =>
+					`[${i}] ${queue[i].card.front?.substring(
+						0,
+						30
+					)}... = ${seconds}s`
+			)
+		);
+
 		for (const seconds of overdueSeconds) {
 			total += Math.max(1, seconds); // Minimum weight of 1 to include all cards
 			cumulativeWeights.push(total);
 		}
-		
-		this.logger(LogLevel.VERBOSE, `Direct sampling - Cumulative weights: [${cumulativeWeights.join(', ')}], total=${total}`);
-		
+
+		this.logger(
+			LogLevel.VERBOSE,
+			`Direct sampling - Cumulative weights: [${cumulativeWeights.join(
+				", "
+			)}], total=${total}`
+		);
+
 		const selectedIndex = sampleFromCumulative(cumulativeWeights);
-		this.logger(LogLevel.VERBOSE, `Direct sampling - Selected index ${selectedIndex}: "${queue[selectedIndex].card.front?.substring(0, 50)}..." (${overdueSeconds[selectedIndex]}s overdue)`);
-		
+		this.logger(
+			LogLevel.VERBOSE,
+			`Direct sampling - Selected index ${selectedIndex}: "${queue[
+				selectedIndex
+			].card.front?.substring(0, 50)}..." (${
+				overdueSeconds[selectedIndex]
+			}s overdue)`
+		);
+
 		return selectedIndex;
 	}
-
 
 	private async processReviewQueue(
 		queue: { card: Flashcard; deck: TFile }[],
@@ -3945,19 +4522,31 @@ export default class GatedNotesPlugin extends Plugin {
 		let remainingQueue = [...queue]; // Work with a copy
 		let reviewCount = 0;
 
-		this.logger(LogLevel.VERBOSE, `Review queue processing: Starting with ${remainingQueue.length} cards`);
+		this.logger(
+			LogLevel.VERBOSE,
+			`Review queue processing: Starting with ${remainingQueue.length} cards`
+		);
 
 		while (remainingQueue.length > 0) {
 			reviewCount++;
-			this.logger(LogLevel.VERBOSE, `Review #${reviewCount}: ${remainingQueue.length} cards remaining`);
-			
+			this.logger(
+				LogLevel.VERBOSE,
+				`Review #${reviewCount}: ${remainingQueue.length} cards remaining`
+			);
+
 			// Select next card using weighted sampling
 			const selectedIndex = this.selectNextCardForReview(remainingQueue);
 			if (selectedIndex === -1) break;
-			
+
 			const { card, deck } = remainingQueue[selectedIndex];
-			this.logger(LogLevel.VERBOSE, `Review #${reviewCount}: Presenting card "${card.front?.substring(0, 50)}..."`);
-			
+			this.logger(
+				LogLevel.VERBOSE,
+				`Review #${reviewCount}: Presenting card "${card.front?.substring(
+					0,
+					50
+				)}..."`
+			);
+
 			// Log initial card properties for verbose logging
 			this.logger(LogLevel.VERBOSE, `Card properties before review:`, {
 				id: card.id,
@@ -3971,14 +4560,17 @@ export default class GatedNotesPlugin extends Plugin {
 				buried: card.buried,
 				suspended: card.suspended,
 				flagged: card.flagged,
-				blocked: card.blocked
+				blocked: card.blocked,
 			});
-			
+
 			const res = await this.openReviewModal(card, deck);
 
 			// Remove the processed card from the queue
 			remainingQueue.splice(selectedIndex, 1);
-			this.logger(LogLevel.VERBOSE, `Review #${reviewCount}: Card processed (result: ${res}), ${remainingQueue.length} cards remaining`);
+			this.logger(
+				LogLevel.VERBOSE,
+				`Review #${reviewCount}: Card processed (result: ${res}), ${remainingQueue.length} cards remaining`
+			);
 
 			if (res === "abort") {
 				new Notice("Review session aborted.");
@@ -3999,7 +4591,7 @@ export default class GatedNotesPlugin extends Plugin {
 			if (gateAfterLoop > gateBefore) {
 				break;
 			}
-			
+
 			// Queue recalculates automatically on next iteration
 		}
 
@@ -4073,145 +4665,136 @@ export default class GatedNotesPlugin extends Plugin {
 		const now = Date.now();
 		const dueThreshold = futureTimeMs ? now + futureTimeMs : now;
 
-		const allDeckFiles = this.app.vault
-			.getFiles()
-			.filter((f) => f.name.endsWith(DECK_FILE_NAME));
+		// Check if we have centralized cards (regardless of migration flag)
+		const centralFile = this.app.vault.getAbstractFileByPath(
+			CENTRAL_DECK_PATH
+		) as TFile;
+		const hasCentralizedCards =
+			centralFile &&
+			(await this.app.vault.adapter.exists(CENTRAL_DECK_PATH));
 
-		for (const deck of allDeckFiles) {
-			const graph = await this.readDeck(deck.path);
-			let cardsInScope: Flashcard[];
+		if (hasCentralizedCards) {
+			// Post-migration: read from centralized file
+			const allCards = await this.cardManager.readCentralizedCards();
 
-			switch (this.studyMode) {
-				case StudyMode.CHAPTER:
-					cardsInScope = Object.values(graph).filter(
-						(c) => c.chapter === activePath
-					);
-					break;
-				case StudyMode.SUBJECT:
-					cardsInScope = Object.values(graph).filter(
-						(c) => this.subjectOf(c.chapter) === this.subjectOf(activePath)
-					);
-					break;
-				case StudyMode.REVIEW:
-				default:
-					cardsInScope = Object.values(graph);
-					break;
-			}
+			if (centralFile) {
+				let cardsInScope: Flashcard[];
 
-			let firstBlockedParaIdx = Infinity;
-			if (this.studyMode === StudyMode.CHAPTER) {
-				const blockedCards = cardsInScope.filter(
-					(c) => c.blocked && !c.suspended && !isBuried(c)
+				switch (this.studyMode) {
+					case StudyMode.NOTE:
+						cardsInScope = Object.values(allCards).filter(
+							(c) => c.chapter === activePath
+						);
+
+						break;
+					case StudyMode.CUSTOM_SESSION:
+						cardsInScope = this.getCardsForCustomSession(allCards);
+						break;
+					case StudyMode.REVIEW:
+					default:
+						cardsInScope = Object.values(allCards);
+						break;
+				}
+
+				this.processCardsInScope(
+					cardsInScope,
+					centralFile,
+					activePath,
+					dueThreshold,
+					reviewPool
 				);
-				if (blockedCards.length > 0) {
-					firstBlockedParaIdx = Math.min(
-						...blockedCards.map((c) => c.paraIdx ?? Infinity)
-					);
-				}
-				
-				// Debug logging for the problematic chapter
-				if (activePath.includes("02_True Happiness - Aristotle") || activePath.includes("A History of the Bible/00 Introduction")) {
-					this.logger(LogLevel.VERBOSE, `Chapter focus mode - blocked card analysis for ${activePath}:`, {
-						totalCardsInScope: cardsInScope.length,
-						blockedCardsCount: blockedCards.length,
-						firstBlockedParaIdx,
-						blockedCardParaIndices: blockedCards.map(c => ({ paraIdx: c.paraIdx, front: c.front?.substring(0, 30) }))
-					});
-				}
-			}
-
-			for (const card of cardsInScope) {
-				// Debug logging for the problematic chapter
-				if (card.chapter.includes("02_True Happiness - Aristotle")) {
-					this.logger(LogLevel.VERBOSE, `Reviewing card filtering for: ${card.front?.substring(0, 50)}...`, {
-						suspended: card.suspended,
-						due: card.due,
-						dueThreshold,
-						isDue: card.due <= dueThreshold,
-						paraIdx: card.paraIdx,
-						firstBlockedParaIdx,
-						isInRange: (card.paraIdx ?? Infinity) <= firstBlockedParaIdx,
-						blocked: card.blocked,
-						status: card.status
-					});
-				}
-				
-				if (card.suspended) continue;
-				if (card.due > dueThreshold) continue;
-
-				if (this.studyMode === StudyMode.CHAPTER) {
-					// In chapter mode, we want to include:
-					// 1. All cards at or before the first blocked paragraph 
-					// 2. Blocked cards that are due AND not new (so they can be reviewed to unblock progress)
-					const cardParaIdx = card.paraIdx ?? Infinity;
-					const isNew = isUnseen(card);
-					const isBlockedAndDue = card.blocked && card.due <= dueThreshold && !isNew;
-					
-					if (cardParaIdx > firstBlockedParaIdx && !isBlockedAndDue) {
-						if (card.chapter.includes("02_True Happiness - Aristotle") || card.chapter.includes("A History of the Bible/00 Introduction")) {
-							this.logger(LogLevel.VERBOSE, `EXCLUDED card: "${card.front?.substring(0, 50)}..." (paraIdx: ${cardParaIdx}, firstBlockedParaIdx: ${firstBlockedParaIdx}, blocked: ${card.blocked}, due: ${card.due <= dueThreshold}, new: ${isNew})`);
-						}
-						continue;
-					}
-					
-					if (card.chapter.includes("02_True Happiness - Aristotle") || card.chapter.includes("A History of the Bible/00 Introduction")) {
-						this.logger(LogLevel.VERBOSE, `INCLUDED card: "${card.front?.substring(0, 50)}..." (paraIdx: ${cardParaIdx}, firstBlockedParaIdx: ${firstBlockedParaIdx}, blocked: ${card.blocked}, due: ${card.due <= dueThreshold}, new: ${isNew})`);
-					}
-				} else {
-					// In other modes (Subject, Review-only), we don't want to see new cards.
-					const isNew = isUnseen(card);
-					if (isNew) continue;
-				}
-				reviewPool.push({ card, deck });
 			}
 		}
 
-		// Debug logging for the final review pool
-		const aristotleCards = reviewPool.filter(({card}) => card.chapter.includes("02_True Happiness - Aristotle"));
-		if (aristotleCards.length > 0) {
-			this.logger(LogLevel.VERBOSE, `Final review pool for Aristotle chapter:`, {
-				totalCards: aristotleCards.length,
-				cards: aristotleCards.map(({card}) => ({
-					front: card.front?.substring(0, 50),
-					paraIdx: card.paraIdx,
-					status: card.status,
-					blocked: card.blocked,
-					due: new Date(card.due).toISOString()
-				}))
-			});
-		} else if (this.studyMode === StudyMode.CHAPTER && reviewPool.length === 0) {
-			this.logger(LogLevel.VERBOSE, `No cards found in review pool for chapter mode`);
-		}
 
 		reviewPool.sort((a, b) => {
 			const aIsNew = isUnseen(a.card);
 			const bIsNew = isUnseen(b.card);
 
-			// In chapter focus mode, respect the review-before-new setting
-			if (this.studyMode === StudyMode.CHAPTER) {
-				if (aIsNew !== bIsNew) {
-					return this.settings.chapterFocusReviewsFirst 
-						? (aIsNew ? 1 : -1)  // Reviews first (non-new before new)
-						: (aIsNew ? -1 : 1); // New first (new before non-new) - original behavior
+			// Handle note focus mode
+			if (this.studyMode === StudyMode.NOTE) {
+				if (this.settings.chapterFocusReviewsFirst) {
+					// Reviews first, then new cards
+					if (!aIsNew && bIsNew) return -1;
+					if (aIsNew && !bIsNew) return 1;
+				} else {
+					// New cards first, then reviews
+					if (aIsNew && !bIsNew) return -1;
+					if (!aIsNew && bIsNew) return 1;
 				}
 			} else {
-				// In other modes, new cards (if they were to be included) would come first.
-				if (aIsNew !== bIsNew) {
-					return aIsNew ? -1 : 1;
-				}
+				// In other modes, new cards first
+				if (aIsNew && !bIsNew) return -1;
+				if (!aIsNew && bIsNew) return 1;
 			}
 
-			// For cards of the same type (e.g., both are review cards), sort by due date.
-			// If due dates are the same, sort by their position in the note.
-			if (a.card.chapter === b.card.chapter) {
+			// For cards of the same type, sort by due date
+			// If due dates are the same, sort by paragraph index
+			if (a.card.due !== b.card.due) {
+				return a.card.due - b.card.due;
+			}
+
+			// If in same chapter, sort by paragraph index
+			const aChapter = a.card.chapter;
+			const bChapter = b.card.chapter;
+			if (aChapter === bChapter) {
 				return (
 					(a.card.paraIdx ?? Infinity) - (b.card.paraIdx ?? Infinity)
 				);
 			}
-			return a.card.due - b.card.due;
+
+			return 0;
 		});
 
 		return reviewPool;
+	}
+
+	private async processCardsInScope(
+		cardsInScope: Flashcard[],
+		deck: TFile,
+		activePath: string,
+		dueThreshold: number,
+		reviewPool: { card: Flashcard; deck: TFile }[]
+	): Promise<void> {
+		let firstBlockedParaIdx = Infinity;
+		if (this.studyMode === StudyMode.NOTE) {
+			const blockedCards = cardsInScope.filter(
+				(c) => c.blocked && !c.suspended && !isBuried(c)
+			);
+			if (blockedCards.length > 0) {
+				firstBlockedParaIdx = Math.min(
+					...blockedCards.map((c) => c.paraIdx ?? Infinity)
+				);
+			}
+
+		}
+
+		for (const card of cardsInScope) {
+			const cardChapter = card.chapter;
+
+
+			if (card.suspended) continue;
+			if (card.due > dueThreshold) continue;
+
+			if (this.studyMode === StudyMode.NOTE) {
+				// In note mode, we want to include:
+				// 1. All cards at or before the first blocked paragraph
+				// 2. Blocked cards that are due AND not new (so they can be reviewed to unblock progress)
+				const cardParaIdx = card.paraIdx ?? Infinity;
+				const isNew = isUnseen(card);
+				const isBlockedAndDue =
+					card.blocked && card.due <= dueThreshold && !isNew;
+
+				if (cardParaIdx > firstBlockedParaIdx && !isBlockedAndDue) {
+					continue;
+				}
+			} else {
+				// In other modes (Subject, Review-only), we don't want to see new cards.
+				const isNew = isUnseen(card);
+				if (isNew) continue;
+			}
+			reviewPool.push({ card, deck });
+		}
 	}
 
 	public getCardVariants(card: Flashcard): CardVariant[] {
@@ -4235,10 +4818,14 @@ export default class GatedNotesPlugin extends Plugin {
 
 	public ensureVariantsStructure(card: Flashcard): void {
 		// Convert legacy structure to variants structure if needed
-		if (!card.variants && card.front !== undefined && card.back !== undefined) {
+		if (
+			!card.variants &&
+			card.front !== undefined &&
+			card.back !== undefined
+		) {
 			card.variants = [{ front: card.front, back: card.back }];
 		}
-		
+
 		// Always sync front/back with first variant for backwards compatibility
 		if (card.variants && card.variants.length > 0) {
 			card.front = card.variants[0].front;
@@ -4246,21 +4833,25 @@ export default class GatedNotesPlugin extends Plugin {
 		}
 	}
 
-	private formatDueTime(dueTimestamp: number, currentTime: number, cardStatus: string): string {
+	private formatDueTime(
+		dueTimestamp: number,
+		currentTime: number,
+		cardStatus: string
+	): string {
 		const diffMs = dueTimestamp - currentTime;
-		
+
 		// Helper function to format numbers with one decimal place, hiding .0
 		const formatDecimal = (num: number): string => {
 			const rounded = Math.round(num * 10) / 10;
 			return rounded % 1 === 0 ? rounded.toString() : rounded.toFixed(1);
 		};
-		
+
 		// Convert to different units
 		const seconds = diffMs / 1000;
 		const minutes = seconds / 60;
 		const hours = minutes / 60;
 		const days = hours / 24;
-		
+
 		// Choose the most appropriate unit
 		if (seconds < 60) {
 			const formatted = formatDecimal(seconds);
@@ -4345,23 +4936,29 @@ export default class GatedNotesPlugin extends Plugin {
 			card.due = now + card.interval * ONE_DAY_MS;
 		}
 		card.last_reviewed = new Date(now).toISOString();
-		
+
 		// Log final card properties after answering
-		this.logger(LogLevel.VERBOSE, `Card properties after answering with "${rating}":`, {
-			id: card.id,
-			due: new Date(card.due).toLocaleString(),
-			dueTimestamp: card.due,
-			currentTime: new Date(now).toLocaleString(),
-			currentTimestamp: now,
-			interval: card.interval,
-			ease_factor: card.ease_factor,
-			status: card.status,
-			buried: card.buried,
-			suspended: card.suspended,
-			flagged: card.flagged,
-			blocked: card.blocked,
-			timeAdded: `${Math.round((card.due - now) / (1000 * 60 * 60 * 24))} days`
-		});
+		this.logger(
+			LogLevel.VERBOSE,
+			`Card properties after answering with "${rating}":`,
+			{
+				id: card.id,
+				due: new Date(card.due).toLocaleString(),
+				dueTimestamp: card.due,
+				currentTime: new Date(now).toLocaleString(),
+				currentTimestamp: now,
+				interval: card.interval,
+				ease_factor: card.ease_factor,
+				status: card.status,
+				buried: card.buried,
+				suspended: card.suspended,
+				flagged: card.flagged,
+				blocked: card.blocked,
+				timeAdded: `${Math.round(
+					(card.due - now) / (1000 * 60 * 60 * 24)
+				)} days`,
+			}
+		);
 	}
 
 	private async autoFinalizeNote(file: TFile): Promise<void> {
@@ -4485,13 +5082,7 @@ export default class GatedNotesPlugin extends Plugin {
 		this.refreshReading();
 		this.refreshAllStatuses();
 
-		const deckPath = getDeckPathForChapter(file.path);
-		if (!(await this.app.vault.adapter.exists(deckPath))) {
-			new Notice("Chapter un-finalized. Gating removed.");
-			return;
-		}
-
-		const graph = await this.readDeck(deckPath);
+		const graph = await this.cardManager.readCentralizedCards();
 		const cardsForChapter = Object.values(graph).filter(
 			(c) => c.chapter === file.path
 		);
@@ -4501,7 +5092,7 @@ export default class GatedNotesPlugin extends Plugin {
 				for (const id in graph) {
 					if (graph[id].chapter === file.path) delete graph[id];
 				}
-				await this.writeDeck(deckPath, graph);
+				await this.cardManager.writeCentralizedCards(graph);
 				new Notice(
 					`Chapter un-finalized and ${cardsForChapter.length} card(s) deleted.`
 				);
@@ -4794,16 +5385,12 @@ ${plainTextForLlm}`;
 		let finalNoticeText = "";
 
 		if (goodCards.length > 0) {
-			const deckPath = getDeckPathForChapter(file.path);
-			const graph = await this.readDeck(deckPath);
+			const graph = await this.cardManager.readCentralizedCards();
 
 			const newCardIds = goodCards.map((card) => card.id);
 
 			goodCards.forEach((card) => (graph[card.id] = card));
-			const deckFile =
-				(this.app.vault.getAbstractFileByPath(deckPath) as TFile) ||
-				(await this.app.vault.create(deckPath, "{}"));
-			await this.writeDeck(deckPath, graph);
+			await this.cardManager.writeCentralizedCards(graph);
 			if (usage) {
 				await logLlmCall(this, {
 					action: existingCardsForContext
@@ -4816,7 +5403,7 @@ ${plainTextForLlm}`;
 				});
 			}
 
-			await this.promptToReviewNewCards(goodCards, deckFile, graph);
+			await this.promptToReviewNewCards(goodCards, null, graph);
 
 			const keptCardsCount = newCardIds.filter((id) => graph[id]).length;
 			const discardedCount = newCardIds.length - keptCardsCount;
@@ -4964,14 +5551,8 @@ ${selection}
 			}
 
 			// Trigger review modal for the new card
-			const deckPath = getDeckPathForChapter(file.path);
-			const graph = await this.readDeck(deckPath);
-			const deckFile = this.app.vault.getAbstractFileByPath(
-				deckPath
-			) as TFile;
-			if (deckFile) {
-				await this.promptToReviewNewCards([card], deckFile, graph);
-			}
+			const graph = await this.cardManager.readCentralizedCards();
+			await this.promptToReviewNewCards([card], null, graph);
 
 			new Notice("✅ AI-generated card added!");
 			this.refreshAllStatuses();
@@ -5044,13 +5625,9 @@ ${selection}
 				await this.saveCards(file, cards);
 
 				// Trigger review modal for the new cards
-				const deckPath = getDeckPathForChapter(file.path);
-				const graph = await this.readDeck(deckPath);
-				const deckFile = this.app.vault.getAbstractFileByPath(
-					deckPath
-				) as TFile;
-				if (deckFile && cards.length > 0) {
-					await this.promptToReviewNewCards(cards, deckFile, graph);
+				const graph = await this.cardManager.readCentralizedCards();
+				if (cards.length > 0) {
+					await this.promptToReviewNewCards(cards, null, graph);
 				}
 
 				notice.setMessage(
@@ -5230,8 +5807,7 @@ ${selection}
 
 				try {
 					const chapterPath = ctx.sourcePath;
-					const deckPath = getDeckPathForChapter(chapterPath);
-					const graph = await this.readDeck(deckPath);
+					const graph = await this.cardManager.readCentralizedCards();
 
 					const blockedCards = Object.values(graph).filter(
 						(c) =>
@@ -5300,7 +5876,9 @@ ${selection}
 		}
 
 		// Find the file explorer container
-		const explorerContainer = document.querySelector('.nav-files-container');
+		const explorerContainer = document.querySelector(
+			".nav-files-container"
+		);
 		if (!explorerContainer) {
 			// Retry after a short delay if explorer isn't ready yet
 			setTimeout(() => this.setupExplorerObserver(), 1000);
@@ -5310,27 +5888,29 @@ ${selection}
 		// Create observer to watch for changes in the file explorer DOM
 		this.explorerObserver = new MutationObserver((mutations) => {
 			let shouldRedecorate = false;
-			
+
 			for (const mutation of mutations) {
 				// Check if any nodes were added that might be file items
-				if (mutation.type === 'childList') {
+				if (mutation.type === "childList") {
 					for (const node of mutation.addedNodes) {
 						if (node.nodeType === Node.ELEMENT_NODE) {
 							const element = node as Element;
 							// Check if the added node contains file items or is a file item
-							if (element.classList.contains('nav-file') || 
-								element.classList.contains('nav-folder') ||
-								element.querySelector('.nav-file-title')) {
+							if (
+								element.classList.contains("nav-file") ||
+								element.classList.contains("nav-folder") ||
+								element.querySelector(".nav-file-title")
+							) {
 								shouldRedecorate = true;
 								break;
 							}
 						}
 					}
 				}
-				
+
 				if (shouldRedecorate) break;
 			}
-			
+
 			if (shouldRedecorate) {
 				// Debounce the redecoration to avoid excessive calls
 				if (this.decorateTimeout) {
@@ -5345,7 +5925,7 @@ ${selection}
 		// Start observing the explorer container and all its children
 		this.explorerObserver.observe(explorerContainer, {
 			childList: true,
-			subtree: true
+			subtree: true,
 		});
 	}
 
@@ -5624,6 +6204,11 @@ ${selection}
 			}
 			
 			.gn-node > summary { cursor: pointer; font-weight: 600; }
+			.gn-node.level-0 { margin-left: 0; }
+			.gn-node.level-1 { margin-left: 1rem; }
+			.gn-node.level-2 { margin-left: 2rem; }
+			.gn-node.level-3 { margin-left: 3rem; }
+			.gn-node.level-4 { margin-left: 4rem; }
 			.gn-chap { margin-left: 1.2rem; cursor: pointer; }
 			.gn-chap:hover { text-decoration: underline; }
 			.gn-cardrow { position: relative; margin: .15rem 0; padding-right: 2.8rem; cursor: pointer; width: 100%; border-radius: var(--radius-s); padding-left: 4px; }
@@ -5935,16 +6520,12 @@ ${selection}
 			paraIdx,
 		});
 
-		const deckPath = getDeckPathForChapter(mdFile.path);
-		const graph = await this.readDeck(deckPath);
-		const deckFile = this.app.vault.getAbstractFileByPath(
-			deckPath
-		) as TFile | null;
+		const graph = await this.cardManager.readCentralizedCards();
 
 		this.openEditModal(
 			card,
 			graph,
-			deckFile ?? (await this.app.vault.create(deckPath, "{}")),
+			null,
 			() => new Notice("✅ Flashcard created."),
 			undefined,
 			"edit"
@@ -5998,10 +6579,9 @@ ${selection}
 		newCards: Flashcard[]
 	): Promise<void> {
 		if (newCards.length === 0) return;
-		const deckPath = getDeckPathForChapter(sourceFile.path);
-		const graph = await this.readDeck(deckPath);
+		const graph = await this.cardManager.readCentralizedCards();
 		newCards.forEach((card) => (graph[card.id] = card));
-		await this.writeDeck(deckPath, graph);
+		await this.cardManager.writeCentralizedCards(graph);
 	}
 
 	/**
@@ -6027,9 +6607,9 @@ ${selection}
 			return;
 		}
 
-		const deckPath = getDeckPathForChapter(file.path);
-		const graph = await this.readDeck(deckPath);
-		if (Object.keys(graph).length === 0) return;
+		const graph = await this.cardManager.readCentralizedCards();
+		const cardsForFile = Object.values(graph).filter(c => c.chapter === file.path);
+		if (cardsForFile.length === 0) return;
 
 		const imageHashMap = new Map<string, number>();
 		const imageRegex = /!\[\[([^\]]+)\]\]/g;
@@ -6083,7 +6663,7 @@ ${selection}
 			}
 		}
 
-		if (updatedCount > 0) await this.writeDeck(deckPath, graph);
+		if (updatedCount > 0) await this.cardManager.writeCentralizedCards(graph);
 
 		if (showNotice) {
 			let noticeText = `Recalculation complete. ${updatedCount} card index(es) updated.`;
@@ -6144,14 +6724,14 @@ ${selection}
 	}
 
 	private async deleteChapterCards(file: TFile): Promise<void> {
-		const deckPath = getDeckPathForChapter(file.path);
-		if (!(await this.app.vault.adapter.exists(deckPath))) {
-			new Notice("No flashcard deck found for this chapter's subject.");
+		const centralizedPath = CENTRAL_DECK_PATH;
+		if (!(await this.app.vault.adapter.exists(centralizedPath))) {
+			new Notice("No flashcard deck found.");
 			return;
 		}
 
-		const graph = await this.readDeck(deckPath);
-		const cardsForChapter = Object.values(graph).filter(
+		const allCards = await this.cardManager.readCentralizedCards();
+		const cardsForChapter = Object.values(allCards).filter(
 			(c) => c.chapter === file.path
 		);
 
@@ -6168,10 +6748,10 @@ ${selection}
 		}
 
 		for (const card of cardsForChapter) {
-			delete graph[card.id];
+			delete allCards[card.id];
 		}
 
-		await this.writeDeck(deckPath, graph);
+		await this.cardManager.writeCentralizedCards(allCards);
 		new Notice(
 			`Deleted ${cardsForChapter.length} flashcard(s) for "${file.basename}".`
 		);
@@ -6184,49 +6764,25 @@ ${selection}
 		oldPath: string
 	): Promise<void> {
 		setTimeout(async () => {
-			const allDecksToScan = new Set<string>([
-				getDeckPathForChapter(oldPath),
-				getDeckPathForChapter(file.path),
-			]);
+			const allCards = await this.cardManager.readCentralizedCards();
+			let changed = false;
 
-			for (const deckPath of allDecksToScan) {
-				if (!(await this.app.vault.adapter.exists(deckPath))) continue;
-
-				const graph = await this.readDeck(deckPath);
-				let changed = false;
-				const cardsToMove: Record<string, Flashcard[]> = {};
-
-				for (const card of Object.values(graph)) {
-					if (
-						card.chapter === oldPath ||
-						card.chapter.startsWith(`${oldPath}/`)
-					) {
-						const newCardPath = card.chapter.replace(
-							oldPath,
-							file.path
-						);
-						const newDeckPath = getDeckPathForChapter(newCardPath);
-						card.chapter = newCardPath;
-						changed = true;
-
-						if (newDeckPath !== deckPath) {
-							if (!cardsToMove[newDeckPath])
-								cardsToMove[newDeckPath] = [];
-							cardsToMove[newDeckPath].push(card);
-							delete graph[card.id];
-						}
-					}
+			for (const card of Object.values(allCards)) {
+				if (
+					card.chapter === oldPath ||
+					card.chapter.startsWith(`${oldPath}/`)
+				) {
+					const newCardPath = card.chapter.replace(
+						oldPath,
+						file.path
+					);
+					card.chapter = newCardPath;
+					changed = true;
 				}
+			}
 
-				if (changed) await this.writeDeck(deckPath, graph);
-
-				for (const newDeckPath in cardsToMove) {
-					const targetGraph = await this.readDeck(newDeckPath);
-					for (const cardToMove of cardsToMove[newDeckPath]) {
-						targetGraph[cardToMove.id] = cardToMove;
-					}
-					await this.writeDeck(newDeckPath, targetGraph);
-				}
+			if (changed) {
+				await this.cardManager.writeCentralizedCards(allCards);
 			}
 
 			this.refreshAllStatuses();
@@ -6539,7 +7095,9 @@ ${selection}
 			);
 			const isNew = isUnseen(card);
 			const showIndicator = this.settings.showNewCardIndicators && isNew;
-			const titleText = showIndicator ? `🌱 ${subject} ► ${chapterName}` : `${subject} ► ${chapterName}`;
+			const titleText = showIndicator
+				? `🌱 ${subject} ► ${chapterName}`
+				: `${subject} ► ${chapterName}`;
 			modal.titleEl.setText(titleText);
 
 			let settled = false;
@@ -6554,7 +7112,11 @@ ${selection}
 
 			const frontContainer = modal.contentEl.createDiv();
 			const selectedVariant = this.getRandomVariant(card);
-			this.renderCardContent(selectedVariant.front, frontContainer, card.chapter);
+			this.renderCardContent(
+				selectedVariant.front,
+				frontContainer,
+				card.chapter
+			);
 
 			const bottomBar = modal.contentEl.createDiv({
 				cls: "gn-action-bar",
@@ -6567,7 +7129,9 @@ ${selection}
 			const mnemonicBtn = new ButtonComponent(bottomBar)
 				.setIcon("brain")
 				.setTooltip("View mnemonics")
-				.onClick(() => this.showMnemonicsPanel(card, selectedVariant, modal));
+				.onClick(() =>
+					this.showMnemonicsPanel(card, selectedVariant, modal)
+				);
 
 			modal.contentEl.createEl("hr");
 
@@ -6590,10 +7154,7 @@ ${selection}
 						new ButtonComponent(easeButtonContainer)
 							.setButtonText(lbl)
 							.onClick(async () => {
-								const deckPath = getDeckPathForChapter(
-									card.chapter
-								);
-								const graph = await this.readDeck(deckPath);
+								const graph = await this.cardManager.readCentralizedCards();
 								const cardInGraph = graph[card.id];
 
 								if (!cardInGraph) {
@@ -6615,7 +7176,10 @@ ${selection}
 									Date.now(),
 									cardInGraph.status
 								);
-								new Notice(`Card will be due again in ${dueTimeText}`, 3000);
+								new Notice(
+									`Card will be due again in ${dueTimeText}`,
+									3000
+								);
 
 								const gateAfter =
 									await this.getFirstBlockedParaIndex(
@@ -6623,7 +7187,7 @@ ${selection}
 										graph
 									);
 
-								await this.writeDeck(deckPath, graph);
+								await this.cardManager.writeCentralizedCards(graph);
 
 								if (gateBefore !== gateAfter) {
 									this.logger(
@@ -6652,12 +7216,12 @@ ${selection}
 				.setIcon("flag")
 				.setTooltip("Flag for review")
 				.onClick(async () => {
-					const graph = await this.readDeck(deck.path);
+					const graph = await this.cardManager.readCentralizedCards();
 					const cardInGraph = graph[card.id];
 					if (cardInGraph) {
 						cardInGraph.flagged = !cardInGraph.flagged;
 						card.flagged = cardInGraph.flagged;
-						await this.writeDeck(deck.path, graph);
+						await this.cardManager.writeCentralizedCards(graph);
 						new Notice(
 							cardInGraph.flagged
 								? "Card flagged."
@@ -6677,9 +7241,9 @@ ${selection}
 				.setTooltip("Delete")
 				.onClick(async () => {
 					if (confirm("Delete this card permanently?")) {
-						const graph = await this.readDeck(deck.path);
+						const graph = await this.cardManager.readCentralizedCards();
 						delete graph[card.id];
-						await this.writeDeck(deck.path, graph);
+						await this.cardManager.writeCentralizedCards(graph);
 						this.refreshReadingAndPreserveScroll();
 						state = "answered";
 						modal.close();
@@ -6690,12 +7254,12 @@ ${selection}
 				.setIcon("pencil")
 				.setTooltip("Edit")
 				.onClick(async () => {
-					const graph = await this.readDeck(deck.path);
+					const graph = await this.cardManager.readCentralizedCards();
 
 					this.openEditModal(
 						card,
 						graph,
-						deck,
+						null,
 						(actionTaken, newCards) => {
 							if (actionTaken) {
 								state = "abort";
@@ -6723,11 +7287,11 @@ ${selection}
 							"Suspend this card? You can unsuspend it later from the Card Browser or Edit menu."
 						)
 					) {
-						const graph = await this.readDeck(deck.path);
+						const graph = await this.cardManager.readCentralizedCards();
 						const cardInGraph = graph[card.id];
 						if (cardInGraph) {
 							cardInGraph.suspended = true;
-							await this.writeDeck(deck.path, graph);
+							await this.cardManager.writeCentralizedCards(graph);
 							this.refreshReadingAndPreserveScroll();
 							new Notice("Card suspended.");
 							state = "answered";
@@ -6750,11 +7314,11 @@ ${selection}
 				.setIcon("file-down")
 				.setTooltip("Bury")
 				.onClick(async () => {
-					const graph = await this.readDeck(deck.path);
+					const graph = await this.cardManager.readCentralizedCards();
 					graph[card.id].due =
 						Date.now() + this.settings.buryDelayHours * 3_600_000;
 					graph[card.id].buried = true;
-					await this.writeDeck(deck.path, graph);
+					await this.cardManager.writeCentralizedCards(graph);
 					this.refreshReadingAndPreserveScroll();
 					state = "answered";
 					modal.close();
@@ -6769,51 +7333,79 @@ ${selection}
 		});
 	}
 
-	private showMnemonicsPanel(card: Flashcard, variant: CardVariant, parentModal: Modal): void {
+	private showMnemonicsPanel(
+		card: Flashcard,
+		variant: CardVariant,
+		parentModal: Modal
+	): void {
 		// Check if card has any mnemonics (either major system or freeform notes)
-		const hasMajorSystem = card.mnemonics?.majorSystem && card.mnemonics.majorSystem.length > 0;
-		const hasFreeformNotes = card.mnemonics?.freeformNotes && card.mnemonics.freeformNotes.trim().length > 0;
-		
+		const hasMajorSystem =
+			card.mnemonics?.majorSystem &&
+			card.mnemonics.majorSystem.length > 0;
+		const hasFreeformNotes =
+			card.mnemonics?.freeformNotes &&
+			card.mnemonics.freeformNotes.trim().length > 0;
+
 		if (!hasMajorSystem && !hasFreeformNotes) {
-			new Notice("No mnemonics saved for this card. Use the Edit modal to create mnemonics first.");
+			new Notice(
+				"No mnemonics saved for this card. Use the Edit modal to create mnemonics first."
+			);
 			return;
 		}
 
 		// Create a modal for viewing saved mnemonics
 		const mnemonicModal = new Modal(this.app);
 		mnemonicModal.titleEl.setText("🧠 Saved Mnemonics");
-		
+
 		const content = mnemonicModal.contentEl;
-		
+
 		// Show freeform notes section if available
 		if (hasFreeformNotes) {
-			content.createEl("h3", { text: "💭 Personal Mnemonic Notes", cls: "mnemonic-section-header" });
-			const notesDiv = content.createDiv({ cls: "freeform-notes-display" });
+			content.createEl("h3", {
+				text: "💭 Personal Mnemonic Notes",
+				cls: "mnemonic-section-header",
+			});
+			const notesDiv = content.createDiv({
+				cls: "freeform-notes-display",
+			});
 			// Preserve line breaks by using pre-wrap
 			notesDiv.textContent = card.mnemonics!.freeformNotes!;
 			notesDiv.style.whiteSpace = "pre-wrap";
-			
+
 			// Add separator if there are also major system mnemonics
 			if (hasMajorSystem) {
 				content.createEl("hr", { cls: "mnemonic-display-separator" });
 			}
 		}
-		
+
 		// Show major system section if available
 		if (hasMajorSystem) {
-			content.createEl("h3", { text: "🔢 Major System Words", cls: "mnemonic-section-header" });
-			
+			content.createEl("h3", {
+				text: "🔢 Major System Words",
+				cls: "mnemonic-section-header",
+			});
+
 			card.mnemonics!.majorSystem!.forEach((mnemonic, index) => {
-				const mnemonicDiv = content.createDiv({ cls: "mnemonic-entry" });
-				
-				// Number and position
-				const header = mnemonicDiv.createEl("h4", { 
-					text: `${mnemonic.number} (${mnemonic.position})${mnemonic.source && mnemonic.source !== mnemonic.number ? ` from "${mnemonic.source}"` : ""}`
+				const mnemonicDiv = content.createDiv({
+					cls: "mnemonic-entry",
 				});
-				
+
+				// Number and position
+				const header = mnemonicDiv.createEl("h4", {
+					text: `${mnemonic.number} (${mnemonic.position})${
+						mnemonic.source && mnemonic.source !== mnemonic.number
+							? ` from "${mnemonic.source}"`
+							: ""
+					}`,
+				});
+
 				// Show selected word (read-only)
-				const selectedWord = mnemonicDiv.createDiv({ cls: "mnemonic-selected" });
-				selectedWord.createEl("strong", { text: mnemonic.selected || "No word selected" });
+				const selectedWord = mnemonicDiv.createDiv({
+					cls: "mnemonic-selected",
+				});
+				selectedWord.createEl("strong", {
+					text: mnemonic.selected || "No word selected",
+				});
 
 				// Add some spacing
 				if (index < card.mnemonics!.majorSystem!.length - 1) {
@@ -6869,7 +7461,7 @@ ${selection}
 					margin-top: 20px; 
 					text-align: center; 
 				}
-			`
+			`,
 		});
 
 		mnemonicModal.open();
@@ -6887,7 +7479,7 @@ ${selection}
 	public openEditModal(
 		card: Flashcard,
 		graph: FlashcardGraph,
-		deck: TFile,
+		deck: TFile | null,
 		onDone: (actionTaken: boolean, newCards?: Flashcard[]) => void,
 		reviewContext?: { index: number; total: number },
 		parentContext?: "edit" | "review"
@@ -6903,7 +7495,7 @@ ${selection}
 	 */
 	public async promptToReviewNewCards(
 		newCards: Flashcard[],
-		deck: TFile,
+		deck: TFile | null,
 		graph: FlashcardGraph
 	): Promise<void> {
 		if (newCards.length === 0) return;
@@ -6956,7 +7548,7 @@ ${selection}
 	 */
 	public async reviewNewCardsInSequence(
 		newCards: Flashcard[],
-		deck: TFile,
+		deck: TFile | null,
 		graph: FlashcardGraph
 	): Promise<void> {
 		if (newCards.length === 0) return;
@@ -7049,19 +7641,13 @@ ${selection}
 			let learningDue = 0,
 				reviewDue = 0;
 			const now = Date.now();
-			const allDeckFiles = this.app.vault
-				.getFiles()
-				.filter((f) => f.name.endsWith(DECK_FILE_NAME));
-
-			for (const deck of allDeckFiles) {
-				const graph = await this.readDeck(deck.path);
-				for (const c of Object.values(graph)) {
-					if (c.due > now) continue;
-					if (["new", "learning", "relearn"].includes(c.status)) {
-						learningDue++;
-					} else {
-						reviewDue++;
-					}
+			const allCards = await this.cardManager.readCentralizedCards();
+			for (const c of Object.values(allCards)) {
+				if (c.due > now) continue;
+				if (["new", "learning", "relearn"].includes(c.status)) {
+					learningDue++;
+				} else {
+					reviewDue++;
 				}
 			}
 			this.statusBar.setText(
@@ -7075,16 +7661,10 @@ ${selection}
 	 */
 	public async updateMissingParaIdxStatus(): Promise<void> {
 		let count = 0;
-		const allDeckFiles = this.app.vault
-			.getFiles()
-			.filter((f) => f.name.endsWith(DECK_FILE_NAME));
-
-		for (const deck of allDeckFiles) {
-			const graph = await this.readDeck(deck.path);
-			for (const card of Object.values(graph)) {
-				if (card.paraIdx === undefined || card.paraIdx === null) {
-					count++;
-				}
+		const allCards = await this.cardManager.readCentralizedCards();
+		for (const card of Object.values(allCards)) {
+			if (card.paraIdx === undefined || card.paraIdx === null) {
+				count++;
 			}
 		}
 
@@ -7130,22 +7710,34 @@ ${selection}
 	private async getChapterState(
 		chapterPath: string
 	): Promise<keyof typeof ICONS | undefined> {
-		const deckPath = getDeckPathForChapter(chapterPath);
-		if (!(await this.app.vault.adapter.exists(deckPath))) return undefined;
+		let cards: Flashcard[] = [];
 
-		const graph = await this.readDeck(deckPath);
-		const cards = Object.values(graph).filter(
-			(c) => c.chapter === chapterPath
-		);
+		// Check if we have centralized cards (regardless of migration flag)
+		const centralFile = this.app.vault.getAbstractFileByPath(
+			CENTRAL_DECK_PATH
+		) as TFile;
+		const hasCentralizedCards =
+			centralFile &&
+			(await this.app.vault.adapter.exists(CENTRAL_DECK_PATH));
+
+		if (hasCentralizedCards) {
+			// Post-migration: read from centralized file
+			const allCards = await this.cardManager.readCentralizedCards();
+			cards = Object.values(allCards).filter(
+				(c) => c.chapter === chapterPath
+			);
+
+		}
 
 		if (cards.length === 0) return undefined;
-		
+
 		// Filter out blocked cards for due/done status calculation
 		const nonBlockedCards = cards.filter((c) => !c.blocked);
-		
+
 		// If there are any blocked cards and no non-blocked cards, show blocked
-		if (nonBlockedCards.length === 0 && cards.some((c) => c.blocked)) return "blocked";
-		
+		if (nonBlockedCards.length === 0 && cards.some((c) => c.blocked))
+			return "blocked";
+
 		// Only check due status on non-blocked cards
 		if (nonBlockedCards.some((c) => c.due <= Date.now())) return "due";
 		return "done";
@@ -7299,12 +7891,14 @@ ${selection}
 		chapterPath: string,
 		graphToUse?: FlashcardGraph
 	): Promise<number> {
-		const graph =
-			graphToUse ??
-			(await this.readDeck(getDeckPathForChapter(chapterPath)));
+		const graph = graphToUse ?? (await this.cardManager.readCentralizedCards());
 
 		const blockedCards = Object.values(graph).filter(
-			(c) => c.chapter === chapterPath && c.blocked && !c.suspended && !isBuried(c)
+			(c) =>
+				c.chapter === chapterPath &&
+				c.blocked &&
+				!c.suspended &&
+				!isBuried(c)
 		);
 
 		if (blockedCards.length === 0) {
@@ -7333,72 +7927,219 @@ ${selection}
 		this.initializeOpenAIClient();
 	}
 
-	public async readDeck(deckPath: string): Promise<FlashcardGraph> {
-		if (!(await this.app.vault.adapter.exists(deckPath))) return {};
-		try {
-			const content = await this.app.vault.adapter.read(deckPath);
-			const graph = JSON.parse(content) as FlashcardGraph;
-			
-			// Migrate legacy cards to variants structure
-			let migrated = false;
-			for (const card of Object.values(graph)) {
-				const hadLegacyStructure = !card.variants && card.front !== undefined && card.back !== undefined;
-				this.ensureVariantsStructure(card);
-				if (hadLegacyStructure) {
-					migrated = true;
-				}
-			}
-			
-			// Save the migrated data back to disk
-			if (migrated) {
-				await this.writeDeck(deckPath, graph);
-				this.logger(LogLevel.VERBOSE, `Migrated legacy cards to variants structure in ${deckPath}`);
-			}
-			
-			return graph;
-		} catch (e: unknown) {
-			this.logger(
-				LogLevel.NORMAL,
-				`Failed to parse deck at ${deckPath}:`,
-				e
-			);
-			new Notice(
-				`Warning: Could not read flashcard file at ${deckPath}. File may be corrupt.`
-			);
-			return {};
+
+	// Migration detection and process
+	private async checkMigrationNeeded(): Promise<void> {
+		// Skip if migration already completed
+		if (this.settings.migrationCompleted) {
+			return;
+		}
+
+		const deckFiles = await this.cardManager.findAllDeckFiles();
+		const rootDeckExists = await this.app.vault.adapter.exists(
+			CENTRAL_DECK_PATH
+		);
+
+		// Need migration if multiple scattered files exist or no centralized file exists
+		const needsMigration =
+			deckFiles.length > 1 || (deckFiles.length > 0 && !rootDeckExists);
+
+		if (needsMigration) {
+			// Show migration dialog after UI is ready
+			setTimeout(() => this.showMigrationDialog(deckFiles), 1000);
 		}
 	}
 
-	public async writeDeck(
-		deckPath: string,
-		graph: FlashcardGraph
-	): Promise<void> {
-		const content = JSON.stringify(graph, null, 2);
+	private showMigrationDialog(deckFiles: TFile[]): void {
+		const modal = new MigrationDialog(this, deckFiles);
+		modal.open();
+	}
+
+	public async performMigration(
+		deckFiles: TFile[],
+		createBackup: boolean
+	): Promise<boolean> {
 		try {
-			const file = this.app.vault.getAbstractFileByPath(deckPath);
-			if (file instanceof TFile) {
-				await this.app.vault.modify(file, content);
-			} else {
-				if (file) {
-					this.logger(
-						LogLevel.NORMAL,
-						`Deck path is a folder, cannot write file: ${deckPath}`
-					);
-					new Notice(
-						`Error: Cannot save flashcards, path is a folder.`
-					);
-					return;
-				}
-				await this.app.vault.create(deckPath, content);
+			const migrationResult = {
+				sourceFiles: [] as Array<{ path: string; cardCount: number }>,
+				totalCards: 0,
+				startTime: Date.now(),
+			};
+
+			// Step 1: Create backup if requested
+			if (createBackup) {
+				await this.createMigrationBackup(deckFiles);
 			}
-		} catch (e: unknown) {
-			this.logger(
-				LogLevel.NORMAL,
-				`Failed to write deck to ${deckPath}`,
-				e
+
+			// Step 2: Consolidate all cards
+			const consolidatedCards: FlashcardGraph = {};
+
+			for (const deckFile of deckFiles) {
+				try {
+					const content = await this.app.vault.cachedRead(deckFile);
+					const cards = JSON.parse(content);
+					const cardCount = Object.keys(cards).length;
+
+					// Determine chapter path from file location
+					const chapterPath = this.getChapterPathFromDeckFile(
+						deckFile.path
+					);
+
+					// Add migration fields to each card
+					for (const [cardId, card] of Object.entries(cards) as [
+						string,
+						Flashcard
+					][]) {
+						card.migrated_from = deckFile.path;
+						card.migration_version = "3.0.0";
+						consolidatedCards[cardId] = card;
+					}
+
+					migrationResult.sourceFiles.push({
+						path: deckFile.path,
+						cardCount,
+					});
+					migrationResult.totalCards += cardCount;
+				} catch (error) {
+					console.error(`Failed to process ${deckFile.path}:`, error);
+					new Notice(
+						`Failed to process ${deckFile.path}. Migration aborted.`
+					);
+					return false;
+				}
+			}
+
+			// Step 3: Write consolidated data to root
+			await this.cardManager.writeCentralizedCards(consolidatedCards);
+
+			// Step 4: Verify data integrity
+			const verification = await this.verifyMigration(
+				migrationResult,
+				consolidatedCards
 			);
-			new Notice(`Error: Failed to save flashcards to ${deckPath}.`);
+			if (!verification.success) {
+				new Notice(
+					`Migration verification failed: ${verification.error}`
+				);
+				return false;
+			}
+
+			// Step 5: Delete original files (the critical step!)
+			for (const deckFile of deckFiles) {
+				try {
+					await this.app.vault.delete(deckFile);
+				} catch (error) {
+					console.error(`Failed to delete ${deckFile.path}:`, error);
+					// Continue with other files - partial cleanup is better than none
+				}
+			}
+
+			// Step 6: Mark migration complete
+			this.settings.migrationCompleted = true;
+			this.settings.migrationVersion = "3.0.0";
+			await this.saveSettings();
+
+			// Step 7: Create migration summary
+			await this.createMigrationSummary(migrationResult);
+
+			new Notice(
+				`Migration completed successfully! ${migrationResult.totalCards} cards consolidated.`
+			);
+			return true;
+		} catch (error) {
+			console.error("Migration failed:", error);
+			new Notice(
+				`Migration failed: ${
+					error instanceof Error ? error.message : String(error)
+				}`
+			);
+			return false;
 		}
+	}
+
+	private async createMigrationBackup(deckFiles: TFile[]): Promise<void> {
+		const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
+		const backupDir = `${this.app.vault.configDir}/plugins/gated-notes/backups/migration-${timestamp}`;
+
+		await this.app.vault.adapter.mkdir(backupDir);
+
+		for (const deckFile of deckFiles) {
+			const content = await this.app.vault.cachedRead(deckFile);
+			const backupPath = `${backupDir}/${deckFile.path.replace(
+				/\//g,
+				"_"
+			)}`;
+			await this.app.vault.adapter.write(backupPath, content);
+		}
+
+		// Create manifest
+		const manifest = {
+			migrationDate: new Date().toISOString(),
+			originalFiles: deckFiles.map((f) => f.path),
+			pluginVersion: this.manifest.version,
+		};
+		await this.app.vault.adapter.write(
+			`${backupDir}/migration-manifest.json`,
+			JSON.stringify(manifest, null, 2)
+		);
+	}
+
+	private getChapterPathFromDeckFile(deckFilePath: string): string {
+		// Convert "Subjects/Math/_flashcards.json" to "Subjects/Math/SomeFile.md"
+		// We'll use the folder path + a generic filename since we don't know the exact file
+		const folderPath = deckFilePath.replace(`/${DECK_FILE_NAME}`, "");
+		return folderPath || "Root";
+	}
+
+	private async verifyMigration(
+		migrationResult: any,
+		consolidatedCards: FlashcardGraph
+	): Promise<{ success: boolean; error?: string }> {
+		const consolidatedCount = Object.keys(consolidatedCards).length;
+
+		if (consolidatedCount !== migrationResult.totalCards) {
+			return {
+				success: false,
+				error: `Card count mismatch: expected ${migrationResult.totalCards}, got ${consolidatedCount}`,
+			};
+		}
+
+		// Verify centralized file exists and is readable
+		try {
+			const verifyCards = await this.cardManager.readCentralizedCards();
+			if (Object.keys(verifyCards).length !== consolidatedCount) {
+				return {
+					success: false,
+					error: "Failed to read back consolidated cards",
+				};
+			}
+		} catch (error) {
+			return {
+				success: false,
+				error: `Failed to verify consolidated file: ${
+					error instanceof Error ? error.message : String(error)
+				}`,
+			};
+		}
+
+		return { success: true };
+	}
+
+	private async createMigrationSummary(migrationResult: any): Promise<void> {
+		const summary = {
+			migrationDate: new Date().toISOString(),
+			totalFilesProcessed: migrationResult.sourceFiles.length,
+			totalCardsConsolidated: migrationResult.totalCards,
+			migrationDuration: Date.now() - migrationResult.startTime,
+			sourceFiles: migrationResult.sourceFiles,
+			newCentralizedFile: CENTRAL_DECK_PATH,
+		};
+
+		const summaryPath = `${this.app.vault.configDir}/plugins/gated-notes/migration-summary.json`;
+		await this.app.vault.adapter.write(
+			summaryPath,
+			JSON.stringify(summary, null, 2)
+		);
 	}
 
 	private findBestParaForTag(
@@ -7546,11 +8287,8 @@ ${selection}
 		const allNotes = this.app.vault.getMarkdownFiles();
 		const unusedImages: TFile[] = [];
 
-		// Get image database and all flashcard files
+		// Get image database
 		const imageDb = await this.getImageDb();
-		const allDeckFiles = this.app.vault
-			.getFiles()
-			.filter((f) => f.name.endsWith(DECK_FILE_NAME));
 
 		// Create a map from image file path to its hash for faster lookups
 		const imagePathToHash = new Map<string, string>();
@@ -7589,28 +8327,29 @@ ${selection}
 			// If not found in notes, check flashcards for image hash references
 			if (!isUsed && imageHash) {
 				const hashReference = `[[IMAGE HASH=${imageHash}]]`;
-				
-				for (const deckFile of allDeckFiles) {
-					try {
-						const graph = await this.readDeck(deckFile.path);
-						
-						// Check all cards in this deck
-						for (const card of Object.values(graph)) {
-							// Check front, back, and tag fields for image hash references
-							if (
-								(card.front && card.front.includes(hashReference)) ||
-								(card.back && card.back.includes(hashReference)) ||
-								card.tag.includes(hashReference)
-							) {
-								isUsed = true;
-								break;
-							}
+
+				try {
+					const allCards = await this.cardManager.readCentralizedCards();
+
+					// Check all cards for image hash references
+					for (const card of Object.values(allCards)) {
+						// Check front, back, and tag fields for image hash references
+						if (
+							(card.front &&
+								card.front.includes(hashReference)) ||
+							(card.back &&
+								card.back.includes(hashReference)) ||
+							card.tag.includes(hashReference)
+						) {
+							isUsed = true;
+							break;
 						}
-						
-						if (isUsed) break;
-					} catch (error) {
-						console.warn(`Could not read deck ${deckFile.path}:`, error);
 					}
+				} catch (error) {
+					console.warn(
+						`Could not read centralized flashcards:`,
+						error
+					);
 				}
 			}
 
@@ -9070,7 +9809,9 @@ class PdfToNoteModal extends Modal {
 
 		// Add error display for page range validation
 		this.pageRangeErrorEl = modeSection.createDiv({
-			attr: { style: "color: var(--color-red); font-size: 0.9em; margin-top: 5px; display: none;" }
+			attr: {
+				style: "color: var(--color-red); font-size: 0.9em; margin-top: 5px; display: none;",
+			},
 		});
 
 		const hybridControls = modeSection.createDiv({
@@ -9210,11 +9951,19 @@ class PdfToNoteModal extends Modal {
 			this.totalPdfPages = pdf.numPages;
 
 			// Respect page range for text extraction too
-			const fromPage = parseInt(this.pageRangeFromInput?.getValue() || "1");
-			const toPage = parseInt(this.pageRangeToInput?.getValue() || pdf.numPages.toString());
+			const fromPage = parseInt(
+				this.pageRangeFromInput?.getValue() || "1"
+			);
+			const toPage = parseInt(
+				this.pageRangeToInput?.getValue() || pdf.numPages.toString()
+			);
 
 			let fullText = "";
-			for (let i = Math.max(1, fromPage); i <= Math.min(pdf.numPages, toPage); i++) {
+			for (
+				let i = Math.max(1, fromPage);
+				i <= Math.min(pdf.numPages, toPage);
+				i++
+			) {
 				const page = await pdf.getPage(i);
 
 				// 1) Ask for marked content & let pdf.js pre-combine glyphs
@@ -9230,15 +9979,16 @@ class PdfToNoteModal extends Modal {
 			}
 
 			this.extractedText = fullText;
-			console.log("fullText:",fullText);
+			console.log("fullText:", fullText);
 
 			this.pdfViewer.empty();
 			const preview = this.pdfViewer.createEl("div");
 			const actualFrom = Math.max(1, fromPage);
 			const actualTo = Math.min(pdf.numPages, toPage);
-			const pageRangeText = actualFrom === actualTo 
-				? `page ${actualFrom}` 
-				: `pages ${actualFrom}-${actualTo}`;
+			const pageRangeText =
+				actualFrom === actualTo
+					? `page ${actualFrom}`
+					: `pages ${actualFrom}-${actualTo}`;
 			preview.createEl("p", {
 				text: `✅ PDF processed: ${file.name} (${pageRangeText} of ${pdf.numPages} total)`,
 			});
@@ -9446,9 +10196,12 @@ class PdfToNoteModal extends Modal {
 	private extractParagraphsFromTextContent(items: any[]): string {
 		// Use marked content order (proper reading order) instead of spatial heuristics
 		return items
-			.filter((item: any) => item.str && typeof item.str === 'string' && item.str.trim())
+			.filter(
+				(item: any) =>
+					item.str && typeof item.str === "string" && item.str.trim()
+			)
 			.map((item: any) => item.str)
-			.join('')
+			.join("")
 			.trim();
 	}
 
@@ -9693,7 +10446,9 @@ class PdfToNoteModal extends Modal {
 				// Extract text content for this page using PDF.js
 				let textContent = "";
 				if (this.includeTextToggle?.getValue()) {
-					const pageTextContent = await page.getTextContent({ includeMarkedContent: true });
+					const pageTextContent = await page.getTextContent({
+						includeMarkedContent: true,
+					});
 					textContent = this.extractParagraphsFromTextContent(
 						pageTextContent.items
 					);
@@ -10244,7 +10999,7 @@ Return ONLY the final, perfected markdown text.`;
 
 		// Phase 1: Process each page with multimodal (page image + marked content text)
 		const phase1Pages: Array<{ page: number; markdown: string }> = [];
-		
+
 		for (let i = 0; i < this.renderedPages.length; i++) {
 			const pageData = this.renderedPages[i];
 			notice.setMessage(
@@ -10262,7 +11017,7 @@ Return ONLY the final, perfected markdown text.`;
 
 			phase1Pages.push({
 				page: pageData.pageNum,
-				markdown: result.content || ""
+				markdown: result.content || "",
 			});
 		}
 
@@ -10270,22 +11025,23 @@ Return ONLY the final, perfected markdown text.`;
 		if (maxPhase <= 1) {
 			notice.setMessage(`✅ Nuclear processing complete (Phase 1 only)!`);
 			return {
-				response: phase1Pages.map(p => p.markdown).join("\n\n"),
+				response: phase1Pages.map((p) => p.markdown).join("\n\n"),
 				usage: totalUsage,
 			};
 		}
 
 		// Phase 2: Final reconciliation pass
 		notice.setMessage(`⚡ Nuclear Phase 2: Final reconciliation...`);
-		
+
 		// Get full marked content text for all pages
 		const fullMarkedText = await this.getFullMarkedText();
-		
+
 		const finalResult = await this.runPhase2Final({
 			guidance,
 			phase1Pages,
 			fullMarkedText,
-			titleHint: this.selectedFile?.name.replace(/\.[^.]+$/, "") || "Document"
+			titleHint:
+				this.selectedFile?.name.replace(/\.[^.]+$/, "") || "Document",
 		});
 		addToTotalUsage(finalResult.usage);
 
@@ -10331,28 +11087,37 @@ Guidelines:
 		}
 
 		const pdfjsLib = await this.loadPdfJs();
-		const typedArray = new Uint8Array(await this.selectedFile.arrayBuffer());
+		const typedArray = new Uint8Array(
+			await this.selectedFile.arrayBuffer()
+		);
 		const pdf = await pdfjsLib.getDocument(typedArray).promise;
 
 		const chunks: string[] = [];
 		for (let i = 1; i <= pdf.numPages; i++) {
 			const page = await pdf.getPage(i);
-			const textContent = await page.getTextContent({ includeMarkedContent: true });
-			
+			const textContent = await page.getTextContent({
+				includeMarkedContent: true,
+			});
+
 			// Join items in the order PDF.js provides (marked content order)
 			const pageText = textContent.items
-				.filter((item: any) => item.str && typeof item.str === 'string' && item.str.trim())
+				.filter(
+					(item: any) =>
+						item.str &&
+						typeof item.str === "string" &&
+						item.str.trim()
+				)
 				.map((item: any) => item.str)
-				.join('')
+				.join("")
 				.trim();
-			
+
 			if (pageText) {
 				chunks.push(pageText);
 			}
 		}
-		
+
 		// Join with double newlines (light page separation)
-		return chunks.join('\n\n');
+		return chunks.join("\n\n");
 	}
 
 	/**
@@ -10383,23 +11148,27 @@ Rules:
 
 		// Prepare the user content
 		const userParts: string[] = [];
-		
+
 		if (titleHint) {
 			userParts.push(`# ${titleHint}\n`);
 		}
-		
-		userParts.push(`## SOURCE_TEXT (marked-content, all pages, proper reading order)\n${fullMarkedText}`);
-		
-		userParts.push(`## PAGE_DRAFTS (Phase 1 outputs; may be incomplete or mis-ordered)\n${
-			phase1Pages
+
+		userParts.push(
+			`## SOURCE_TEXT (marked-content, all pages, proper reading order)\n${fullMarkedText}`
+		);
+
+		userParts.push(
+			`## PAGE_DRAFTS (Phase 1 outputs; may be incomplete or mis-ordered)\n${phase1Pages
 				.sort((a, b) => a.page - b.page)
-				.map(p => `### Page ${p.page}\n${p.markdown}`)
-				.join('\n\n')
-		}`);
+				.map((p) => `### Page ${p.page}\n${p.markdown}`)
+				.join("\n\n")}`
+		);
 
-		const fullPrompt = `${systemPrompt}\n\n${userParts.join('\n\n')}`;
+		const fullPrompt = `${systemPrompt}\n\n${userParts.join("\n\n")}`;
 
-		const maxTokens = this.getMaxTokensForNuclearReview(fullMarkedText.length);
+		const maxTokens = this.getMaxTokensForNuclearReview(
+			fullMarkedText.length
+		);
 		return await this.plugin.sendToLlm(
 			fullPrompt,
 			undefined,
@@ -10654,9 +11423,13 @@ Rules:
 					const pdfPath = this.selectedFile
 						? URL.createObjectURL(this.selectedFile)
 						: undefined;
-					
-					const pageRangeStart = parseInt(this.pageRangeFromInput?.getValue() || "1");
-					const pageRangeEnd = parseInt(this.pageRangeToInput?.getValue() || "999999");
+
+					const pageRangeStart = parseInt(
+						this.pageRangeFromInput?.getValue() || "1"
+					);
+					const pageRangeEnd = parseInt(
+						this.pageRangeToInput?.getValue() || "999999"
+					);
 
 					new InteractiveEditor(
 						this.app,
@@ -11043,13 +11816,16 @@ Rules:
 		});
 
 		// Example PDF Page Range (only shows if example PDF mode is visible)
-		const examplePageRangeContainer = this.examplePdfModeContainer.createDiv({
-			attr: { style: "margin-top: 15px;" }
-		});
+		const examplePageRangeContainer =
+			this.examplePdfModeContainer.createDiv({
+				attr: { style: "margin-top: 15px;" },
+			});
 
 		const examplePageRangeSetting = new Setting(examplePageRangeContainer)
 			.setName("Example PDF Page Range")
-			.setDesc("Specify page range for example PDF (leave empty for all pages)")
+			.setDesc(
+				"Specify page range for example PDF (leave empty for all pages)"
+			)
 			.addText((text) => {
 				this.examplePdfPageRangeFromInput = text;
 				text.setPlaceholder("From (e.g., 32)");
@@ -11071,7 +11847,9 @@ Rules:
 
 		// Add error display for example PDF page range validation
 		this.examplePdfPageRangeErrorEl = examplePageRangeContainer.createDiv({
-			attr: { style: "color: var(--color-red); font-size: 0.9em; margin-top: 5px; display: none;" }
+			attr: {
+				style: "color: var(--color-red); font-size: 0.9em; margin-top: 5px; display: none;",
+			},
 		});
 	}
 
@@ -11178,8 +11956,6 @@ Rules:
 					"width: 100px; margin-left: 20px;";
 			});
 
-
-
 		// Phase 2 Reconciliation Token Limit (2-phase approach)
 		const phase2TokenContainer = tokenSection.createDiv();
 		phase2TokenContainer.style.display = "none";
@@ -11264,7 +12040,6 @@ Rules:
 		return isNaN(value) ? 4000 : value;
 	}
 
-
 	private getMaxTokensForNuclearReview(contentLength: number): number | null {
 		if (!this.limitNuclearReviewTokensToggle?.getValue()) return null;
 		const inputValue = parseInt(
@@ -11309,7 +12084,7 @@ Rules:
 			errorMessage = "Start page must be 1 or greater";
 		} else if (fromPage > this.totalPdfPages) {
 			errorMessage = `Start page cannot exceed ${this.totalPdfPages}`;
-		} 
+		}
 		// Validate to page
 		else if (toPage < 1) {
 			errorMessage = "End page must be 1 or greater";
@@ -11341,8 +12116,10 @@ Rules:
 			return true;
 		}
 
-		const fromValue = this.examplePdfPageRangeFromInput?.getValue()?.trim() || "";
-		const toValue = this.examplePdfPageRangeToInput?.getValue()?.trim() || "";
+		const fromValue =
+			this.examplePdfPageRangeFromInput?.getValue()?.trim() || "";
+		const toValue =
+			this.examplePdfPageRangeToInput?.getValue()?.trim() || "";
 
 		// If both empty, it's valid (means all pages)
 		if (!fromValue && !toValue) {
@@ -11360,7 +12137,7 @@ Rules:
 			errorMessage = "Start page must be 1 or greater";
 		} else if (fromPage > this.examplePdfTotalPages) {
 			errorMessage = `Start page cannot exceed ${this.examplePdfTotalPages}`;
-		} 
+		}
 		// Validate to page
 		else if (toPage < 1) {
 			errorMessage = "End page must be 1 or greater";
@@ -11385,7 +12162,11 @@ Rules:
 	/**
 	 * Get the actual selected page range as numbers
 	 */
-	private getSelectedPageRange(): { from: number; to: number; count: number } {
+	private getSelectedPageRange(): {
+		from: number;
+		to: number;
+		count: number;
+	} {
 		const fromValue = this.pageRangeFromInput?.getValue()?.trim() || "";
 		const toValue = this.pageRangeToInput?.getValue()?.trim() || "";
 
@@ -11407,16 +12188,16 @@ Rules:
 
 		const { count } = this.getSelectedPageRange();
 		const shouldEnable2Phase = count >= 2;
-		
+
 		// Only auto-change if user hasn't manually overridden
 		// (We could track this with a flag if needed, for now just set the smart default)
 		if (count === 1 && this.useNuclearOptionToggle.getValue()) {
 			// Don't auto-disable if user explicitly enabled it
 			return;
 		}
-		
+
 		this.useNuclearOptionToggle.setValue(shouldEnable2Phase);
-		
+
 		// Update visibility of related controls
 		this.updateTokenControlVisibility();
 	}
@@ -11427,10 +12208,10 @@ Rules:
 	private updateTextPreview(): void {
 		if (this.selectedFile && this.validatePageRange()) {
 			// Refresh text extraction for the new page range
-			this.extractTextFromPdf(this.selectedFile).catch(error => {
+			this.extractTextFromPdf(this.selectedFile).catch((error) => {
 				console.error("Failed to update text preview:", error);
 			});
-			
+
 			// Clear preloaded images so they get refreshed for new page range
 			if (this.renderedPages.length > 0) {
 				this.renderedPages = [];
@@ -11480,7 +12261,6 @@ Rules:
 					this.costUi?.update();
 				});
 			});
-
 	}
 
 	private openExampleNoteSelector(displayElement: HTMLElement): void {
@@ -11597,15 +12377,20 @@ Rules:
 
 			// Store total pages for validation
 			this.examplePdfTotalPages = pdf.numPages;
-			
+
 			// Validate page range now that we know total pages
 			this.validateExamplePdfPageRange();
 
 			this.examplePdfPages = [];
 
 			// Respect the selected page range for example PDF
-			const fromPage = parseInt(this.examplePdfPageRangeFromInput?.getValue() || "1");
-			const toPage = parseInt(this.examplePdfPageRangeToInput?.getValue() || pdf.numPages.toString());
+			const fromPage = parseInt(
+				this.examplePdfPageRangeFromInput?.getValue() || "1"
+			);
+			const toPage = parseInt(
+				this.examplePdfPageRangeToInput?.getValue() ||
+					pdf.numPages.toString()
+			);
 			const actualFrom = Math.max(1, fromPage);
 			const actualTo = Math.min(pdf.numPages, toPage);
 
@@ -11636,7 +12421,9 @@ Rules:
 				// Always extract text content for example PDF (might be used in text-only mode)
 				let textContent = "";
 				try {
-					const pageTextContent = await page.getTextContent({ includeMarkedContent: true });
+					const pageTextContent = await page.getTextContent({
+						includeMarkedContent: true,
+					});
 					textContent = this.extractParagraphsFromTextContent(
 						pageTextContent.items
 					);
@@ -11810,8 +12597,12 @@ Rules:
 			const imageCount = { current: 0 };
 
 			// Respect the selected page range
-			const fromPage = parseInt(this.pageRangeFromInput?.getValue() || "1");
-			const toPage = parseInt(this.pageRangeToInput?.getValue() || pdf.numPages.toString());
+			const fromPage = parseInt(
+				this.pageRangeFromInput?.getValue() || "1"
+			);
+			const toPage = parseInt(
+				this.pageRangeToInput?.getValue() || pdf.numPages.toString()
+			);
 			const actualFrom = Math.max(1, fromPage);
 			const actualTo = Math.min(pdf.numPages, toPage);
 
@@ -12606,7 +13397,7 @@ class EditModal extends Modal {
 		private plugin: GatedNotesPlugin,
 		private card: Flashcard,
 		private graph: FlashcardGraph,
-		private deck: TFile,
+		private deck: TFile | null,
 		private onDone: (actionTaken: boolean, newCards?: Flashcard[]) => void,
 		private reviewContext?: { index: number; total: number },
 		private parentContext?: "edit" | "review"
@@ -12647,19 +13438,25 @@ class EditModal extends Modal {
 
 		// Variant selector
 		const variantRow = createRow("", editPane); // Start with empty label, will be updated dynamically
-		this.variantLabelEl = variantRow.querySelector('label') as HTMLLabelElement;
+		this.variantLabelEl = variantRow.querySelector(
+			"label"
+		) as HTMLLabelElement;
 		this.variantDropdown = variantRow.createEl("select");
 		this.refreshVariantDropdown();
-		
+
 		const addVariantBtn = variantRow.createEl("button", { text: "Add" });
 		addVariantBtn.style.marginLeft = "8px";
 		addVariantBtn.onclick = () => this.addVariant();
-		
-		const deleteVariantBtn = variantRow.createEl("button", { text: "Delete" });
+
+		const deleteVariantBtn = variantRow.createEl("button", {
+			text: "Delete",
+		});
 		deleteVariantBtn.style.marginLeft = "4px";
 		deleteVariantBtn.onclick = () => this.deleteCurrentVariant();
-		
-		const generateVariantsBtn = variantRow.createEl("button", { text: "🤖 Generate" });
+
+		const generateVariantsBtn = variantRow.createEl("button", {
+			text: "🤖 Generate",
+		});
 		generateVariantsBtn.style.marginLeft = "4px";
 		generateVariantsBtn.id = "generate-variants-btn"; // Add ID for easier reference
 		generateVariantsBtn.onclick = () => this.generateVariantsWithAI();
@@ -12796,7 +13593,7 @@ class EditModal extends Modal {
 					)
 						return;
 					delete this.graph[this.card.id];
-					await this.plugin.writeDeck(this.deck.path, this.graph);
+					await this.plugin.cardManager.writeCentralizedCards(this.graph);
 					new Notice("Card deleted.");
 					this.plugin.refreshAllStatuses();
 					this.close();
@@ -12872,18 +13669,18 @@ class EditModal extends Modal {
 	) {
 		// Save current variant before saving other fields
 		this.saveCurrentVariant();
-		
+
 		this.card.tag = tagInput.value.trim();
 		this.card.paraIdx = Number(paraInput.value) || undefined;
-		
+
 		// Sync front/back fields with first variant for backwards compatibility
 		if (this.card.variants && this.card.variants.length > 0) {
 			this.card.front = this.card.variants[0].front;
 			this.card.back = this.card.variants[0].back;
 		}
-		
+
 		this.graph[this.card.id] = this.card;
-		await this.plugin.writeDeck(this.deck.path, this.graph);
+		await this.plugin.cardManager.writeCentralizedCards(this.graph);
 		this.plugin.refreshReading();
 		this.plugin.refreshAllStatuses();
 	}
@@ -12891,7 +13688,7 @@ class EditModal extends Modal {
 	private refreshVariantDropdown() {
 		this.variantDropdown.innerHTML = "";
 		const variants = this.plugin.getCardVariants(this.card);
-		
+
 		// Update the label to be more informative
 		if (this.variantLabelEl) {
 			if (variants.length === 1) {
@@ -12900,21 +13697,25 @@ class EditModal extends Modal {
 				this.variantLabelEl.textContent = `Variant (${variants.length} total):`;
 			}
 		}
-		
+
 		variants.forEach((variant, index) => {
 			const option = this.variantDropdown.createEl("option");
 			option.value = index.toString();
 			// Make options more descriptive
-			const preview = variant.front.length > 30 
-				? variant.front.substring(0, 30) + "..."
-				: variant.front;
+			const preview =
+				variant.front.length > 30
+					? variant.front.substring(0, 30) + "..."
+					: variant.front;
 			option.text = `${index + 1}: ${preview || "(empty)"}`;
 		});
 		this.variantDropdown.value = this.currentVariantIndex.toString();
 	}
 
 	private populateFieldsFromCurrentVariant() {
-		const currentVariant = this.plugin.getCurrentVariant(this.card, this.currentVariantIndex);
+		const currentVariant = this.plugin.getCurrentVariant(
+			this.card,
+			this.currentVariantIndex
+		);
 		this.frontInput.value = currentVariant.front;
 		this.backInput.value = currentVariant.back;
 	}
@@ -12923,17 +13724,17 @@ class EditModal extends Modal {
 		if (!this.card.variants) {
 			this.card.variants = [];
 		}
-		
+
 		// Ensure the variants array is large enough
 		while (this.card.variants.length <= this.currentVariantIndex) {
 			this.card.variants.push({ front: "", back: "" });
 		}
-		
+
 		this.card.variants[this.currentVariantIndex] = {
 			front: this.frontInput.value.trim(),
-			back: this.backInput.value.trim()
+			back: this.backInput.value.trim(),
 		};
-		
+
 		// If we're editing the first variant, sync front/back fields
 		if (this.currentVariantIndex === 0) {
 			this.syncFrontBackWithFirstVariant();
@@ -12944,7 +13745,7 @@ class EditModal extends Modal {
 		if (!this.card.variants) {
 			this.card.variants = [];
 		}
-		
+
 		this.card.variants.push({ front: "", back: "" });
 		this.currentVariantIndex = this.card.variants.length - 1;
 		this.refreshVariantDropdown();
@@ -12958,17 +13759,17 @@ class EditModal extends Modal {
 			new Notice("Cannot delete the only variant");
 			return;
 		}
-		
+
 		if (!this.card.variants) return;
-		
+
 		// Remove the variant
 		this.card.variants.splice(this.currentVariantIndex, 1);
-		
+
 		// Adjust current index if needed
 		if (this.currentVariantIndex >= this.card.variants.length) {
 			this.currentVariantIndex = this.card.variants.length - 1;
 		}
-		
+
 		this.refreshVariantDropdown();
 		this.populateFieldsFromCurrentVariant();
 		this.syncFrontBackWithFirstVariant();
@@ -12985,11 +13786,16 @@ class EditModal extends Modal {
 		try {
 			// Save current variant first
 			this.saveCurrentVariant();
-			
-			const currentVariant = this.plugin.getCurrentVariant(this.card, this.currentVariantIndex);
-			
+
+			const currentVariant = this.plugin.getCurrentVariant(
+				this.card,
+				this.currentVariantIndex
+			);
+
 			if (!currentVariant.front.trim() || !currentVariant.back.trim()) {
-				new Notice("Please fill in both front and back fields before generating variants");
+				new Notice(
+					"Please fill in both front and back fields before generating variants"
+				);
 				return;
 			}
 
@@ -13008,27 +13814,44 @@ class EditModal extends Modal {
 			}
 
 			// Show cost confirmation modal
-			const confirmed = await this.showGenerateVariantsConfirmation(currentVariant, existingVariants, includeExisting, options.quantity);
+			const confirmed = await this.showGenerateVariantsConfirmation(
+				currentVariant,
+				existingVariants,
+				includeExisting,
+				options.quantity
+			);
 			if (!confirmed) {
 				return;
 			}
 
 			// Show loading state
-			const generateBtn = document.getElementById("generate-variants-btn") as HTMLButtonElement;
+			const generateBtn = document.getElementById(
+				"generate-variants-btn"
+			) as HTMLButtonElement;
 			if (generateBtn) {
 				generateBtn.textContent = "⏳ Generating...";
 				generateBtn.disabled = true;
 			}
 
 			// Execute the actual generation
-			await this.executeVariantGeneration(currentVariant, existingVariants, includeExisting, options.quantity);
-			
+			await this.executeVariantGeneration(
+				currentVariant,
+				existingVariants,
+				includeExisting,
+				options.quantity
+			);
 		} catch (error) {
 			console.error("Error generating variants:", error);
-			new Notice(`Error generating variants: ${error instanceof Error ? error.message : String(error)}`);
+			new Notice(
+				`Error generating variants: ${
+					error instanceof Error ? error.message : String(error)
+				}`
+			);
 		} finally {
 			// Reset button state
-			const generateBtn = document.getElementById("generate-variants-btn") as HTMLButtonElement;
+			const generateBtn = document.getElementById(
+				"generate-variants-btn"
+			) as HTMLButtonElement;
 			if (generateBtn) {
 				generateBtn.textContent = "🤖 Generate";
 				generateBtn.disabled = false;
@@ -13036,18 +13859,19 @@ class EditModal extends Modal {
 		}
 	}
 
-	private showVariantOptionsModal(): Promise<{ quantity: "one" | "many" } | null> {
+	private showVariantOptionsModal(): Promise<{
+		quantity: "one" | "many";
+	} | null> {
 		return new Promise((resolve) => {
-			new VariantOptionsModal(
-				this.plugin,
-				(result) => resolve(result)
+			new VariantOptionsModal(this.plugin, (result) =>
+				resolve(result)
 			).open();
 		});
 	}
 
 	private showGenerateVariantsConfirmation(
 		currentVariant: CardVariant,
-		existingVariants: CardVariant[], 
+		existingVariants: CardVariant[],
 		includeExisting: boolean,
 		quantity: "one" | "many"
 	): Promise<boolean> {
@@ -13059,9 +13883,14 @@ class EditModal extends Modal {
 					// Build prompt for cost estimation
 					let promptVariants = "";
 					if (includeExisting) {
-						promptVariants = existingVariants.map((variant, index) => 
-							`${index + 1}. Front: ${variant.front}\n   Back: ${variant.back}`
-						).join("\n");
+						promptVariants = existingVariants
+							.map(
+								(variant, index) =>
+									`${index + 1}. Front: ${
+										variant.front
+									}\n   Back: ${variant.back}`
+							)
+							.join("\n");
 					} else {
 						promptVariants = `1. Front: ${currentVariant.front}\n   Back: ${currentVariant.back}`;
 					}
@@ -13069,10 +13898,16 @@ class EditModal extends Modal {
 					const isMultiple = quantity === "many";
 					const quantityText = isMultiple ? "2–3 NEW" : "1 NEW";
 					const exampleCount = isMultiple ? 3 : 1;
-					
+
 					const prompt = `You are a flashcard variant generator.
-I will give you ${includeExisting ? 'existing flashcard variants' : 'a flashcard'} with "front" (question or prompt) and "back" (answer).
-Your task is to create ${quantityText} alternative version${isMultiple ? 's' : ''} that quiz${isMultiple ? '' : 'es'} the same knowledge.
+I will give you ${
+						includeExisting
+							? "existing flashcard variants"
+							: "a flashcard"
+					} with "front" (question or prompt) and "back" (answer).
+Your task is to create ${quantityText} alternative version${
+						isMultiple ? "s" : ""
+					} that quiz${isMultiple ? "" : "es"} the same knowledge.
 
 Rules for variants:
 - Each variant should quiz the **same knowledge** as the existing ones.
@@ -13081,15 +13916,21 @@ Rules for variants:
 - Variants should still be suitable for spaced repetition flashcards.
 - Do NOT repeat any of the existing variants - create NEW ones.
 
-${includeExisting ? 'Existing variants:' : 'Flashcard:'}
+${includeExisting ? "Existing variants:" : "Flashcard:"}
 ${promptVariants}
 
 
-Now return JSON with ${quantityText.toLowerCase()} variant${isMultiple ? 's' : ''} in this format:
+Now return JSON with ${quantityText.toLowerCase()} variant${
+						isMultiple ? "s" : ""
+					} in this format:
 
 {
   "variants": [
-${Array.from({length: exampleCount}, (_, i) => `    {"front": "…", "back": "…"}${i < exampleCount - 1 ? ',' : ''}`).join('\n')}
+${Array.from(
+	{ length: exampleCount },
+	(_, i) =>
+		`    {"front": "…", "back": "…"}${i < exampleCount - 1 ? "," : ""}`
+).join("\n")}
   ]
 }`;
 
@@ -13097,12 +13938,15 @@ ${Array.from({length: exampleCount}, (_, i) => `    {"front": "…", "back": "�
 						promptText: prompt,
 						imageCount: 0,
 						action: "generate_variants" as const,
-						details: { cardCount: isMultiple ? 3 : 1, isVariableOutput: isMultiple } // Estimate based on quantity
+						details: {
+							cardCount: isMultiple ? 3 : 1,
+							isVariableOutput: isMultiple,
+						}, // Estimate based on quantity
 					};
 				},
 				() => resolve(true)
 			);
-			
+
 			modal.onClose = () => resolve(false);
 			modal.open();
 		});
@@ -13114,23 +13958,31 @@ ${Array.from({length: exampleCount}, (_, i) => `    {"front": "…", "back": "�
 		includeExisting: boolean,
 		quantity: "one" | "many"
 	) {
-
 		// Build prompt with existing variants if requested
 		let promptVariants = "";
 		if (includeExisting) {
-			promptVariants = existingVariants.map((variant, index) => 
-				`${index + 1}. Front: ${variant.front}\n   Back: ${variant.back}`
-			).join("\n");
+			promptVariants = existingVariants
+				.map(
+					(variant, index) =>
+						`${index + 1}. Front: ${variant.front}\n   Back: ${
+							variant.back
+						}`
+				)
+				.join("\n");
 		} else {
 			promptVariants = `1. Front: ${currentVariant.front}\n   Back: ${currentVariant.back}`;
 		}
 
 		const isMultiple = quantity === "many";
 		const quantityText = isMultiple ? "2–3 NEW" : "1 NEW";
-		
+
 		const prompt = `You are a flashcard variant generator.
-I will give you ${includeExisting ? 'existing flashcard variants' : 'a flashcard'} with "front" (question or prompt) and "back" (answer).
-Your task is to create ${quantityText} alternative version${isMultiple ? 's' : ''} that quiz${isMultiple ? '' : 'es'} the same knowledge.
+I will give you ${
+			includeExisting ? "existing flashcard variants" : "a flashcard"
+		} with "front" (question or prompt) and "back" (answer).
+Your task is to create ${quantityText} alternative version${
+			isMultiple ? "s" : ""
+		} that quiz${isMultiple ? "" : "es"} the same knowledge.
 
 Rules for variants:
 - Each variant should quiz the **same knowledge** as the existing ones.
@@ -13139,40 +13991,46 @@ Rules for variants:
 - Variants should still be suitable for spaced repetition flashcards.
 - Do NOT repeat any of the existing variants - create NEW ones.
 
-${includeExisting ? 'Existing variants:' : 'Flashcard:'}
+${includeExisting ? "Existing variants:" : "Flashcard:"}
 ${promptVariants}
 
-Now return JSON with ${quantityText.toLowerCase()} variant${isMultiple ? 's' : ''} in this format:
+Now return JSON with ${quantityText.toLowerCase()} variant${
+			isMultiple ? "s" : ""
+		} in this format:
 
 {
   "variants": [
-${Array.from({length: isMultiple ? 3 : 1}, (_, i) => `    {"front": "…", "back": "…"}${i < (isMultiple ? 2 : 0) ? ',' : ''}`).join('\n')}
+${Array.from(
+	{ length: isMultiple ? 3 : 1 },
+	(_, i) =>
+		`    {"front": "…", "back": "…"}${i < (isMultiple ? 2 : 0) ? "," : ""}`
+).join("\n")}
   ]
 }`;
 
 		const response = await this.plugin.sendToLlm(prompt, [], {});
-		
+
 		// Parse the response
 		const variants = this.parseVariantResponse(response.content);
-		
+
 		if (variants && variants.length > 0) {
 			// Add the generated variants
 			if (!this.card.variants) {
 				this.card.variants = [];
 			}
-			
+
 			// Add new variants to the card
-			variants.forEach(variant => {
+			variants.forEach((variant) => {
 				this.card.variants!.push({
 					front: variant.front.trim(),
-					back: variant.back.trim()
+					back: variant.back.trim(),
 				});
 			});
-			
+
 			// Refresh UI
 			this.refreshVariantDropdown();
 			this.syncFrontBackWithFirstVariant();
-			
+
 			new Notice(`✅ Generated ${variants.length} new variants!`);
 		} else {
 			throw new Error("No valid variants were generated");
@@ -13183,75 +14041,97 @@ ${Array.from({length: isMultiple ? 3 : 1}, (_, i) => `    {"front": "…", "back
 		return new Promise((resolve) => {
 			const modal = new Modal(this.plugin.app);
 			modal.setTitle("Generate Variants");
-			
-			modal.contentEl.createEl("p", { 
-				text: "This card already has multiple variants. Should the AI consider all existing variants when generating new ones, or just use the current variant?" 
+
+			modal.contentEl.createEl("p", {
+				text: "This card already has multiple variants. Should the AI consider all existing variants when generating new ones, or just use the current variant?",
 			});
-			
+
 			const radioContainer = modal.contentEl.createDiv();
 			radioContainer.style.margin = "20px 0";
-			
+
 			const includeLabel = radioContainer.createEl("label");
 			includeLabel.style.display = "block";
 			includeLabel.style.marginBottom = "10px";
-			const includeRadio = includeLabel.createEl("input", { type: "radio", value: "include" });
+			const includeRadio = includeLabel.createEl("input", {
+				type: "radio",
+				value: "include",
+			});
 			includeRadio.name = "variant-generation-mode";
 			includeRadio.checked = true; // Default to true as requested
-			includeLabel.appendText(" Include all existing variants (recommended for better variety)");
-			
+			includeLabel.appendText(
+				" Include all existing variants (recommended for better variety)"
+			);
+
 			const currentOnlyLabel = radioContainer.createEl("label");
 			currentOnlyLabel.style.display = "block";
-			const currentOnlyRadio = currentOnlyLabel.createEl("input", { type: "radio", value: "current" });
+			const currentOnlyRadio = currentOnlyLabel.createEl("input", {
+				type: "radio",
+				value: "current",
+			});
 			currentOnlyRadio.name = "variant-generation-mode";
 			currentOnlyLabel.appendText(" Use only the current variant");
-			
+
 			const buttonContainer = modal.contentEl.createDiv();
 			buttonContainer.style.display = "flex";
 			buttonContainer.style.justifyContent = "flex-end";
 			buttonContainer.style.gap = "10px";
 			buttonContainer.style.marginTop = "20px";
-			
-			const generateBtn = buttonContainer.createEl("button", { text: "Generate", cls: "mod-cta" });
+
+			const generateBtn = buttonContainer.createEl("button", {
+				text: "Generate",
+				cls: "mod-cta",
+			});
 			generateBtn.onclick = () => {
-				const includeExisting = (modal.contentEl.querySelector('input[name="variant-generation-mode"]:checked') as HTMLInputElement)?.value === "include";
+				const includeExisting =
+					(
+						modal.contentEl.querySelector(
+							'input[name="variant-generation-mode"]:checked'
+						) as HTMLInputElement
+					)?.value === "include";
 				modal.close();
 				resolve(includeExisting);
 			};
-			
-			const cancelBtn = buttonContainer.createEl("button", { text: "Cancel" });
+
+			const cancelBtn = buttonContainer.createEl("button", {
+				text: "Cancel",
+			});
 			cancelBtn.onclick = () => {
 				modal.close();
 				resolve(false);
 			};
-			
+
 			modal.onClose = () => resolve(false);
 			modal.open();
 		});
 	}
 
-	private parseVariantResponse(response: string): Array<{front: string, back: string}> | null {
+	private parseVariantResponse(
+		response: string
+	): Array<{ front: string; back: string }> | null {
 		try {
 			// Try to extract JSON from the response
 			const jsonMatch = response.match(/\{[\s\S]*\}/);
 			if (!jsonMatch) {
 				throw new Error("No JSON found in response");
 			}
-			
+
 			const parsed = JSON.parse(jsonMatch[0]);
-			
+
 			if (!parsed.variants || !Array.isArray(parsed.variants)) {
 				throw new Error("Response doesn't contain variants array");
 			}
-			
+
 			// Validate each variant
-			const validVariants = parsed.variants.filter((variant: any) => 
-				variant.front && variant.back && 
-				typeof variant.front === 'string' && 
-				typeof variant.back === 'string' &&
-				variant.front.trim().length > 0 && 
-				variant.back.trim().length > 0
+			const validVariants = parsed.variants.filter(
+				(variant: any) =>
+					variant.front &&
+					variant.back &&
+					typeof variant.front === "string" &&
+					typeof variant.back === "string" &&
+					variant.front.trim().length > 0 &&
+					variant.back.trim().length > 0
 			);
-			
+
 			return validVariants;
 		} catch (error) {
 			console.error("Error parsing variant response:", error);
@@ -13412,12 +14292,12 @@ ${Array.from({length: isMultiple ? 3 : 1}, (_, i) => `    {"front": "…", "back
 						newCards.forEach(
 							(card) => (this.graph[card.id] = card)
 						);
-						await this.plugin.writeDeck(this.deck.path, this.graph);
+						await this.plugin.cardManager.writeCentralizedCards(this.graph);
 
 						this.close();
 						await this.plugin.promptToReviewNewCards(
 							newCards,
-							this.deck,
+							null,
 							this.graph
 						);
 						this.onDone(true);
@@ -13535,12 +14415,12 @@ Return ONLY valid JSON array of this shape: [{"front":"...","back":"..."}]`;
 						newCards.forEach(
 							(newCard) => (this.graph[newCard.id] = newCard)
 						);
-						await this.plugin.writeDeck(this.deck.path, this.graph);
+						await this.plugin.cardManager.writeCentralizedCards(this.graph);
 
 						this.close();
 						await this.plugin.promptToReviewNewCards(
 							newCards,
-							this.deck,
+							null,
 							this.graph
 						);
 						this.onDone(true);
@@ -13560,14 +14440,18 @@ Return ONLY valid JSON array of this shape: [{"front":"...","back":"..."}]`;
 	private createMnemonicSection(editPane: HTMLElement): void {
 		const mnemonicRow = editPane.createDiv({ cls: "gn-edit-row" });
 		mnemonicRow.createEl("label", { text: "🧠 Mnemonics:" });
-		
-		this.mnemonicContainer = mnemonicRow.createDiv({ cls: "mnemonic-container" });
-		
+
+		this.mnemonicContainer = mnemonicRow.createDiv({
+			cls: "mnemonic-container",
+		});
+
 		// Button to open mnemonics modal
-		const editMnemonicsBtn = mnemonicRow.createEl("button", { text: "Edit Mnemonics" });
+		const editMnemonicsBtn = mnemonicRow.createEl("button", {
+			text: "Edit Mnemonics",
+		});
 		editMnemonicsBtn.style.marginLeft = "10px";
 		editMnemonicsBtn.onclick = () => this.openMnemonicsModal();
-		
+
 		// Initialize display
 		this.updateMnemonicsDisplay();
 	}
@@ -13575,40 +14459,59 @@ Return ONLY valid JSON array of this shape: [{"front":"...","back":"..."}]`;
 	private updateMnemonicsDisplay(): void {
 		// Clear existing content
 		this.mnemonicContainer.empty();
-		
+
 		// Show saved mnemonics if any
-		if (this.card.mnemonics?.majorSystem && this.card.mnemonics.majorSystem.length > 0) {
+		if (
+			this.card.mnemonics?.majorSystem &&
+			this.card.mnemonics.majorSystem.length > 0
+		) {
 			this.card.mnemonics.majorSystem.forEach((mnemonic, index) => {
-				const mnemonicDiv = this.mnemonicContainer.createDiv({ cls: "saved-mnemonic" });
-				
+				const mnemonicDiv = this.mnemonicContainer.createDiv({
+					cls: "saved-mnemonic",
+				});
+
 				const headerText = `${mnemonic.number} (${mnemonic.position})${
-					mnemonic.source && mnemonic.source !== mnemonic.number 
-						? ` from "${mnemonic.source}"` 
+					mnemonic.source && mnemonic.source !== mnemonic.number
+						? ` from "${mnemonic.source}"`
 						: ""
 				}`;
-				
-				mnemonicDiv.createEl("span", { text: headerText, cls: "mnemonic-header" });
-				mnemonicDiv.createEl("span", { text: " → ", cls: "mnemonic-arrow" });
-				mnemonicDiv.createEl("strong", { text: mnemonic.selected || "No word selected" });
+
+				mnemonicDiv.createEl("span", {
+					text: headerText,
+					cls: "mnemonic-header",
+				});
+				mnemonicDiv.createEl("span", {
+					text: " → ",
+					cls: "mnemonic-arrow",
+				});
+				mnemonicDiv.createEl("strong", {
+					text: mnemonic.selected || "No word selected",
+				});
 			});
 		} else {
-			this.mnemonicContainer.createEl("div", { 
+			this.mnemonicContainer.createEl("div", {
 				text: "No mnemonics configured",
-				cls: "mnemonic-empty"
+				cls: "mnemonic-empty",
 			});
 		}
 	}
-	
+
 	private openMnemonicsModal(): void {
 		// Save current variant first to ensure we're working with latest content
 		this.saveCurrentVariant();
-		const currentVariant = this.plugin.getCurrentVariant(this.card, this.currentVariantIndex);
-		
+		const currentVariant = this.plugin.getCurrentVariant(
+			this.card,
+			this.currentVariantIndex
+		);
+
 		new MnemonicsModal(
 			this.plugin,
 			this.card,
 			currentVariant,
-			async (selectedMnemonics: MnemonicEntry[], freeformNotes: string) => {
+			async (
+				selectedMnemonics: MnemonicEntry[],
+				freeformNotes: string
+			) => {
 				// Save mnemonics to card
 				if (!this.card.mnemonics) {
 					this.card.mnemonics = {};
@@ -13616,10 +14519,10 @@ Return ONLY valid JSON array of this shape: [{"front":"...","back":"..."}]`;
 				this.card.mnemonics.majorSystem = selectedMnemonics;
 				this.card.mnemonics.enabled = selectedMnemonics.length > 0;
 				this.card.mnemonics.freeformNotes = freeformNotes;
-				
+
 				// Update display
 				this.updateMnemonicsDisplay();
-				
+
 				new Notice(`${selectedMnemonics.length} mnemonics saved!`);
 			}
 		).open();
@@ -13637,7 +14540,10 @@ class MnemonicsModal extends Modal {
 		private plugin: GatedNotesPlugin,
 		private card: Flashcard,
 		private variant: CardVariant,
-		private onSave: (mnemonics: MnemonicEntry[], freeformNotes: string) => void
+		private onSave: (
+			mnemonics: MnemonicEntry[],
+			freeformNotes: string
+		) => void
 	) {
 		super(plugin.app);
 	}
@@ -13645,172 +14551,213 @@ class MnemonicsModal extends Modal {
 	onOpen() {
 		this.titleEl.setText("🧠 Configure Mnemonics");
 		makeModalDraggable(this, this.plugin);
-		
+
 		// Add freeform notes section at the top
 		this.addFreeformNotesSection();
-		
+
 		// Generate mnemonics from current variant
-		const frontMnemonics = MajorSystemUtils.generateMnemonics(this.variant.front, 'front');
-		const backMnemonics = MajorSystemUtils.generateMnemonics(this.variant.back, 'back');
+		const frontMnemonics = MajorSystemUtils.generateMnemonics(
+			this.variant.front,
+			"front"
+		);
+		const backMnemonics = MajorSystemUtils.generateMnemonics(
+			this.variant.back,
+			"back"
+		);
 		this.currentMnemonics = [...frontMnemonics, ...backMnemonics];
-		
+
 		// Load existing selections if available
 		if (this.card.mnemonics?.majorSystem) {
-			this.currentMnemonics.forEach(current => {
+			this.currentMnemonics.forEach((current) => {
 				const existing = this.card.mnemonics!.majorSystem!.find(
-					saved => saved.number === current.number && saved.position === current.position
+					(saved) =>
+						saved.number === current.number &&
+						saved.position === current.position
 				);
 				if (existing?.selected) {
 					current.selected = existing.selected;
 				}
 			});
 		}
-		
+
 		if (this.currentMnemonics.length === 0) {
-			this.contentEl.createEl("p", { text: "No numbers detected in this card for mnemonic generation." });
+			this.contentEl.createEl("p", {
+				text: "No numbers detected in this card for mnemonic generation.",
+			});
 			this.addCloseButton();
 			this.addStyles();
 			return;
 		}
-		
+
 		// Add separator between freeform section and major system section
 		this.contentEl.createEl("hr", { cls: "mnemonic-separator" });
-		
-		this.contentEl.createEl("p", { text: "Select mnemonic words for each number:" });
+
+		this.contentEl.createEl("p", {
+			text: "Select mnemonic words for each number:",
+		});
 		this.renderMnemonics();
 		this.addButtons();
 		this.addStyles();
 	}
-	
+
 	private addFreeformNotesSection(): void {
 		// Create section header
-		const freeformSection = this.contentEl.createDiv({ cls: "freeform-mnemonic-section" });
-		freeformSection.createEl("h3", { text: "💭 Personal Mnemonic Notes" });
-		freeformSection.createEl("p", { 
-			text: "Add your own mnemonic notes or use AI to generate memory aids:",
-			cls: "mnemonic-section-description"
+		const freeformSection = this.contentEl.createDiv({
+			cls: "freeform-mnemonic-section",
 		});
-		
+		freeformSection.createEl("h3", { text: "💭 Personal Mnemonic Notes" });
+		freeformSection.createEl("p", {
+			text: "Add your own mnemonic notes or use AI to generate memory aids:",
+			cls: "mnemonic-section-description",
+		});
+
 		// Create textarea for freeform notes
 		this.freeformNotesTextarea = freeformSection.createEl("textarea", {
 			cls: "freeform-mnemonic-textarea",
-			placeholder: "Add your personal mnemonic notes here...\n\nFor example:\n🪖✉️=👨☕→🪲🎵\n\nGeneral Epistles go from Hebrews ('He Brews') to Jude (a song by the Beatles)"
+			placeholder:
+				"Add your personal mnemonic notes here...\n\nFor example:\n🪖✉️=👨☕→🪲🎵\n\nGeneral Epistles go from Hebrews ('He Brews') to Jude (a song by the Beatles)",
 		});
 		this.freeformNotesTextarea.rows = 6;
-		
+
 		// Load existing freeform notes if available
 		if (this.card.mnemonics?.freeformNotes) {
-			this.freeformNotesTextarea.value = this.card.mnemonics.freeformNotes;
+			this.freeformNotesTextarea.value =
+				this.card.mnemonics.freeformNotes;
 		}
-		
+
 		// Create AI buttons container
-		const aiButtonsContainer = freeformSection.createDiv({ cls: "ai-buttons-container" });
-		
+		const aiButtonsContainer = freeformSection.createDiv({
+			cls: "ai-buttons-container",
+		});
+
 		// Generate with AI button (for mental imagery)
 		const generateAIBtn = new ButtonComponent(aiButtonsContainer)
 			.setButtonText("🧠 Generate with AI")
 			.setTooltip("Generate mental imagery description using AI")
 			.onClick(() => this.generateMentalImagery());
-		
+
 		// Generate emoji sequence button
 		const generateEmojiBtn = new ButtonComponent(aiButtonsContainer)
 			.setButtonText("😊 Generate Emojis")
 			.setTooltip("Generate emoji sequence using AI")
 			.onClick(() => this.generateEmojiSequence());
 	}
-	
+
 	private renderMnemonics(): void {
-		const conflicts = MajorSystemUtils.getConflictingNumbers(this.currentMnemonics);
-		
+		const conflicts = MajorSystemUtils.getConflictingNumbers(
+			this.currentMnemonics
+		);
+
 		this.currentMnemonics.forEach((mnemonic, index) => {
-			const mnemonicDiv = this.contentEl.createDiv({ cls: "mnemonic-entry" });
-			
+			const mnemonicDiv = this.contentEl.createDiv({
+				cls: "mnemonic-entry",
+			});
+
 			// Number header
 			const headerText = `${mnemonic.number} (${mnemonic.position})${
-				mnemonic.source && mnemonic.source !== mnemonic.number 
-					? ` from "${mnemonic.source}"` 
+				mnemonic.source && mnemonic.source !== mnemonic.number
+					? ` from "${mnemonic.source}"`
 					: ""
 			}`;
 			mnemonicDiv.createEl("h4", { text: headerText });
-			
+
 			// Word selection area
-			const wordContainer = mnemonicDiv.createDiv({ cls: "mnemonic-words" });
-			
+			const wordContainer = mnemonicDiv.createDiv({
+				cls: "mnemonic-words",
+			});
+
 			// Show first 8 words by default
 			const initialWords = mnemonic.words.slice(0, 8);
 			const remainingWords = mnemonic.words.slice(8);
-			
-			this.renderWordButtons(wordContainer, initialWords, mnemonic, conflicts);
-			
+
+			this.renderWordButtons(
+				wordContainer,
+				initialWords,
+				mnemonic,
+				conflicts
+			);
+
 			// "Show more" functionality
 			if (remainingWords.length > 0) {
-				const showMoreBtn = wordContainer.createEl("button", { 
+				const showMoreBtn = wordContainer.createEl("button", {
 					text: `Show ${remainingWords.length} more`,
-					cls: "mnemonic-show-more"
+					cls: "mnemonic-show-more",
 				});
-				
-				showMoreBtn.addEventListener('click', () => {
+
+				showMoreBtn.addEventListener("click", () => {
 					showMoreBtn.remove();
-					this.renderWordButtons(wordContainer, remainingWords, mnemonic, conflicts);
+					this.renderWordButtons(
+						wordContainer,
+						remainingWords,
+						mnemonic,
+						conflicts
+					);
 				});
 			}
-			
+
 			if (index < this.currentMnemonics.length - 1) {
 				mnemonicDiv.createEl("hr");
 			}
 		});
 	}
-	
+
 	private renderWordButtons(
-		container: HTMLElement, 
-		words: string[], 
-		mnemonic: MnemonicEntry, 
+		container: HTMLElement,
+		words: string[],
+		mnemonic: MnemonicEntry,
 		conflicts: Map<string, string[]>
 	): void {
-		words.forEach(word => {
-			const wordBtn = container.createEl("button", { 
+		words.forEach((word) => {
+			const wordBtn = container.createEl("button", {
 				text: word,
-				cls: mnemonic.selected === word ? "mnemonic-word selected" : "mnemonic-word"
+				cls:
+					mnemonic.selected === word
+						? "mnemonic-word selected"
+						: "mnemonic-word",
 			});
-			
-			wordBtn.addEventListener('click', () => {
+
+			wordBtn.addEventListener("click", () => {
 				// If clicking the same word, deselect it
 				if (mnemonic.selected === word) {
 					mnemonic.selected = undefined;
 				} else {
 					// Handle mutual exclusion - clear conflicting selections
 					if (conflicts.has(mnemonic.number)) {
-						const conflictingNumbers = conflicts.get(mnemonic.number)!;
-						this.currentMnemonics.forEach(m => {
+						const conflictingNumbers = conflicts.get(
+							mnemonic.number
+						)!;
+						this.currentMnemonics.forEach((m) => {
 							if (conflictingNumbers.includes(m.number)) {
 								m.selected = undefined;
 							}
 						});
 					}
-					
+
 					// Set new selection
 					mnemonic.selected = word;
 				}
-				
+
 				this.updateSelectionDisplay();
 			});
 		});
 	}
-	
+
 	private refreshDisplay(): void {
 		this.contentEl.empty();
 		this.renderMnemonics();
 		this.addButtons();
 	}
-	
+
 	private updateSelectionDisplay(): void {
 		// Update all word button states without rebuilding the entire modal
-		const wordButtons = this.contentEl.querySelectorAll('.mnemonic-word') as NodeListOf<HTMLButtonElement>;
-		
-		wordButtons.forEach(button => {
+		const wordButtons = this.contentEl.querySelectorAll(
+			".mnemonic-word"
+		) as NodeListOf<HTMLButtonElement>;
+
+		wordButtons.forEach((button) => {
 			const buttonText = button.textContent;
 			let isSelected = false;
-			
+
 			// Find which mnemonic this button belongs to
 			for (const mnemonic of this.currentMnemonics) {
 				if (mnemonic.selected === buttonText) {
@@ -13818,41 +14765,47 @@ class MnemonicsModal extends Modal {
 					break;
 				}
 			}
-			
+
 			// Update button appearance
 			if (isSelected) {
-				button.classList.add('selected');
+				button.classList.add("selected");
 			} else {
-				button.classList.remove('selected');
+				button.classList.remove("selected");
 			}
 		});
 	}
-	
+
 	private addButtons(): void {
-		const buttonContainer = this.contentEl.createDiv({ cls: "mnemonic-modal-buttons" });
-		
+		const buttonContainer = this.contentEl.createDiv({
+			cls: "mnemonic-modal-buttons",
+		});
+
 		new ButtonComponent(buttonContainer)
 			.setButtonText("Save")
 			.setCta()
 			.onClick(() => {
-				const selectedMnemonics = this.currentMnemonics.filter(m => m.selected);
+				const selectedMnemonics = this.currentMnemonics.filter(
+					(m) => m.selected
+				);
 				const freeformNotes = this.freeformNotesTextarea.value.trim();
 				this.onSave(selectedMnemonics, freeformNotes);
 				this.close();
 			});
-			
+
 		new ButtonComponent(buttonContainer)
 			.setButtonText("Cancel")
 			.onClick(() => this.close());
 	}
-	
+
 	private addCloseButton(): void {
-		const buttonContainer = this.contentEl.createDiv({ cls: "mnemonic-modal-buttons" });
+		const buttonContainer = this.contentEl.createDiv({
+			cls: "mnemonic-modal-buttons",
+		});
 		new ButtonComponent(buttonContainer)
 			.setButtonText("Close")
 			.onClick(() => this.close());
 	}
-	
+
 	private addStyles(): void {
 		this.contentEl.createEl("style", {
 			text: `
@@ -13951,29 +14904,34 @@ class MnemonicsModal extends Modal {
 					border: none;
 					border-top: 2px dashed var(--background-modifier-border);
 				}
-			`
+			`,
 		});
 	}
-	
+
 	private async generateMentalImagery(): Promise<void> {
 		const front = this.variant.front;
 		const back = this.variant.back;
-		
+
 		try {
 			new Notice("Generating mental imagery...", 3000);
-			
+
 			// Build Major System context if numbers are detected
 			let majorSystemContext = "";
 			if (this.currentMnemonics.length > 0) {
-				majorSystemContext = "\n\nAVAILABLE MAJOR SYSTEM WORDS (you can optionally incorporate these):\n";
-				this.currentMnemonics.forEach(mnemonic => {
+				majorSystemContext =
+					"\n\nAVAILABLE MAJOR SYSTEM WORDS (you can optionally incorporate these):\n";
+				this.currentMnemonics.forEach((mnemonic) => {
 					const wordList = mnemonic.words.slice(0, 10).join(", "); // Show first 10 words
-					const moreCount = mnemonic.words.length > 10 ? ` (+${mnemonic.words.length - 10} more)` : "";
+					const moreCount =
+						mnemonic.words.length > 10
+							? ` (+${mnemonic.words.length - 10} more)`
+							: "";
 					majorSystemContext += `• Number "${mnemonic.number}" (${mnemonic.position}): ${wordList}${moreCount}\n`;
 				});
-				majorSystemContext += "\nYou can use any of these words in your mental imagery if it helps create a memorable story.";
+				majorSystemContext +=
+					"\nYou can use any of these words in your mental imagery if it helps create a memorable story.";
 			}
-			
+
 			const prompt = `Create a vivid mental image description to help remember this flashcard. Be creative and memorable:
 
 FRONT: ${front}
@@ -13987,45 +14945,55 @@ If Major System words are available above, feel free to incorporate any that wou
 
 Provide only the mental imagery description, no additional explanation.`;
 
-			const response = await this.plugin.sendToLlm(prompt, undefined, { temperature: 0.7 });
-			
+			const response = await this.plugin.sendToLlm(prompt, undefined, {
+				temperature: 0.7,
+			});
+
 			if (response.content.trim()) {
 				// Append to existing content or replace if empty
 				const currentValue = this.freeformNotesTextarea.value.trim();
 				if (currentValue) {
-					this.freeformNotesTextarea.value = currentValue + "\n\n" + response.content.trim();
+					this.freeformNotesTextarea.value =
+						currentValue + "\n\n" + response.content.trim();
 				} else {
 					this.freeformNotesTextarea.value = response.content.trim();
 				}
 				new Notice("Mental imagery generated!");
 			} else {
-				new Notice("Failed to generate mental imagery. Please try again.");
+				new Notice(
+					"Failed to generate mental imagery. Please try again."
+				);
 			}
 		} catch (error) {
 			console.error("Error generating mental imagery:", error);
 			new Notice("Error generating mental imagery. Please try again.");
 		}
 	}
-	
+
 	private async generateEmojiSequence(): Promise<void> {
 		const front = this.variant.front;
 		const back = this.variant.back;
-		
+
 		try {
 			new Notice("Generating emoji sequence...", 3000);
-			
+
 			// Build Major System context if numbers are detected
 			let majorSystemContext = "";
 			if (this.currentMnemonics.length > 0) {
-				majorSystemContext = "\n\nAVAILABLE MAJOR SYSTEM WORDS (you can optionally incorporate these):\n";
-				this.currentMnemonics.forEach(mnemonic => {
+				majorSystemContext =
+					"\n\nAVAILABLE MAJOR SYSTEM WORDS (you can optionally incorporate these):\n";
+				this.currentMnemonics.forEach((mnemonic) => {
 					const wordList = mnemonic.words.slice(0, 10).join(", "); // Show first 10 words
-					const moreCount = mnemonic.words.length > 10 ? ` (+${mnemonic.words.length - 10} more)` : "";
+					const moreCount =
+						mnemonic.words.length > 10
+							? ` (+${mnemonic.words.length - 10} more)`
+							: "";
 					majorSystemContext += `• Number "${mnemonic.number}" (${mnemonic.position}): ${wordList}${moreCount}\n`;
 				});
-				majorSystemContext += "\nYou can use any of these words in your emoji sequence if they help create memorable phonetic or visual connections.";
+				majorSystemContext +=
+					"\nYou can use any of these words in your emoji sequence if they help create memorable phonetic or visual connections.";
 			}
-			
+
 			const prompt = `Create a creative emoji sequence to help remember this flashcard:
 
 FRONT: ${front}
@@ -14042,26 +15010,31 @@ If Major System words are available above, feel free to incorporate any that cre
 
 Provide only the emoji sequence, no additional explanation.`;
 
-			const response = await this.plugin.sendToLlm(prompt, undefined, { temperature: 0.8 });
-			
+			const response = await this.plugin.sendToLlm(prompt, undefined, {
+				temperature: 0.8,
+			});
+
 			if (response.content.trim()) {
 				// Append to existing content or replace if empty
 				const currentValue = this.freeformNotesTextarea.value.trim();
 				if (currentValue) {
-					this.freeformNotesTextarea.value = currentValue + "\n\n" + response.content.trim();
+					this.freeformNotesTextarea.value =
+						currentValue + "\n\n" + response.content.trim();
 				} else {
 					this.freeformNotesTextarea.value = response.content.trim();
 				}
 				new Notice("Emoji sequence generated!");
 			} else {
-				new Notice("Failed to generate emoji sequence. Please try again.");
+				new Notice(
+					"Failed to generate emoji sequence. Please try again."
+				);
 			}
 		} catch (error) {
 			console.error("Error generating emoji sequence:", error);
 			new Notice("Error generating emoji sequence. Please try again.");
 		}
 	}
-	
+
 	onClose() {
 		this.contentEl.empty();
 	}
@@ -14282,7 +15255,7 @@ class CardBrowser extends Modal {
 		filtersContainer.style.flexWrap = "wrap";
 		filtersContainer.style.alignItems = "center";
 		filtersContainer.style.marginBottom = "10px";
-		
+
 		// Add common filter button styles
 		const addFilterButtonStyles = (button: HTMLElement) => {
 			button.style.padding = "4px 8px";
@@ -14298,11 +15271,15 @@ class CardBrowser extends Modal {
 		// Flagged cards filter
 		const flagBtn = filtersContainer.createEl("button", { text: "🚩" });
 		addFilterButtonStyles(flagBtn);
-		flagBtn.style.backgroundColor = this.showOnlyFlagged ? "var(--interactive-accent)" : "var(--interactive-normal)";
+		flagBtn.style.backgroundColor = this.showOnlyFlagged
+			? "var(--interactive-accent)"
+			: "var(--interactive-normal)";
 		flagBtn.setAttribute("aria-label", "Show only flagged cards");
 		flagBtn.onclick = async () => {
 			this.showOnlyFlagged = !this.showOnlyFlagged;
-			flagBtn.style.backgroundColor = this.showOnlyFlagged ? "var(--interactive-accent)" : "var(--interactive-normal)";
+			flagBtn.style.backgroundColor = this.showOnlyFlagged
+				? "var(--interactive-accent)"
+				: "var(--interactive-normal)";
 			await this.renderContent();
 		};
 
@@ -14310,10 +15287,14 @@ class CardBrowser extends Modal {
 		const suspendBtn = new ButtonComponent(filtersContainer);
 		suspendBtn.setIcon("ban");
 		suspendBtn.setTooltip("Show only suspended cards");
-		suspendBtn.buttonEl.style.backgroundColor = this.showOnlySuspended ? "var(--interactive-accent)" : "var(--interactive-normal)";
+		suspendBtn.buttonEl.style.backgroundColor = this.showOnlySuspended
+			? "var(--interactive-accent)"
+			: "var(--interactive-normal)";
 		suspendBtn.onClick(async () => {
 			this.showOnlySuspended = !this.showOnlySuspended;
-			suspendBtn.buttonEl.style.backgroundColor = this.showOnlySuspended ? "var(--interactive-accent)" : "var(--interactive-normal)";
+			suspendBtn.buttonEl.style.backgroundColor = this.showOnlySuspended
+				? "var(--interactive-accent)"
+				: "var(--interactive-normal)";
 			await this.renderContent();
 		});
 
@@ -14321,10 +15302,14 @@ class CardBrowser extends Modal {
 		const buryBtn = new ButtonComponent(filtersContainer);
 		buryBtn.setIcon("file-down");
 		buryBtn.setTooltip("Show only buried cards");
-		buryBtn.buttonEl.style.backgroundColor = this.showOnlyBuried ? "var(--interactive-accent)" : "var(--interactive-normal)";
+		buryBtn.buttonEl.style.backgroundColor = this.showOnlyBuried
+			? "var(--interactive-accent)"
+			: "var(--interactive-normal)";
 		buryBtn.onClick(async () => {
 			this.showOnlyBuried = !this.showOnlyBuried;
-			buryBtn.buttonEl.style.backgroundColor = this.showOnlyBuried ? "var(--interactive-accent)" : "var(--interactive-normal)";
+			buryBtn.buttonEl.style.backgroundColor = this.showOnlyBuried
+				? "var(--interactive-accent)"
+				: "var(--interactive-normal)";
 			await this.renderContent();
 		});
 
@@ -14332,11 +15317,15 @@ class CardBrowser extends Modal {
 		if (this.plugin.settings.showNewCardIndicators) {
 			const newBtn = filtersContainer.createEl("button", { text: "🌱" });
 			addFilterButtonStyles(newBtn);
-			newBtn.style.backgroundColor = this.showOnlyNew ? "var(--interactive-accent)" : "var(--interactive-normal)";
+			newBtn.style.backgroundColor = this.showOnlyNew
+				? "var(--interactive-accent)"
+				: "var(--interactive-normal)";
 			newBtn.setAttribute("aria-label", "Show only new cards");
 			newBtn.onclick = async () => {
 				this.showOnlyNew = !this.showOnlyNew;
-				newBtn.style.backgroundColor = this.showOnlyNew ? "var(--interactive-accent)" : "var(--interactive-normal)";
+				newBtn.style.backgroundColor = this.showOnlyNew
+					? "var(--interactive-accent)"
+					: "var(--interactive-normal)";
 				await this.renderContent();
 			};
 		}
@@ -14372,10 +15361,7 @@ class CardBrowser extends Modal {
 		this.editorPane.empty();
 		this.editorPane.setText("← Choose a chapter to view its cards");
 
-		const showCardsForChapter = async (
-			deck: TFile,
-			chapterPath: string
-		) => {
+		const showCardsForChapter = async (chapterPath: string) => {
 			this.state.activeChapterPath = chapterPath;
 			this.plugin.logger(
 				LogLevel.VERBOSE,
@@ -14390,8 +15376,8 @@ class CardBrowser extends Modal {
 				?.addClass("is-active");
 
 			this.editorPane.empty();
-			const graph = await this.plugin.readDeck(deck.path);
-			let cards: Flashcard[] = Object.values(graph).filter(
+			const allCards = await this.plugin.cardManager.readCentralizedCards();
+			let cards: Flashcard[] = Object.values(allCards).filter(
 				(c) => c.chapter === chapterPath
 			);
 
@@ -14412,10 +15398,14 @@ class CardBrowser extends Modal {
 
 			for (const card of cards) {
 				const row = this.editorPane.createDiv({ cls: "gn-cardrow" });
-				
+
 				// Add status icons
-				if (this.plugin.settings.showNewCardIndicators && isUnseen(card)) {
-					row.createEl("span", { text: "🌱" }).style.marginRight = "4px";
+				if (
+					this.plugin.settings.showNewCardIndicators &&
+					isUnseen(card)
+				) {
+					row.createEl("span", { text: "🌱" }).style.marginRight =
+						"4px";
 				}
 				if (isBuried(card)) {
 					const iconSpan = row.createEl("span");
@@ -14432,16 +15422,22 @@ class CardBrowser extends Modal {
 					iconSpan.style.marginRight = "4px";
 					setIcon(iconSpan, "flag");
 				}
-				
+
 				// Add card label (using first variant)
 				const labelSpan = row.createEl("span");
 				const firstVariant = this.plugin.getCurrentVariant(card, 0);
 				labelSpan.setText(firstVariant.front || "(empty front)");
 
-				row.onclick = () => {
-					this.plugin.openEditModal(card, graph, deck, async () => {
-						await this.renderContent();
-					});
+				row.onclick = async () => {
+					// Get all cards and create a temporary graph-like structure for the edit modal
+					const allCards = await this.plugin.cardManager.readCentralizedCards();
+					const centralFile = this.plugin.app.vault.getAbstractFileByPath(CENTRAL_DECK_PATH) as TFile;
+					
+					if (centralFile) {
+						this.plugin.openEditModal(card, allCards, centralFile, async () => {
+							await this.renderContent();
+						});
+					}
 				};
 
 				row.createEl("span", { text: "ℹ️", cls: "gn-info" }).onclick = (
@@ -14456,85 +15452,145 @@ class CardBrowser extends Modal {
 				}).onclick = async (ev) => {
 					ev.stopPropagation();
 					if (!confirm("Delete this card permanently?")) return;
-					delete graph[card.id];
-					await this.plugin.writeDeck(deck.path, graph);
+					
+					// Delete from centralized storage
+					const allCards = await this.plugin.cardManager.readCentralizedCards();
+					delete allCards[card.id];
+					await this.plugin.cardManager.writeCentralizedCards(allCards);
+					
 					this.plugin.refreshAllStatuses();
 					await this.renderContent();
 				};
 			}
 		};
 
-		const decks = this.app.vault
-			.getFiles()
-			.filter((f) => f.name.endsWith(DECK_FILE_NAME));
+		// Read all cards from centralized storage
+		const allCards = await this.plugin.cardManager.readCentralizedCards();
+		let cardsInDeck = Object.values(allCards);
+		
+		// Apply filters
+		if (this.filter) cardsInDeck = cardsInDeck.filter(this.filter);
+		if (this.showOnlyFlagged)
+			cardsInDeck = cardsInDeck.filter((c) => c.flagged);
+		if (this.showOnlySuspended)
+			cardsInDeck = cardsInDeck.filter((c) => c.suspended);
+		if (this.showOnlyBuried)
+			cardsInDeck = cardsInDeck.filter((c) => isBuried(c));
+		if (this.showOnlyNew)
+			cardsInDeck = cardsInDeck.filter((c) => isUnseen(c));
 
-		for (const deck of decks) {
-			const graph = await this.plugin.readDeck(deck.path);
-			let cardsInDeck = Object.values(graph);
-			if (this.filter) cardsInDeck = cardsInDeck.filter(this.filter);
-			if (this.showOnlyFlagged)
-				cardsInDeck = cardsInDeck.filter((c) => c.flagged);
-			if (this.showOnlySuspended)
-				cardsInDeck = cardsInDeck.filter((c) => c.suspended);
-			if (this.showOnlyBuried)
-				cardsInDeck = cardsInDeck.filter((c) => isBuried(c));
-			if (this.showOnlyNew)
-				cardsInDeck = cardsInDeck.filter((c) => isUnseen(c));
-			if (cardsInDeck.length === 0) continue;
-
-			const subject = deck.path.split("/")[0] || "Vault Root";
-
-			const shouldBeOpen =
-				this.state.isFirstRender ||
-				this.state.openSubjects.has(subject);
-			this.plugin.logger(
-				LogLevel.VERBOSE,
-				`CardBrowser: renderContent -> Subject '${subject}' should be open: ${shouldBeOpen} (isFirstRender: ${this.state.isFirstRender})`
-			);
-
-			const subjectEl = this.treePane.createEl("details", {
-				cls: "gn-node",
-			});
-			subjectEl.open = shouldBeOpen;
-
-			subjectEl.createEl("summary", { text: subject });
-
-			subjectEl.addEventListener("toggle", () => {
-				if (subjectEl.open) this.state.openSubjects.add(subject);
-				else this.state.openSubjects.delete(subject);
-				this.plugin.logger(
-					LogLevel.VERBOSE,
-					`CardBrowser: Subject toggle -> '${subject}' is now ${
-						subjectEl.open ? "open" : "closed"
-					}. New state:`,
-					[...this.state.openSubjects]
-				);
-			});
-
-			if (this.state.isFirstRender) this.state.openSubjects.add(subject);
-
-			const chaptersInSubject = new Map<string, number>();
-			for (const c of cardsInDeck) {
-				chaptersInSubject.set(
-					c.chapter,
-					(chaptersInSubject.get(c.chapter) ?? 0) + 1
-				);
-			}
-
-			const sortedChapters = [...chaptersInSubject.entries()].sort(
-				(a, b) => a[0].localeCompare(b[0])
-			);
-			for (const [chapterPath, count] of sortedChapters) {
-				const chapterName =
-					chapterPath.split("/").pop()?.replace(/\.md$/, "") ??
-					chapterPath;
-				subjectEl.createEl("div", {
-					cls: "gn-chap",
-					text: `${count} card(s) • ${chapterName}`,
-					attr: { "data-chapter-path": chapterPath },
-				}).onclick = () => showCardsForChapter(deck, chapterPath);
-			}
+		// Build hierarchical folder tree
+		interface TreeNode {
+			name: string;
+			fullPath: string;
+			children: Map<string, TreeNode>;
+			cards: Flashcard[];
 		}
+
+		const rootNode: TreeNode = {
+			name: "root",
+			fullPath: "",
+			children: new Map(),
+			cards: []
+		};
+
+		// Build tree from card paths
+		for (const card of cardsInDeck) {
+			const pathParts = card.chapter.split("/");
+			const fileName = pathParts.pop(); // Remove the .md file
+			let currentNode = rootNode;
+
+			// Navigate/create folder structure
+			let currentPath = "";
+			for (const part of pathParts) {
+				currentPath = currentPath ? `${currentPath}/${part}` : part;
+				if (!currentNode.children.has(part)) {
+					currentNode.children.set(part, {
+						name: part,
+						fullPath: currentPath,
+						children: new Map(),
+						cards: []
+					});
+				}
+				currentNode = currentNode.children.get(part)!;
+			}
+
+			// Add card to the deepest folder
+			currentNode.cards.push(card);
+		}
+
+		// Helper function to recursively check if a node has any cards in its tree
+		const hasCardsInTree = (node: TreeNode): boolean => {
+			if (node.cards.length > 0) return true;
+			return Array.from(node.children.values()).some(child => hasCardsInTree(child));
+		};
+
+		// Render tree recursively
+		const renderNode = (node: TreeNode, container: HTMLElement, level: number = 0) => {
+			// Skip empty folders (folders with no cards in any descendant)
+			if (level > 0 && !hasCardsInTree(node)) {
+				return;
+			}
+
+			// Render children (folders)
+			const sortedChildren = [...node.children.entries()].sort((a, b) => a[0].localeCompare(b[0]));
+			for (const [folderName, childNode] of sortedChildren) {
+				const shouldBeOpen = this.state.isFirstRender || this.state.openSubjects.has(childNode.fullPath);
+				
+				const folderEl = container.createEl("details", {
+					cls: `gn-node level-${level}`,
+				});
+				folderEl.open = shouldBeOpen;
+
+				folderEl.createEl("summary", { text: folderName });
+
+				folderEl.addEventListener("toggle", () => {
+					if (folderEl.open) this.state.openSubjects.add(childNode.fullPath);
+					else this.state.openSubjects.delete(childNode.fullPath);
+					this.plugin.logger(
+						LogLevel.VERBOSE,
+						`CardBrowser: Folder toggle -> '${childNode.fullPath}' is now ${
+							folderEl.open ? "open" : "closed"
+						}`
+					);
+				});
+
+				if (this.state.isFirstRender) this.state.openSubjects.add(childNode.fullPath);
+
+				// Recursively render children
+				renderNode(childNode, folderEl, level + 1);
+			}
+
+			// Render cards (chapters) in this folder
+			if (node.cards.length > 0) {
+				const chaptersInFolder = new Map<string, number>();
+				for (const card of node.cards) {
+					chaptersInFolder.set(
+						card.chapter,
+						(chaptersInFolder.get(card.chapter) ?? 0) + 1
+					);
+				}
+
+				const sortedChapters = [...chaptersInFolder.entries()].sort((a, b) =>
+					a[0].localeCompare(b[0])
+				);
+				for (const [chapterPath, count] of sortedChapters) {
+					const chapterName =
+						chapterPath.split("/").pop()?.replace(/\.md$/, "") ??
+						chapterPath;
+					const chapterEl = container.createEl("div", {
+						cls: "gn-chap",
+						text: `${count} card(s) • ${chapterName}`,
+						attr: { "data-chapter-path": chapterPath },
+					});
+					chapterEl.style.marginLeft = `${(level + 1) * 1.2}rem`;
+					chapterEl.onclick = () => showCardsForChapter(chapterPath);
+				}
+			}
+		};
+
+		// Start rendering from root
+		renderNode(rootNode, this.treePane);
 
 		if (this.state.isFirstRender) {
 			this.plugin.logger(
@@ -14549,21 +15605,16 @@ class CardBrowser extends Modal {
 				LogLevel.VERBOSE,
 				`CardBrowser: renderContent -> Attempting to restore active chapter: '${this.state.activeChapterPath}'`
 			);
-			const activeChapterDeck = decks.find(
-				(d) =>
-					getDeckPathForChapter(this.state.activeChapterPath!) ===
-					d.path
-			);
-			if (activeChapterDeck) {
-				await showCardsForChapter(
-					activeChapterDeck,
-					this.state.activeChapterPath
-				);
+			// Check if the active chapter still exists in the current cards
+			const chapterExists = cardsInDeck.some(card => card.chapter === this.state.activeChapterPath);
+			if (chapterExists) {
+				await showCardsForChapter(this.state.activeChapterPath);
 			} else {
 				this.plugin.logger(
 					LogLevel.VERBOSE,
-					"CardBrowser: renderContent -> ...deck not found for active chapter."
+					`CardBrowser: renderContent -> Active chapter '${this.state.activeChapterPath}' no longer exists`
 				);
+				this.state.activeChapterPath = null;
 			}
 		}
 
@@ -15000,26 +16051,30 @@ class ReviewAheadModal extends Modal {
 		contentEl.empty();
 
 		const modeNames = {
-			[StudyMode.CHAPTER]: "chapter",
-			[StudyMode.SUBJECT]: "subject", 
-			[StudyMode.REVIEW]: "review-only"
+			[StudyMode.NOTE]: "note",
+			[StudyMode.CUSTOM_SESSION]: "custom session",
+			[StudyMode.REVIEW]: "review-only",
 		};
 
 		contentEl.createEl("h2", { text: "No cards due for review" });
-		contentEl.createEl("p", { 
-			text: `There are no cards due for ${modeNames[this.studyMode]} mode. Would you like to review cards that are due in the future?` 
+		contentEl.createEl("p", {
+			text: `There are no cards due for ${
+				modeNames[this.studyMode]
+			} mode. Would you like to review cards that are due in the future?`,
 		});
 
 		const inputContainer = contentEl.createDiv();
 		inputContainer.style.marginBottom = "15px";
 
-		const label = inputContainer.createEl("label", { text: "Review cards due within:" });
+		const label = inputContainer.createEl("label", {
+			text: "Review cards due within:",
+		});
 		label.style.display = "block";
 		label.style.marginBottom = "5px";
 
 		const input = inputContainer.createEl("input", {
 			type: "text",
-			placeholder: "e.g., 5m, 2.5h, 1d"
+			placeholder: "e.g., 5m, 2.5h, 1d",
 		});
 		input.style.width = "100%";
 		input.style.padding = "8px";
@@ -15027,7 +16082,7 @@ class ReviewAheadModal extends Modal {
 		input.style.borderRadius = "4px";
 
 		const helpText = inputContainer.createEl("div", {
-			text: "Formats: 5m (5 minutes), 2.5h (2.5 hours), 1d (1 day)"
+			text: "Formats: 5m (5 minutes), 2.5h (2.5 hours), 1d (1 day)",
 		});
 		helpText.style.fontSize = "12px";
 		helpText.style.color = "var(--text-muted)";
@@ -15051,7 +16106,9 @@ class ReviewAheadModal extends Modal {
 			.onClick(async () => {
 				const timeMs = parseTimeInput(input.value);
 				if (timeMs === null) {
-					new Notice("Invalid time format. Use formats like 5m, 2.5h, or 1d");
+					new Notice(
+						"Invalid time format. Use formats like 5m, 2.5h, or 1d"
+					);
 					input.focus();
 					return;
 				}
@@ -15215,6 +16272,387 @@ class UnusedImageReviewModal extends Modal {
 	onClose() {
 		const { contentEl } = this;
 		contentEl.empty();
+	}
+}
+
+/**
+ * Dialog for selecting a folder for custom session study mode
+ */
+class CustomSessionDialog extends Modal {
+	private selectedPath: string = "";
+
+	constructor(app: App, private onConfirm: (path: string) => void) {
+		super(app);
+	}
+
+	onOpen() {
+		this.titleEl.setText("📁 Select Custom Session Folder");
+
+		const { contentEl } = this;
+		contentEl.empty();
+
+		// Description
+		contentEl.createEl("p", {
+			text: "Select a folder to study all flashcards within that folder and its subfolders:",
+		});
+
+		// Build folder tree from cards
+		this.buildFolderTree(contentEl);
+
+		// Buttons
+		const buttonContainer = contentEl.createEl("div", {
+			cls: "modal-button-container",
+		});
+
+		buttonContainer.createEl("button", {
+			text: "Study Vault Root",
+			cls: "mod-cta",
+		}).onclick = () => {
+			this.onConfirm("");
+			this.close();
+		};
+
+		buttonContainer.createEl("button", {
+			text: "Cancel",
+		}).onclick = () => {
+			this.close();
+		};
+	}
+
+	private async buildFolderTree(container: HTMLElement) {
+		// Get all unique folder paths from cards
+		const plugin = (this.app as any).plugins.plugins["gated-notes"];
+		if (!plugin) return;
+
+		try {
+			const allCards = await plugin.cardManager.readCentralizedCards();
+			const folderPaths = new Set<string>();
+
+			// Extract folder paths from card chapters
+			for (const card of Object.values(allCards) as Flashcard[]) {
+				const pathParts = card.chapter.split("/");
+				pathParts.pop(); // Remove filename
+				
+				// Add all intermediate paths
+				let currentPath = "";
+				for (const part of pathParts) {
+					currentPath = currentPath ? `${currentPath}/${part}` : part;
+					folderPaths.add(currentPath);
+				}
+			}
+
+			// Build hierarchical structure
+			const sortedPaths = Array.from(folderPaths).sort();
+			const treeContainer = container.createEl("div", {
+				cls: "custom-session-tree",
+				attr: { style: "max-height: 300px; overflow-y: auto; border: 1px solid var(--background-modifier-border); padding: 10px; margin: 10px 0;" }
+			});
+
+			for (const path of sortedPaths) {
+				const level = path.split("/").length - 1;
+				const folderName = path.split("/").pop() || path;
+				const cardCount = (Object.values(allCards) as Flashcard[]).filter(c => 
+					c.chapter.startsWith(path + "/") || c.chapter.startsWith(path)
+				).length;
+
+				const folderEl = treeContainer.createEl("div", {
+					cls: "custom-session-folder",
+					attr: { 
+						style: `margin-left: ${level * 20}px; padding: 4px; cursor: pointer; border-radius: 4px;`,
+						"data-path": path
+					}
+				});
+
+				folderEl.createEl("span", {
+					text: `📁 ${folderName} (${cardCount} cards)`,
+				});
+
+				folderEl.onclick = () => {
+					// Remove previous selection
+					treeContainer.querySelectorAll(".selected").forEach(el => 
+						el.removeClass("selected"));
+					
+					// Add selection to current
+					folderEl.addClass("selected");
+					folderEl.style.backgroundColor = "var(--interactive-accent)";
+					folderEl.style.color = "var(--text-on-accent)";
+					
+					this.selectedPath = path;
+					
+					// Update button to show selection
+					const confirmBtn = container.querySelector(".mod-cta") as HTMLButtonElement;
+					if (confirmBtn) {
+						confirmBtn.textContent = `Study "${folderName}"`;
+						confirmBtn.onclick = () => {
+							this.onConfirm(this.selectedPath);
+							this.close();
+						};
+					}
+				};
+			}
+		} catch (error) {
+			console.error("Error building folder tree:", error);
+			container.createEl("p", {
+				text: "Error loading folders. Please try again.",
+				cls: "mod-warning"
+			});
+		}
+	}
+
+	onClose() {
+		this.selectedPath = "";
+	}
+}
+
+/**
+ * Migration dialog to handle flashcard file consolidation
+ */
+class MigrationDialog extends Modal {
+	constructor(private plugin: GatedNotesPlugin, private deckFiles: TFile[]) {
+		super(plugin.app);
+	}
+
+	onOpen() {
+		this.titleEl.setText("🔄 Flashcard Migration Required");
+
+		const { contentEl } = this;
+		contentEl.empty();
+
+		// Introduction
+		contentEl.createEl("p", {
+			text: "Multiple flashcard files detected in your vault. To unlock new hierarchical features and improve performance, we recommend consolidating them into a single centralized file.",
+		});
+
+		// File list
+		const fileList = contentEl.createDiv({ cls: "migration-file-list" });
+		fileList.createEl("h3", { text: "Files to be consolidated:" });
+
+		const listEl = fileList.createEl("ul");
+		let totalCards = 0;
+
+		for (const file of this.deckFiles) {
+			const listItem = listEl.createEl("li");
+			listItem.setText(`📄 ${file.path}`);
+			// Note: We could read each file to show card counts, but that might be slow
+		}
+
+		// Benefits section
+		const benefitsDiv = contentEl.createDiv({ cls: "migration-benefits" });
+		benefitsDiv.createEl("h3", { text: "Benefits of migration:" });
+		const benefitsList = benefitsDiv.createEl("ul");
+		benefitsList.createEl("li", {
+			text: "✅ Better performance with single file access",
+		});
+		benefitsList.createEl("li", {
+			text: "✅ Support for unlimited folder nesting",
+		});
+		benefitsList.createEl("li", {
+			text: "✅ Advanced study modes and filtering",
+		});
+		benefitsList.createEl("li", { text: "✅ Simplified backup and sync" });
+
+		// Options
+		const optionsDiv = contentEl.createDiv({ cls: "migration-options" });
+		optionsDiv.createEl("h3", { text: "Migration options:" });
+
+		let createBackup = true;
+		const backupOption = optionsDiv.createDiv({ cls: "migration-option" });
+		const backupCheckbox = backupOption.createEl("input", {
+			type: "checkbox",
+		});
+		backupCheckbox.checked = true;
+		backupCheckbox.addEventListener("change", () => {
+			createBackup = backupCheckbox.checked;
+		});
+		backupOption.createSpan({
+			text: " Create backup before migration (recommended)",
+		});
+
+		// Warning
+		const warningDiv = contentEl.createDiv({ cls: "migration-warning" });
+		const warningText = warningDiv.createEl("p", {
+			cls: "migration-warning-text",
+		});
+		warningText.setText(
+			"⚠️ This process will delete the original scattered files after consolidation. Choose 'Cancel' to continue using the current system with limited features."
+		);
+
+		// Buttons
+		const buttonDiv = contentEl.createDiv({ cls: "migration-buttons" });
+
+		new ButtonComponent(buttonDiv)
+			.setButtonText("Cancel")
+			.onClick(() => this.close());
+
+		new ButtonComponent(buttonDiv)
+			.setButtonText("🚀 Start Migration")
+			.setCta()
+			.onClick(async () => {
+				this.startMigration(createBackup);
+			});
+
+		// Add styles
+		this.addStyles();
+	}
+
+	private async startMigration(createBackup: boolean): Promise<void> {
+		// Show progress
+		this.contentEl.empty();
+		this.contentEl.createEl("h2", { text: "Migration in Progress..." });
+
+		const progressDiv = this.contentEl.createDiv({
+			cls: "migration-progress",
+		});
+		progressDiv.createEl("p", {
+			text: "Please wait while we consolidate your flashcard files.",
+		});
+
+		// Create a simple progress indicator
+		const progressBar = progressDiv.createDiv({
+			cls: "migration-progress-bar",
+		});
+		const progressFill = progressBar.createDiv({
+			cls: "migration-progress-fill",
+		});
+
+		// Animate progress bar
+		let progress = 0;
+		const progressInterval = setInterval(() => {
+			progress += 10;
+			progressFill.style.width = `${Math.min(progress, 90)}%`;
+		}, 200);
+
+		try {
+			const success = await this.plugin.performMigration(
+				this.deckFiles,
+				createBackup
+			);
+
+			clearInterval(progressInterval);
+			progressFill.style.width = "100%";
+
+			if (success) {
+				this.showMigrationSuccess();
+			} else {
+				this.showMigrationError(
+					"Migration failed. Please check the console for details."
+				);
+			}
+		} catch (error) {
+			clearInterval(progressInterval);
+			this.showMigrationError(
+				`Migration failed: ${
+					error instanceof Error ? error.message : String(error)
+				}`
+			);
+		}
+	}
+
+	private showMigrationSuccess(): void {
+		this.contentEl.empty();
+		this.contentEl.createEl("h2", { text: "✅ Migration Complete!" });
+		this.contentEl.createEl("p", {
+			text: "Your flashcard files have been successfully consolidated. You can now enjoy improved performance and new features!",
+		});
+
+		const buttonDiv = this.contentEl.createDiv({
+			cls: "migration-buttons",
+		});
+		new ButtonComponent(buttonDiv)
+			.setButtonText("Continue")
+			.setCta()
+			.onClick(() => {
+				this.close();
+				// Refresh the plugin to use new system
+				window.location.reload();
+			});
+	}
+
+	private showMigrationError(message: string): void {
+		this.contentEl.empty();
+		this.contentEl.createEl("h2", { text: "❌ Migration Failed" });
+		this.contentEl.createEl("p", { text: message });
+		this.contentEl.createEl("p", {
+			text: "Your original files remain unchanged. You can continue using the plugin with the current file structure.",
+		});
+
+		const buttonDiv = this.contentEl.createDiv({
+			cls: "migration-buttons",
+		});
+		new ButtonComponent(buttonDiv)
+			.setButtonText("Close")
+			.onClick(() => this.close());
+	}
+
+	private addStyles(): void {
+		this.contentEl.createEl("style", {
+			text: `
+				.migration-file-list {
+					margin: 20px 0;
+					padding: 15px;
+					background: var(--background-secondary);
+					border-radius: 8px;
+				}
+				.migration-file-list ul {
+					margin: 10px 0 0 20px;
+				}
+				.migration-benefits {
+					margin: 20px 0;
+				}
+				.migration-benefits ul {
+					margin: 10px 0 0 20px;
+				}
+				.migration-options {
+					margin: 20px 0;
+				}
+				.migration-option {
+					margin: 10px 0;
+					display: flex;
+					align-items: center;
+				}
+				.migration-warning {
+					margin: 20px 0;
+					padding: 15px;
+					background: var(--background-modifier-error-rgb, rgba(var(--color-red-rgb, 220, 38, 38), 0.1));
+					border-radius: 8px;
+					border-left: 4px solid var(--text-error);
+				}
+				.migration-warning-text {
+					color: var(--text-error);
+					font-weight: 500;
+					margin: 0;
+				}
+				.migration-buttons {
+					margin-top: 30px;
+					text-align: center;
+				}
+				.migration-buttons button {
+					margin: 0 10px;
+				}
+				.migration-progress {
+					text-align: center;
+					margin: 30px 0;
+				}
+				.migration-progress-bar {
+					width: 100%;
+					height: 20px;
+					background: var(--background-modifier-border);
+					border-radius: 10px;
+					overflow: hidden;
+					margin: 20px 0;
+				}
+				.migration-progress-fill {
+					height: 100%;
+					background: var(--interactive-accent);
+					transition: width 0.3s ease;
+					width: 0%;
+				}
+			`,
+		});
+	}
+
+	onClose() {
+		this.contentEl.empty();
 	}
 }
 
@@ -15457,7 +16895,9 @@ class GNSettingsTab extends PluginSettingTab {
 
 		new Setting(containerEl)
 			.setName("Show new card indicators")
-			.setDesc("Display green leaf (🌱) indicators for new flashcards in review and browser.")
+			.setDesc(
+				"Display green leaf (🌱) indicators for new flashcards in review and browser."
+			)
 			.addToggle((toggle) =>
 				toggle
 					.setValue(this.plugin.settings.showNewCardIndicators)
@@ -15469,7 +16909,9 @@ class GNSettingsTab extends PluginSettingTab {
 
 		new Setting(containerEl)
 			.setName("Show review cards before new cards (Chapter Focus)")
-			.setDesc("In chapter focus mode, prioritize due review cards over new cards.")
+			.setDesc(
+				"In chapter focus mode, prioritize due review cards over new cards."
+			)
 			.addToggle((toggle) =>
 				toggle
 					.setValue(this.plugin.settings.chapterFocusReviewsFirst)
@@ -15481,7 +16923,9 @@ class GNSettingsTab extends PluginSettingTab {
 
 		new Setting(containerEl)
 			.setName("Enable smart interleaving")
-			.setDesc("Randomly order cards while favoring more overdue ones (Subject/Review-only modes).")
+			.setDesc(
+				"Randomly order cards while favoring more overdue ones (Subject/Review-only modes)."
+			)
 			.addToggle((toggle) =>
 				toggle
 					.setValue(this.plugin.settings.enableInterleaving)
@@ -15548,7 +16992,8 @@ const isUnseen = (card: Flashcard): boolean =>
  * @param card The flashcard to check.
  * @returns True if the card is buried, false otherwise.
  */
-const isBuried = (card: Flashcard): boolean => !!card.buried && card.due <= Date.now();
+const isBuried = (card: Flashcard): boolean =>
+	!!card.buried && card.due <= Date.now();
 
 /**
  * Parses time input strings like "5m", "2.5h", "1d" into milliseconds.
@@ -15558,17 +17003,21 @@ const isBuried = (card: Flashcard): boolean => !!card.buried && card.due <= Date
 const parseTimeInput = (input: string): number | null => {
 	const trimmed = input.trim().toLowerCase();
 	const match = trimmed.match(/^(\d+(?:\.\d+)?)\s*([mhd]?)$/);
-	
+
 	if (!match) return null;
-	
+
 	const value = parseFloat(match[1]);
-	const unit = match[2] || 'm'; // default to minutes if no unit
-	
+	const unit = match[2] || "m"; // default to minutes if no unit
+
 	switch (unit) {
-		case 'm': return value * 60 * 1000; // minutes to ms
-		case 'h': return value * 60 * 60 * 1000; // hours to ms  
-		case 'd': return value * 24 * 60 * 60 * 1000; // days to ms
-		default: return null;
+		case "m":
+			return value * 60 * 1000; // minutes to ms
+		case "h":
+			return value * 60 * 60 * 1000; // hours to ms
+		case "d":
+			return value * 24 * 60 * 60 * 1000; // days to ms
+		default:
+			return null;
 	}
 };
 
@@ -15588,23 +17037,23 @@ const getOverdueSeconds = (card: Flashcard): number => {
 const sampleFromCumulative = (cumulativeWeights: number[]): number => {
 	if (cumulativeWeights.length === 0) return -1;
 	if (cumulativeWeights.length === 1) return 0;
-	
+
 	const total = cumulativeWeights[cumulativeWeights.length - 1];
 	if (total <= 0) return Math.floor(Math.random() * cumulativeWeights.length);
-	
+
 	const random = Math.random() * total;
 	let selectedIndex = cumulativeWeights.length - 1;
-	
+
 	for (let i = 0; i < cumulativeWeights.length; i++) {
 		if (random <= cumulativeWeights[i]) {
 			selectedIndex = i;
 			break;
 		}
 	}
-	
+
 	// Note: Could add logging here, but it would be called from plugin context
 	// Individual sampling methods handle their own logging
-	
+
 	return selectedIndex;
 };
 
@@ -16485,7 +17934,7 @@ class StudyOverviewModal extends Modal {
 
 		// Show loading message
 		const loadingEl = this.contentEl.createEl("p", {
-			text: "Gathering statistics..."
+			text: "Gathering statistics...",
 		});
 
 		try {
@@ -16498,13 +17947,13 @@ class StudyOverviewModal extends Modal {
 			// Create main container
 			const container = this.contentEl.createDiv({
 				attr: {
-					style: "font-family: var(--font-monospace); white-space: pre-line; font-size: 14px; line-height: 1.4;"
-				}
+					style: "font-family: var(--font-monospace); white-space: pre-line; font-size: 14px; line-height: 1.4;",
+				},
 			});
 
 			// Build the overview text
 			let overview = "=== Vault Study Overview ===\n\n";
-			
+
 			overview += `Total Cards: ${stats.totalCards.toLocaleString()}\n`;
 			if (stats.totalCards > 0) {
 				overview += `├─ New: ${stats.byStatus.new.toLocaleString()}\n`;
@@ -16513,17 +17962,32 @@ class StudyOverviewModal extends Modal {
 				overview += `└─ Relearn: ${stats.byStatus.relearn.toLocaleString()}\n\n`;
 
 				overview += "Status Breakdown:\n";
-				
+
 				// Build status items array first, then format with correct tree structure
 				const statusItems = [
-					`Due: ${stats.byState.due.toLocaleString()}`
+					`Due: ${stats.byState.due.toLocaleString()}`,
 				];
-				if (stats.byState.blocked > 0) statusItems.push(`Blocked: ${stats.byState.blocked.toLocaleString()}`);
-				if (stats.byState.suspended > 0) statusItems.push(`Suspended: ${stats.byState.suspended.toLocaleString()}`);
-				if (stats.byState.buried > 0) statusItems.push(`Buried: ${stats.byState.buried.toLocaleString()}`);
-				if (stats.byState.flagged > 0) statusItems.push(`Flagged: ${stats.byState.flagged.toLocaleString()}`);
-				if (stats.byState.missingParaIdx > 0) statusItems.push(`Missing Paragraph Index: ${stats.byState.missingParaIdx.toLocaleString()}`);
-				
+				if (stats.byState.blocked > 0)
+					statusItems.push(
+						`Blocked: ${stats.byState.blocked.toLocaleString()}`
+					);
+				if (stats.byState.suspended > 0)
+					statusItems.push(
+						`Suspended: ${stats.byState.suspended.toLocaleString()}`
+					);
+				if (stats.byState.buried > 0)
+					statusItems.push(
+						`Buried: ${stats.byState.buried.toLocaleString()}`
+					);
+				if (stats.byState.flagged > 0)
+					statusItems.push(
+						`Flagged: ${stats.byState.flagged.toLocaleString()}`
+					);
+				if (stats.byState.missingParaIdx > 0)
+					statusItems.push(
+						`Missing Paragraph Index: ${stats.byState.missingParaIdx.toLocaleString()}`
+					);
+
 				statusItems.forEach((item, index) => {
 					const isLast = index === statusItems.length - 1;
 					const prefix = isLast ? "└─" : "├─";
@@ -16535,12 +17999,15 @@ class StudyOverviewModal extends Modal {
 					stats.bySubject.forEach((subject, index) => {
 						const isLast = index === stats.bySubject.length - 1;
 						const prefix = isLast ? "└─" : "├─";
-						let subjectLine = `${prefix} ${subject.subject}: ${subject.total.toLocaleString()} cards`;
-						
+						let subjectLine = `${prefix} ${
+							subject.subject
+						}: ${subject.total.toLocaleString()} cards`;
+
 						const details = [];
 						if (subject.due > 0) details.push(`${subject.due} due`);
-						if (subject.blocked > 0) details.push(`${subject.blocked} blocked`);
-						
+						if (subject.blocked > 0)
+							details.push(`${subject.blocked} blocked`);
+
 						if (details.length > 0) {
 							subjectLine += ` (${details.join(", ")})`;
 						}
@@ -16555,19 +18022,18 @@ class StudyOverviewModal extends Modal {
 
 			// Add refresh button
 			const buttonContainer = this.contentEl.createDiv({
-				attr: { style: "margin-top: 20px; text-align: center;" }
+				attr: { style: "margin-top: 20px; text-align: center;" },
 			});
 
 			const refreshButton = buttonContainer.createEl("button", {
 				text: "Refresh",
-				attr: { style: "padding: 8px 16px;" }
+				attr: { style: "padding: 8px 16px;" },
 			});
 
 			refreshButton.onclick = async () => {
 				this.close();
 				new StudyOverviewModal(this.plugin).open();
 			};
-
 		} catch (error) {
 			loadingEl.setText("Error gathering statistics: " + error);
 		}
