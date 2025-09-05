@@ -167,6 +167,8 @@ interface Settings {
 	chapterFocusReviewsFirst: boolean;
 	/** Whether to enable smart interleaving for non-chapter modes. */
 	enableInterleaving: boolean;
+	/** Array of subject names that should be expanded in the CardBrowser. */
+	cardBrowserExpandedSubjects: string[];
 }
 
 const DEFAULT_SETTINGS: Settings = {
@@ -193,6 +195,7 @@ const DEFAULT_SETTINGS: Settings = {
 	showNewCardIndicators: true,
 	chapterFocusReviewsFirst: true,
 	enableInterleaving: true,
+	cardBrowserExpandedSubjects: [],
 };
 
 interface ImageAnalysis {
@@ -6826,6 +6829,9 @@ ${selection}
 					modal.close();
 				});
 
+			// Add Related Cards button (non-blocking)
+			this.addRelatedCardsButtonToReviewModal(bottomBar, card);
+
 			new ButtonComponent(bottomBar).setButtonText("Skip").onClick(() => {
 				state = "skip";
 				modal.close();
@@ -6833,6 +6839,56 @@ ${selection}
 
 			modal.open();
 		});
+	}
+
+	private async addRelatedCardsButtonToReviewModal(bottomBar: HTMLElement, card: Flashcard): Promise<void> {
+		const relatedCards = await this.findRelatedCardsForReview(card);
+		const relatedCount = relatedCards.length;
+		
+		if (relatedCount === 0) return; // Don't show button if no related cards
+		
+		new ButtonComponent(bottomBar)
+			.setIcon("users")
+			.setTooltip(`Find ${relatedCount} cards with the same tag: "${card.tag}"`)
+			.onClick(() => {
+				// Create search query to find cards with the same tag
+				const searchQuery = `tag:"${card.tag}"`;
+				
+				// Open CardBrowser with the search query pre-filled
+				new CardBrowser(
+					this,
+					this.cardBrowserState,
+					undefined, // filter
+					searchQuery // initialSearchQuery
+				).openWithNavigation();
+			});
+	}
+
+	private async findRelatedCardsForReview(card: Flashcard): Promise<Flashcard[]> {
+		const relatedCards: Flashcard[] = [];
+		
+		// Get all deck files in vault
+		const allDeckFiles = this.app.vault
+			.getFiles()
+			.filter((f) => f.name === "_flashcards.json");
+			
+		for (const deckFile of allDeckFiles) {
+			try {
+				const graph = await this.readDeck(deckFile.path);
+				const cards = Object.values(graph) as Flashcard[];
+				
+				for (const deckCard of cards) {
+					// Find cards with the same tag, but exclude the current card
+					if (deckCard.tag === card.tag && deckCard.id !== card.id) {
+						relatedCards.push(deckCard);
+					}
+				}
+			} catch (error) {
+				console.warn(`Could not read deck ${deckFile.path}:`, error);
+			}
+		}
+		
+		return relatedCards;
 	}
 
 	private showMnemonicsPanel(card: Flashcard, variant: CardVariant, parentModal: Modal): void {
@@ -7231,10 +7287,10 @@ ${selection}
 		// Filter out blocked cards for due/done status calculation
 		const nonBlockedCards = cards.filter((c) => !c.blocked);
 		
-		// If there are any blocked cards, show blocked
-		if (cards.some((c) => c.blocked)) {
+		// If there are any blocked cards that are NOT suspended, show blocked
+		if (cards.some((c) => c.blocked && !c.suspended)) {
 			if (chapterPath.includes("The Feynman Lectures on Physics Vol. 1")) {
-				console.log("  → Result: BLOCKED (hourglass)");
+				console.log("  → Result: BLOCKED (hourglass) - has non-suspended blocked cards");
 			}
 			return "blocked";
 		}
@@ -12718,7 +12774,7 @@ class EditModal extends NavigationAwareModal {
 		this.plugin.ensureVariantsStructure(this.card);
 	}
 
-	onOpenContent() {
+	async onOpenContent() {
 		makeModalDraggable(this, this.plugin);
 		this.titleEl.setText(
 			this.reviewContext
@@ -12948,7 +13004,13 @@ class EditModal extends NavigationAwareModal {
 						this.onDone(true);
 					});
 			}
+			
+			// Add Related Cards button for review context
+			await this.addRelatedCardsButton(btnRow);
 		} else {
+			// Add Related Cards button for non-review context
+			await this.addRelatedCardsButton(btnRow);
+			
 			new ButtonComponent(btnRow)
 				.setButtonText("Save")
 				.setCta()
@@ -13772,6 +13834,59 @@ Return ONLY valid JSON array of this shape: [{"front":"...","back":"..."}]`;
 		this.saveCurrentVariant();
 	}
 
+	private async addRelatedCardsButton(btnRow: HTMLElement): Promise<void> {
+		const relatedCards = await this.findRelatedCards();
+		const relatedCount = relatedCards.length;
+		
+		if (relatedCount === 0) return; // Don't show button if no related cards
+		
+		new ButtonComponent(btnRow)
+			.setButtonText(`Related: ${relatedCount}`)
+			.setTooltip(`Find ${relatedCount} cards with the same tag: "${this.card.tag}"`)
+			.onClick(() => {
+				// Create search query to find cards with the same tag
+				const searchQuery = `tag:"${this.card.tag}"`;
+				
+				// Open CardBrowser with the search query pre-filled
+				const cardBrowser = new CardBrowser(
+					this.plugin,
+					this.plugin.cardBrowserState,
+					undefined, // filter
+					searchQuery // initialSearchQuery
+				);
+				
+				// Use navigation system for proper context preservation
+				this.navigateTo(cardBrowser);
+			});
+	}
+
+	private async findRelatedCards(): Promise<Flashcard[]> {
+		const relatedCards: Flashcard[] = [];
+		
+		// Get all deck files in vault
+		const allDeckFiles = this.plugin.app.vault
+			.getFiles()
+			.filter((f) => f.name === "_flashcards.json");
+			
+		for (const deckFile of allDeckFiles) {
+			try {
+				const graph = await this.plugin.readDeck(deckFile.path);
+				const cards = Object.values(graph) as Flashcard[];
+				
+				for (const card of cards) {
+					// Find cards with the same tag, but exclude the current card
+					if (card.tag === this.card.tag && card.id !== this.card.id) {
+						relatedCards.push(card);
+					}
+				}
+			} catch (error) {
+				console.warn(`Could not read deck ${deckFile.path}:`, error);
+			}
+		}
+		
+		return relatedCards;
+	}
+
 	protected onCloseContent(): void {
 		// Clean up any resources specific to EditModal
 		this.currentMnemonics = [];
@@ -14399,15 +14514,22 @@ class CardBrowser extends NavigationAwareModal {
 	private showOnlySuspended = false;
 	private showOnlyNew = false;
 	private showOnlyBuried = false;
+	private searchQuery = "";
+	private searchInput!: HTMLInputElement;
+	private searchTimeout!: NodeJS.Timeout;
 	private treePane!: HTMLElement;
 	private editorPane!: HTMLElement;
 
 	constructor(
 		protected plugin: GatedNotesPlugin,
 		private state: CardBrowserState,
-		private filter?: (card: Flashcard) => boolean
+		private filter?: (card: Flashcard) => boolean,
+		initialSearchQuery?: string
 	) {
 		super(plugin.app, plugin);
+		if (initialSearchQuery) {
+			this.searchQuery = initialSearchQuery;
+		}
 	}
 
 	protected createNavigationContext(): CardBrowserContext {
@@ -14416,7 +14538,7 @@ class CardBrowser extends NavigationAwareModal {
 			id: this.generateContextId(),
 			title: "Card Browser",
 			timestamp: Date.now(),
-			searchQuery: undefined, // TODO: Add search functionality
+			searchQuery: this.searchQuery,
 			selectedDeckPath: this.state.selectedDeckPath,
 			selectedChapterPath: this.state.selectedChapterPath,
 			scrollPosition: undefined,
@@ -14432,7 +14554,12 @@ class CardBrowser extends NavigationAwareModal {
 		if (context.selectedChapterPath) {
 			this.state.selectedChapterPath = context.selectedChapterPath;
 		}
-		// TODO: Restore search query, scroll position, etc.
+		if (context.searchQuery) {
+			this.searchQuery = context.searchQuery;
+			if (this.searchInput) {
+				this.searchInput.value = this.searchQuery;
+			}
+		}
 	}
 
 	protected saveToContext(): void {
@@ -14440,7 +14567,7 @@ class CardBrowser extends NavigationAwareModal {
 			const browserContext = this.context as CardBrowserContext;
 			browserContext.selectedDeckPath = this.state.selectedDeckPath;
 			browserContext.selectedChapterPath = this.state.selectedChapterPath;
-			// TODO: Save search query, scroll position, etc.
+			browserContext.searchQuery = this.searchQuery;
 		}
 	}
 
@@ -14454,6 +14581,9 @@ class CardBrowser extends NavigationAwareModal {
 			"CardBrowser: onOpen -> Received state:",
 			{ ...this.state, openSubjects: [...this.state.openSubjects] }
 		);
+
+		// Load persistent browser state
+		this.loadBrowserState();
 
 		this.modalEl.addClass("gn-browser");
 		this.titleEl.setText(
@@ -14527,6 +14657,65 @@ class CardBrowser extends NavigationAwareModal {
 			};
 		}
 
+		// Add search input
+		const searchContainer = header.createDiv({ cls: "gn-search" });
+		searchContainer.style.marginTop = "10px";
+		searchContainer.style.display = "flex";
+		searchContainer.style.gap = "8px";
+		searchContainer.style.alignItems = "center";
+
+		const searchLabel = searchContainer.createEl("label", { text: "Search:" });
+		searchLabel.style.minWidth = "55px";
+		
+		this.searchInput = searchContainer.createEl("input", {
+			type: "text",
+			placeholder: "Search cards (front, back, or tag:\"exact-tag\")"
+		}) as HTMLInputElement;
+		this.searchInput.style.flex = "1";
+		this.searchInput.style.padding = "4px 8px";
+		this.searchInput.style.border = "1px solid var(--interactive-normal)";
+		this.searchInput.style.borderRadius = "4px";
+		this.searchInput.value = this.searchQuery;
+
+		// Add search functionality
+		const performSearch = async () => {
+			this.searchQuery = this.searchInput.value.trim();
+			await this.renderContent();
+		};
+
+		this.searchInput.addEventListener("input", () => {
+			// Debounce search to avoid excessive re-renders
+			clearTimeout(this.searchTimeout);
+			this.searchTimeout = setTimeout(performSearch, 300);
+		});
+
+		this.searchInput.addEventListener("keydown", (e) => {
+			if (e.key === "Enter") {
+				clearTimeout(this.searchTimeout);
+				performSearch();
+			}
+		});
+
+		const clearBtn = searchContainer.createEl("button", { text: "Clear" });
+		clearBtn.style.padding = "4px 8px";
+		clearBtn.style.border = "1px solid var(--interactive-normal)";
+		clearBtn.style.borderRadius = "4px";
+		clearBtn.style.backgroundColor = "var(--interactive-normal)";
+		clearBtn.style.cursor = "pointer";
+		clearBtn.onclick = async () => {
+			this.searchInput.value = "";
+			this.searchQuery = "";
+			await this.renderContent();
+		};
+
+		// Add expand/collapse all button
+		const expandCollapseBtn = filtersContainer.createEl("button");
+		addFilterButtonStyles(expandCollapseBtn);
+		expandCollapseBtn.setAttribute("aria-label", "Collapse all");
+		expandCollapseBtn.addClass("clickable-icon", "nav-action-button");
+		setIcon(expandCollapseBtn, "chevrons-down-up");
+		expandCollapseBtn.onclick = () => this.toggleExpandCollapseAll();
+
 		const body = this.contentEl.createDiv({ cls: "gn-body" });
 		this.treePane = body.createDiv({ cls: "gn-tree" });
 		this.editorPane = body.createDiv({ cls: "gn-editor" });
@@ -14582,6 +14771,12 @@ class CardBrowser extends NavigationAwareModal {
 			);
 
 			if (this.filter) cards = cards.filter(this.filter);
+			
+			// Apply search filter
+			if (this.searchQuery) {
+				cards = cards.filter(card => this.matchesSearch(card));
+			}
+			
 			if (this.showOnlyFlagged) cards = cards.filter((c) => c.flagged);
 			if (this.showOnlySuspended)
 				cards = cards.filter((c) => c.suspended);
@@ -14658,6 +14853,12 @@ class CardBrowser extends NavigationAwareModal {
 			const graph = await this.plugin.readDeck(deck.path);
 			let cardsInDeck = Object.values(graph);
 			if (this.filter) cardsInDeck = cardsInDeck.filter(this.filter);
+			
+			// Apply search filter
+			if (this.searchQuery) {
+				cardsInDeck = cardsInDeck.filter(card => this.matchesSearch(card));
+			}
+			
 			if (this.showOnlyFlagged)
 				cardsInDeck = cardsInDeck.filter((c) => c.flagged);
 			if (this.showOnlySuspended)
@@ -14763,6 +14964,112 @@ class CardBrowser extends NavigationAwareModal {
 		}, 50);
 	}
 
+	private matchesSearch(card: Flashcard): boolean {
+		if (!this.searchQuery) return true;
+
+		const query = this.searchQuery.toLowerCase();
+		
+		// Check for tag search: tag:"exact-tag"
+		const tagMatch = query.match(/tag:"([^"]+)"/);
+		if (tagMatch) {
+			const tagQuery = tagMatch[1];
+			return card.tag.toLowerCase() === tagQuery.toLowerCase();
+		}
+
+		// Check for tag search without quotes: tag:sometag
+		const simpleTagMatch = query.match(/tag:(\S+)/);
+		if (simpleTagMatch) {
+			const tagQuery = simpleTagMatch[1];
+			return card.tag.toLowerCase().includes(tagQuery.toLowerCase());
+		}
+
+		// Regular text search in front, back, and tag
+		const searchFields = [
+			card.front || "",
+			card.back || "", 
+			card.tag || ""
+		];
+
+		// Also search in variants
+		if (card.variants) {
+			card.variants.forEach(variant => {
+				searchFields.push(variant.front || "", variant.back || "");
+			});
+		}
+
+		return searchFields.some(field => 
+			field.toLowerCase().includes(query)
+		);
+	}
+
+	private saveBrowserState() {
+		// Convert Set to array for serialization
+		this.plugin.settings.cardBrowserExpandedSubjects = Array.from(this.state.openSubjects);
+		this.plugin.saveSettings();
+		
+		this.plugin.logger(
+			LogLevel.VERBOSE,
+			`CardBrowser: Saved state -> ${this.plugin.settings.cardBrowserExpandedSubjects.length} expanded subjects`
+		);
+	}
+
+	private loadBrowserState() {
+		// Convert array back to Set and merge with existing state
+		const savedSubjects = new Set(this.plugin.settings.cardBrowserExpandedSubjects);
+		
+		// Merge with any existing state (in case of multiple browser instances)
+		savedSubjects.forEach(subject => this.state.openSubjects.add(subject));
+		
+		this.plugin.logger(
+			LogLevel.VERBOSE,
+			`CardBrowser: Loaded state -> ${savedSubjects.size} expanded subjects restored`
+		);
+	}
+
+	private toggleExpandCollapseAll() {
+		// Find all details elements (subject folders) in the tree pane
+		const allDetails = this.treePane.querySelectorAll('details.gn-node') as NodeListOf<HTMLDetailsElement>;
+		
+		if (allDetails.length === 0) return;
+
+		// Check if majority are expanded to determine toggle direction
+		const expandedCount = Array.from(allDetails).filter(detail => detail.open).length;
+		const shouldExpand = expandedCount < allDetails.length / 2;
+
+		// Update button icon and label based on action
+		const expandCollapseBtn = this.contentEl.querySelector('button.nav-action-button') as HTMLButtonElement;
+		if (expandCollapseBtn) {
+			if (shouldExpand) {
+				expandCollapseBtn.setAttribute("aria-label", "Collapse all");
+				setIcon(expandCollapseBtn, "chevrons-down-up");
+			} else {
+				expandCollapseBtn.setAttribute("aria-label", "Expand all"); 
+				setIcon(expandCollapseBtn, "chevrons-up-down");
+			}
+		}
+
+		// Toggle all details and update state
+		allDetails.forEach(detail => {
+			detail.open = shouldExpand;
+			
+			// Extract subject name from the details summary
+			const summaryEl = detail.querySelector('summary');
+			if (summaryEl) {
+				const subject = summaryEl.textContent?.trim() || '';
+				if (shouldExpand) {
+					this.state.openSubjects.add(subject);
+				} else {
+					this.state.openSubjects.delete(subject);
+				}
+			}
+		});
+
+		this.plugin.logger(
+			LogLevel.VERBOSE,
+			`CardBrowser: ${shouldExpand ? 'Expanded' : 'Collapsed'} all ${allDetails.length} folders`
+		);
+	}
+
 	protected onCloseContent() {
 		this.plugin.logger(
 			LogLevel.VERBOSE,
@@ -14773,6 +15080,15 @@ class CardBrowser extends NavigationAwareModal {
 			"CardBrowser: onClose -> Final state on close:",
 			{ ...this.state, openSubjects: [...this.state.openSubjects] }
 		);
+		
+		// Save persistent browser state
+		this.saveBrowserState();
+		
+		// Clean up timeout
+		if (this.searchTimeout) {
+			clearTimeout(this.searchTimeout);
+		}
+		
 		this.contentEl.empty();
 	}
 }
