@@ -28,6 +28,12 @@ import { Buffer } from "buffer";
 import { encode } from "gpt-tokenizer";
 import { calculateCost as aicostCalculate } from "aicost";
 import OpenAI from "openai";
+import { NavigationAwareModal } from "./navigation-aware-modal";
+import { 
+	NavigationContextType, 
+	CardBrowserContext,
+	EditModalContext 
+} from "./navigation-stack";
 
 import * as JSZip from "jszip";
 
@@ -79,7 +85,7 @@ interface ReviewLog {
 /**
  * Represents a single flashcard within the system.
  */
-interface CardVariant {
+export interface CardVariant {
 	front: string;
 	back: string;
 }
@@ -93,7 +99,7 @@ interface MnemonicEntry {
 	source?: string; // The original text that generated this number (e.g., "4:9")
 }
 
-interface Flashcard {
+export interface Flashcard {
 	id: string;
 	// Legacy fields for backwards compatibility
 	front?: string;
@@ -207,6 +213,8 @@ interface CardBrowserState {
 	treeScroll: number;
 	editorScroll: number;
 	isFirstRender: boolean;
+	selectedDeckPath?: string;
+	selectedChapterPath?: string;
 }
 
 interface ExtractedImage {
@@ -2961,7 +2969,7 @@ export default class GatedNotesPlugin extends Plugin {
 	settings!: Settings;
 	public lastModalTransform: string | null = null;
 	private openai: OpenAI | null = null;
-	private cardBrowserState: CardBrowserState = {
+	public cardBrowserState: CardBrowserState = {
 		openSubjects: new Set(),
 		activeChapterPath: null,
 		treeScroll: 0,
@@ -3146,22 +3154,22 @@ export default class GatedNotesPlugin extends Plugin {
 				else if (card.status === "review") stats.byStatus.review++;
 				else if (card.status === "relearn") stats.byStatus.relearn++;
 
-				// State counts - only count non-blocked cards as due
-				if (card.due <= now && !card.blocked) stats.byState.due++;
+				// State counts - only count non-blocked, non-suspended cards as due
+				if (card.due <= now && !card.blocked && !card.suspended) stats.byState.due++;
 				if (card.blocked) stats.byState.blocked++;
 				if (card.suspended) stats.byState.suspended++;
 				if (card.buried) stats.byState.buried++;
 				if (card.flagged) stats.byState.flagged++;
 				if (card.paraIdx === undefined || card.paraIdx === null) stats.byState.missingParaIdx++;
 
-				// Subject counts - only count non-blocked cards as due
+				// Subject counts - only count non-blocked, non-suspended cards as due
 				const subject = this.subjectOf(card.chapter);
 				if (!subjectMap.has(subject)) {
 					subjectMap.set(subject, { total: 0, due: 0, blocked: 0 });
 				}
 				const subjectStats = subjectMap.get(subject)!;
 				subjectStats.total++;
-				if (card.due <= now && !card.blocked) subjectStats.due++;
+				if (card.due <= now && !card.blocked && !card.suspended) subjectStats.due++;
 				if (card.blocked) subjectStats.blocked++;
 			}
 		}
@@ -3327,7 +3335,7 @@ export default class GatedNotesPlugin extends Plugin {
 		this.addCommand({
 			id: "gn-browse-cards",
 			name: "Browse cards",
-			callback: () => new CardBrowser(this, this.cardBrowserState).open(),
+			callback: () => new CardBrowser(this, this.cardBrowserState).openWithNavigation(),
 		});
 
 		this.addCommand({
@@ -3733,7 +3741,7 @@ export default class GatedNotesPlugin extends Plugin {
 		});
 
 		this.addRibbonIcon("wallet-cards", "Card Browser", () => {
-			new CardBrowser(this, this.cardBrowserState).open();
+			new CardBrowser(this, this.cardBrowserState).openWithNavigation();
 		});
 
 		this.addRibbonIcon("bar-chart", "Study Overview", () => {
@@ -6748,19 +6756,26 @@ ${selection}
 						graph,
 						deck,
 						(actionTaken, newCards) => {
+							console.log("REVIEW MODAL DEBUG: actionTaken:", actionTaken, "newCards:", newCards?.length || 0);
 							if (actionTaken) {
-								state = "abort";
-								modal.close();
-
 								if (newCards && newCards.length > 0) {
-									this.promptToReviewNewCards(
-										newCards,
-										deck,
-										graph
-									);
+									console.log("REVIEW MODAL DEBUG: Have new cards, setting state to answered");
+									// We have new cards from split/refocus operation
+									// Set state to "answered" to continue the review session
+									state = "answered";
+									modal.close();
+									
+									// Don't start a separate review - let the new cards appear in future reviews
+									new Notice(`✅ Created ${newCards.length} new cards! They will appear in future reviews.`);
+								} else {
+									console.log("REVIEW MODAL DEBUG: No new cards, setting state to abort");
+									// No new cards, just a regular edit - abort to refresh
+									state = "abort";
+									modal.close();
 								}
 							}
 						},
+						//{ index: 1, total: 1 }, // Indicate we're in a review session
 						undefined,
 						"review"
 					);
@@ -6943,7 +6958,7 @@ ${selection}
 		reviewContext?: { index: number; total: number },
 		parentContext?: "edit" | "review"
 	): void {
-		new EditModal(this, card, graph, deck, onDone, reviewContext).open();
+		new EditModal(this, card, graph, deck, onDone, reviewContext).openWithNavigation();
 	}
 
 	/**
@@ -7024,8 +7039,8 @@ ${selection}
 					card,
 					graph,
 					deck,
-					(continueReview: boolean) => {
-						if (!continueReview) {
+					(actionTaken: boolean, newCards?: Flashcard[]) => {
+						if (!actionTaken) {
 							reviewAborted = true;
 						}
 						resolve();
@@ -7108,6 +7123,7 @@ ${selection}
 				const graph = await this.readDeck(deck.path);
 				for (const c of Object.values(graph)) {
 					if (c.due > now) continue;
+					if (c.suspended) continue; // Skip suspended cards
 					if (["new", "learning", "relearn"].includes(c.status)) {
 						learningDue++;
 					} else {
@@ -7191,14 +7207,49 @@ ${selection}
 
 		if (cards.length === 0) return undefined;
 		
+		// Debug logging for Feynman Lectures
+		if (chapterPath.includes("The Feynman Lectures on Physics Vol. 1") && 
+		    (chapterPath.includes("02_Basic Physics") || 
+		     chapterPath.includes("03_The Relation of Physics") || 
+		     chapterPath.includes("04_Conservation of Energy"))) {
+			console.log("🐛 BADGE DEBUG for:", chapterPath);
+			console.log("  Total cards:", cards.length);
+			console.log("  Blocked cards:", cards.filter(c => c.blocked).length);
+			console.log("  Suspended cards:", cards.filter(c => c.suspended).length);
+			console.log("  Due cards:", cards.filter(c => c.due <= Date.now()).length);
+			console.log("  Due non-suspended:", cards.filter(c => c.due <= Date.now() && !c.suspended).length);
+			console.log("  Sample card statuses:", cards.slice(0, 3).map(c => ({
+				blocked: c.blocked, 
+				suspended: c.suspended, 
+				status: c.status, 
+				due: c.due, 
+				now: Date.now(),
+				isDue: c.due <= Date.now()
+			})));
+		}
+		
 		// Filter out blocked cards for due/done status calculation
 		const nonBlockedCards = cards.filter((c) => !c.blocked);
 		
-		// If there are any blocked cards and no non-blocked cards, show blocked
-		if (nonBlockedCards.length === 0 && cards.some((c) => c.blocked)) return "blocked";
+		// If there are any blocked cards, show blocked
+		if (cards.some((c) => c.blocked)) {
+			if (chapterPath.includes("The Feynman Lectures on Physics Vol. 1")) {
+				console.log("  → Result: BLOCKED (hourglass)");
+			}
+			return "blocked";
+		}
 		
-		// Only check due status on non-blocked cards
-		if (nonBlockedCards.some((c) => c.due <= Date.now())) return "due";
+		// Only check due status on non-blocked, non-suspended cards
+		if (nonBlockedCards.some((c) => c.due <= Date.now() && !c.suspended)) {
+			if (chapterPath.includes("The Feynman Lectures on Physics Vol. 1")) {
+				console.log("  → Result: DUE (calendar)");
+			}
+			return "due";
+		}
+		
+		if (chapterPath.includes("The Feynman Lectures on Physics Vol. 1")) {
+			console.log("  → Result: DONE (checkmark) ❌ This shouldn't happen!");
+		}
 		return "done";
 	}
 
@@ -12644,7 +12695,7 @@ class ActionConfirmationModal extends Modal {
 /**
  * The primary modal for editing a flashcard's content and properties.
  */
-class EditModal extends Modal {
+class EditModal extends NavigationAwareModal {
 	private currentVariantIndex: number = 0;
 	private variantDropdown!: HTMLSelectElement;
 	private variantLabelEl!: HTMLLabelElement;
@@ -12654,7 +12705,7 @@ class EditModal extends Modal {
 	private currentMnemonics: MnemonicEntry[] = [];
 
 	constructor(
-		private plugin: GatedNotesPlugin,
+		protected plugin: GatedNotesPlugin,
 		private card: Flashcard,
 		private graph: FlashcardGraph,
 		private deck: TFile,
@@ -12662,12 +12713,12 @@ class EditModal extends Modal {
 		private reviewContext?: { index: number; total: number },
 		private parentContext?: "edit" | "review"
 	) {
-		super(plugin.app);
+		super(plugin.app, plugin);
 		// Ensure card has variants structure
 		this.plugin.ensureVariantsStructure(this.card);
 	}
 
-	onOpen() {
+	onOpenContent() {
 		makeModalDraggable(this, this.plugin);
 		this.titleEl.setText(
 			this.reviewContext
@@ -13466,12 +13517,18 @@ ${Array.from({length: isMultiple ? 3 : 1}, (_, i) => `    {"front": "…", "back
 						await this.plugin.writeDeck(this.deck.path, this.graph);
 
 						this.close();
-						await this.plugin.promptToReviewNewCards(
-							newCards,
-							this.deck,
-							this.graph
-						);
-						this.onDone(true);
+						
+						// If we're in a review context, pass the new cards to the callback instead of starting a separate review
+						if (this.reviewContext) {
+							this.onDone(true, newCards);
+						} else {
+							await this.plugin.promptToReviewNewCards(
+								newCards,
+								this.deck,
+								this.graph
+							);
+							this.onDone(true, newCards);
+						}
 					} catch (e: unknown) {
 						new Notice(
 							`Failed to generate cards: ${(e as Error).message}`
@@ -13582,19 +13639,30 @@ Return ONLY valid JSON array of this shape: [{"front":"...","back":"..."}]`;
 							});
 						}
 
-						delete this.graph[this.card.id];
+						// Suspend the original card instead of deleting it
+						this.graph[this.card.id].suspended = true;
 						newCards.forEach(
 							(newCard) => (this.graph[newCard.id] = newCard)
 						);
 						await this.plugin.writeDeck(this.deck.path, this.graph);
 
 						this.close();
-						await this.plugin.promptToReviewNewCards(
-							newCards,
-							this.deck,
-							this.graph
-						);
-						this.onDone(true);
+						
+						// If we're in a review context, pass the new cards to the callback instead of starting a separate review
+						console.log("SPLIT DEBUG: reviewContext:", this.reviewContext);
+						console.log("SPLIT DEBUG: newCards count:", newCards.length);
+						if (this.reviewContext) {
+							console.log("SPLIT DEBUG: In review context, calling onDone with newCards");
+							this.onDone(true, newCards);
+						} else {
+							console.log("SPLIT DEBUG: Not in review context, calling promptToReviewNewCards");
+							await this.plugin.promptToReviewNewCards(
+								newCards,
+								this.deck,
+								this.graph
+							);
+							this.onDone(true, newCards);
+						}
 					} catch (e: unknown) {
 						new Notice(
 							`Error splitting card: ${(e as Error).message}`
@@ -13674,6 +13742,39 @@ Return ONLY valid JSON array of this shape: [{"front":"...","back":"..."}]`;
 				new Notice(`${selectedMnemonics.length} mnemonics saved!`);
 			}
 		).open();
+	}
+
+	// NavigationAwareModal implementation
+	protected createNavigationContext(): EditModalContext {
+		return {
+			type: NavigationContextType.EDIT_MODAL,
+			id: this.generateContextId(),
+			title: this.reviewContext 
+				? `Edit Card ${this.reviewContext.index}/${this.reviewContext.total}`
+				: "Edit Card",
+			timestamp: Date.now(),
+			cardId: this.card.id,
+			deckPath: this.deck.path,
+			hasUnsavedChanges: false,
+			originalCard: { ...this.card }
+		};
+	}
+
+	protected restoreFromContext(context: EditModalContext): void {
+		// Context restoration - the card and deck should already be set from constructor
+		// We could restore form state here if we saved it
+		this.populateFieldsFromCurrentVariant();
+		this.updateMnemonicsDisplay();
+	}
+
+	protected saveToContext(): void {
+		// Save current form state to the current variant
+		this.saveCurrentVariant();
+	}
+
+	protected onCloseContent(): void {
+		// Clean up any resources specific to EditModal
+		this.currentMnemonics = [];
 	}
 }
 
@@ -14293,7 +14394,7 @@ class SplitOptionsModal extends Modal {
 /**
  * A modal that provides a tree-based browser for all flashcards in the vault.
  */
-class CardBrowser extends Modal {
+class CardBrowser extends NavigationAwareModal {
 	private showOnlyFlagged = false;
 	private showOnlySuspended = false;
 	private showOnlyNew = false;
@@ -14302,14 +14403,48 @@ class CardBrowser extends Modal {
 	private editorPane!: HTMLElement;
 
 	constructor(
-		private plugin: GatedNotesPlugin,
+		protected plugin: GatedNotesPlugin,
 		private state: CardBrowserState,
 		private filter?: (card: Flashcard) => boolean
 	) {
-		super(plugin.app);
+		super(plugin.app, plugin);
 	}
 
-	async onOpen() {
+	protected createNavigationContext(): CardBrowserContext {
+		return {
+			type: NavigationContextType.CARD_BROWSER,
+			id: this.generateContextId(),
+			title: "Card Browser",
+			timestamp: Date.now(),
+			searchQuery: undefined, // TODO: Add search functionality
+			selectedDeckPath: this.state.selectedDeckPath,
+			selectedChapterPath: this.state.selectedChapterPath,
+			scrollPosition: undefined,
+			selectedFolders: new Set() // TODO: Add multi-selection
+		};
+	}
+
+	protected restoreFromContext(context: CardBrowserContext): void {
+		// Restore browser state from context
+		if (context.selectedDeckPath) {
+			this.state.selectedDeckPath = context.selectedDeckPath;
+		}
+		if (context.selectedChapterPath) {
+			this.state.selectedChapterPath = context.selectedChapterPath;
+		}
+		// TODO: Restore search query, scroll position, etc.
+	}
+
+	protected saveToContext(): void {
+		if (this.context && this.context.type === NavigationContextType.CARD_BROWSER) {
+			const browserContext = this.context as CardBrowserContext;
+			browserContext.selectedDeckPath = this.state.selectedDeckPath;
+			browserContext.selectedChapterPath = this.state.selectedChapterPath;
+			// TODO: Save search query, scroll position, etc.
+		}
+	}
+
+	protected async onOpenContent() {
 		this.plugin.logger(
 			LogLevel.VERBOSE,
 			"CardBrowser: onOpen -> Initializing modal."
@@ -14628,7 +14763,7 @@ class CardBrowser extends Modal {
 		}, 50);
 	}
 
-	onClose() {
+	protected onCloseContent() {
 		this.plugin.logger(
 			LogLevel.VERBOSE,
 			"CardBrowser: onClose -> Closing modal."
