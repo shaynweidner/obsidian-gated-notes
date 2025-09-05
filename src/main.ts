@@ -54,8 +54,8 @@ const HIGHLIGHT_COLORS = {
 
 enum StudyMode {
 	REVIEW = "review",
-	CHAPTER = "chapter",
-	SUBJECT = "subject",
+	NOTE = "note",
+	CUSTOM_SESSION = "custom_session",
 }
 
 enum LogLevel {
@@ -2810,13 +2810,10 @@ class MajorSystemUtils {
 	static async loadCMUDictionary(plugin: GatedNotesPlugin): Promise<void> {
 		if (this.cmuDictionary || this.isLoading) return;
 		
-		console.log('🧠 Starting CMU dictionary loading...');
 		this.isLoading = true;
 		try {
 			// Load from embedded base64 dictionary
-			console.log('🧠 Loading compressed dictionary data...');
 			const { CMU_DICT_COMPRESSED_BASE64 } = await import('./cmudict-data');
-			console.log('🧠 Base64 data length:', CMU_DICT_COMPRESSED_BASE64.length, 'chars');
 			
 			// Decode base64 to binary data
 			const binaryString = atob(CMU_DICT_COMPRESSED_BASE64);
@@ -2824,32 +2821,22 @@ class MajorSystemUtils {
 			for (let i = 0; i < binaryString.length; i++) {
 				bytes[i] = binaryString.charCodeAt(i);
 			}
-			console.log('🧠 Decoded to binary, size:', bytes.length, 'bytes');
 			
 			// Decompress using pako
-			console.log('🧠 Decompressing with pako...');
 			const pako = await import('pako');
 			const decompressedData = pako.inflate(bytes, { to: 'string' });
 			const decompressed = decompressedData;
-			console.log('🧠 Decompressed size:', decompressed.length, 'chars');
 			
 			// Parse the JSON dictionary
 			const rawDict = JSON.parse(decompressed);
-			console.log('🧠 CMU dictionary parsed successfully, raw entries:', Object.keys(rawDict).length);
 			
 			// Process the dictionary - it's already organized by Major System digits!
-			console.log('🧠 Processing dictionary entries (already in Major System format)...');
 			this.cmuDictionary = {};
 			let processedDigits = 0;
 			let totalWords = 0;
 			
 			for (const [digits, wordList] of Object.entries(rawDict)) {
 				processedDigits++;
-				
-				// Debug first few entries to understand format
-				if (processedDigits <= 3) {
-					console.log(`🧠 Sample entry: digit "${digits}" ->`, wordList, `(type: ${typeof wordList}, length: ${Array.isArray(wordList) ? wordList.length : 'N/A'})`);
-				}
 				
 				// Validate that wordList is an array of word objects
 				if (Array.isArray(wordList)) {
@@ -2868,73 +2855,11 @@ class MajorSystemUtils {
 				}
 			}
 			
-			console.log('🧠 CMU dictionary processed successfully!');
-			console.log('🧠 Processed digit patterns:', processedDigits);
-			console.log('🧠 Valid digit patterns with words:', Object.keys(this.cmuDictionary).length);
-			console.log('🧠 Total words loaded:', totalWords);
-			
-			// Log some examples for debugging
-			console.log('🧠 Sample mappings:');
-			const sampleDigits = ['8', '3', '83', '1', '2', '12'];
-			for (const digits of sampleDigits) {
-				const words = this.cmuDictionary[digits];
-				if (words && words.length > 0) {
-					console.log(`🧠   ${digits} -> [${words.slice(0, 3).map(w => w.word).join(', ')}] (${words.length} total)`);
-				} else {
-					console.log(`🧠   ${digits} -> no words found`);
-				}
-			}
-			
 		} catch (error) {
 			console.warn('Failed to load CMU dictionary, using fallback:', error);
 		} finally {
 			this.isLoading = false;
 		}
-	}
-
-	private static pronunciationToDigits(pronunciation: any): string | null {
-		const digits: string[] = [];
-		
-		// Handle different possible formats
-		let phonemes: string[] = [];
-		if (Array.isArray(pronunciation)) {
-			phonemes = pronunciation;
-		} else if (typeof pronunciation === 'string') {
-			// If it's a string, split by spaces
-			phonemes = pronunciation.split(' ');
-		} else {
-			console.warn('🧠 Unexpected pronunciation format:', pronunciation);
-			return null;
-		}
-		
-		for (const phoneme of phonemes) {
-			if (typeof phoneme !== 'string') {
-				console.warn('🧠 Non-string phoneme:', phoneme);
-				continue;
-			}
-			
-			// Remove stress markers (digits) from phonemes
-			const cleanPhoneme = phoneme.replace(/\d+$/, '');
-			const digit = this.PHONEME_TO_DIGIT[cleanPhoneme];
-			if (digit !== undefined) {
-				digits.push(digit);
-			}
-		}
-		
-		return digits.length > 0 ? digits.join('') : null;
-	}
-
-	private static getWordFrequency(word: string): number {
-		// Basic frequency estimation based on word length and common patterns
-		// This is a simplified approach - ideally we'd use actual frequency data
-		const baseFreq = 1000;
-		const lengthBonus = Math.max(0, 5 - word.length) * 100; // Prefer shorter words
-		
-		// Bonus for common words
-		const commonWords = ['the', 'and', 'you', 'are', 'not', 'can', 'had', 'her', 'was', 'one', 'our', 'out', 'day', 'get', 'has', 'him', 'his', 'how', 'its', 'may', 'new', 'now', 'old', 'see', 'two', 'way', 'who', 'boy', 'did', 'man', 'car', 'eat', 'job', 'let', 'put', 'end', 'far', 'fun', 'got', 'home', 'left', 'life', 'live', 'look', 'made', 'make', 'move', 'must', 'name', 'need', 'open', 'over', 'play', 'read', 'right', 'run', 'same', 'show', 'take', 'tell', 'turn', 'walk', 'want', 'well', 'went', 'were', 'what', 'when', 'will', 'work', 'year'];
-		const commonBonus = commonWords.includes(word.toLowerCase()) ? 2000 : 0;
-		
-		return baseFreq + lengthBonus + commonBonus;
 	}
 
 	static getWordCandidates(number: string, maxCandidates: number = 12): string[] {
@@ -3050,7 +2975,9 @@ export default class GatedNotesPlugin extends Plugin {
 	private gatingStatus!: HTMLElement;
 	private cardsMissingParaIdxStatus!: HTMLElement;
 	private statusRefreshQueued = false;
-	private studyMode: StudyMode = StudyMode.CHAPTER;
+	private studyMode: StudyMode = StudyMode.NOTE;
+	private customSessionPaths: string[] = []; // Selected folders for custom session
+	private customSessionExcludeNewCards: boolean = true; // Whether to exclude new cards in custom session
 	private isRecalculatingAll = false;
 
 	// Enhanced image management services
@@ -3060,6 +2987,130 @@ export default class GatedNotesPlugin extends Plugin {
 
 	private subjectOf(path: string): string {
 		return path.split("/")[0] ?? "";
+	}
+
+	private showCustomSessionDialog(): void {
+		const modal = new CustomSessionDialog(this.app, (selectedPaths: string[], excludeNewCards: boolean) => {
+			this.customSessionPaths = selectedPaths;
+			this.customSessionExcludeNewCards = excludeNewCards;
+			this.studyMode = StudyMode.CUSTOM_SESSION;
+			
+			let pathDisplay = "Vault Root";
+			if (selectedPaths.length > 0) {
+				if (selectedPaths.length === 1) {
+					pathDisplay = selectedPaths[0];
+				} else {
+					pathDisplay = `${selectedPaths.length} folders`;
+				}
+			}
+			
+			const modeText = excludeNewCards ? " (review-only)" : "";
+			new Notice(`📁 Custom session: ${pathDisplay}${modeText}`);
+			this.reviewDue();
+		});
+		modal.open();
+	}
+
+	private async getCardsForCustomSession(): Promise<Flashcard[]> {
+		if (this.customSessionPaths.length === 0) {
+			// Fallback to all cards if no path selected
+			const allDeckFiles = this.app.vault
+				.getFiles()
+				.filter((f) => f.name === DECK_FILE_NAME);
+			
+			const allCards: Flashcard[] = [];
+			for (const deckFile of allDeckFiles) {
+				try {
+					const content = await this.app.vault.read(deckFile);
+					const deckCards = JSON.parse(content);
+					allCards.push(...(Object.values(deckCards) as Flashcard[]));
+				} catch (error) {
+					console.warn(`Could not read deck ${deckFile.path}:`, error);
+				}
+			}
+			
+			// Filter out new cards if the option is selected
+			if (this.customSessionExcludeNewCards) {
+				return allCards.filter(card => !isUnseen(card));
+			}
+			
+			return allCards;
+		}
+
+		// Separate note paths and folder paths
+		const notePaths: string[] = [];
+		const folderPaths: string[] = [];
+		
+		for (const path of this.customSessionPaths) {
+			if (path.endsWith(".md")) {
+				notePaths.push(path);
+			} else {
+				folderPaths.push(path);
+			}
+		}
+
+		const cards: Flashcard[] = [];
+
+		// Handle specific note selections
+		for (const notePath of notePaths) {
+			const folderPath = notePath.substring(0, notePath.lastIndexOf("/"));
+			const deckPath = folderPath + "/" + DECK_FILE_NAME;
+			
+			try {
+				const deckFile = this.app.vault.getAbstractFileByPath(deckPath);
+				if (deckFile instanceof TFile) {
+					const content = await this.app.vault.read(deckFile);
+					const deckCards = JSON.parse(content);
+					
+					// Filter cards that belong to this specific note
+					const noteCards = Object.values(deckCards).filter((card: any) => 
+						card.chapter === notePath
+					) as Flashcard[];
+					
+					cards.push(...noteCards);
+				}
+			} catch (error) {
+				console.warn(`Could not read deck for note ${notePath}:`, error);
+			}
+		}
+
+		// Handle folder selections (include all notes in folder and subfolders)
+		const targetDeckFiles = this.app.vault
+			.getFiles()
+			.filter((f) => {
+				if (f.name !== DECK_FILE_NAME) return false;
+				
+				// Get the folder path of this deck file
+				const folderPath = f.path.replace(`/${DECK_FILE_NAME}`, "");
+				
+				// Include if it's in any selected folder path or a subfolder of selected paths
+				return folderPaths.some(selectedPath => 
+					folderPath === selectedPath || 
+					folderPath.startsWith(`${selectedPath}/`)
+				);
+			});
+
+		for (const deckFile of targetDeckFiles) {
+			try {
+				const content = await this.app.vault.read(deckFile);
+				const deckCards = JSON.parse(content);
+				cards.push(...(Object.values(deckCards) as Flashcard[]));
+			} catch (error) {
+				console.warn(`Could not read deck ${deckFile.path}:`, error);
+			}
+		}
+
+		// Remove duplicates (in case a note is selected both individually and via its folder)
+		const uniqueCards = cards.filter((card, index, self) => 
+			index === self.findIndex(c => c.id === card.id)
+		);
+
+		// Filter out new cards if the option is selected
+		if (this.customSessionExcludeNewCards) {
+			return uniqueCards.filter(card => !isUnseen(card));
+		}
+
+		return uniqueCards;
 	}
 
 	public async gatherVaultStatistics(): Promise<{
@@ -3665,16 +3716,14 @@ export default class GatedNotesPlugin extends Plugin {
 	}
 
 	private registerRibbonIcons(): void {
-		this.addRibbonIcon("target", "Chapter focus", () => {
-			this.studyMode = StudyMode.CHAPTER;
-			new Notice("🎯 Chapter focus mode");
+		this.addRibbonIcon("target", "Note focus", () => {
+			this.studyMode = StudyMode.NOTE;
+			new Notice("🎯 Note focus mode");
 			this.reviewDue();
 		});
 
-		this.addRibbonIcon("library", "Subject focus", () => {
-			this.studyMode = StudyMode.SUBJECT;
-			new Notice("📚 Subject focus mode");
-			this.reviewDue();
+		this.addRibbonIcon("library", "Custom session", () => {
+			this.showCustomSessionDialog();
 		});
 
 		this.addRibbonIcon("brain", "Review-only focus", () => {
@@ -3900,7 +3949,7 @@ export default class GatedNotesPlugin extends Plugin {
 		}
 		
 		// Skip interleaving for chapter mode or if disabled
-		if (this.studyMode === StudyMode.CHAPTER || !this.settings.enableInterleaving) {
+		if (this.studyMode === StudyMode.NOTE || !this.settings.enableInterleaving) {
 			this.logger(LogLevel.VERBOSE, `Interleaving: Skipped (mode=${this.studyMode}, enabled=${this.settings.enableInterleaving}), selecting index 0`);
 			return 0; // Just take the first card (already sorted)
 		}
@@ -4073,126 +4122,128 @@ export default class GatedNotesPlugin extends Plugin {
 		const now = Date.now();
 		const dueThreshold = futureTimeMs ? now + futureTimeMs : now;
 
-		const allDeckFiles = this.app.vault
-			.getFiles()
-			.filter((f) => f.name.endsWith(DECK_FILE_NAME));
+		// Handle different study modes with different file discovery strategies
+		let allCards: Flashcard[] = [];
+		let relevantDeckFiles: TFile[] = [];
 
-		for (const deck of allDeckFiles) {
-			const graph = await this.readDeck(deck.path);
-			let cardsInScope: Flashcard[];
-
-			switch (this.studyMode) {
-				case StudyMode.CHAPTER:
-					cardsInScope = Object.values(graph).filter(
-						(c) => c.chapter === activePath
-					);
-					break;
-				case StudyMode.SUBJECT:
-					cardsInScope = Object.values(graph).filter(
-						(c) => this.subjectOf(c.chapter) === this.subjectOf(activePath)
-					);
-					break;
-				case StudyMode.REVIEW:
-				default:
-					cardsInScope = Object.values(graph);
-					break;
-			}
-
-			let firstBlockedParaIdx = Infinity;
-			if (this.studyMode === StudyMode.CHAPTER) {
-				const blockedCards = cardsInScope.filter(
-					(c) => c.blocked && !c.suspended && !isBuried(c)
-				);
-				if (blockedCards.length > 0) {
-					firstBlockedParaIdx = Math.min(
-						...blockedCards.map((c) => c.paraIdx ?? Infinity)
-					);
-				}
-				
-				// Debug logging for the problematic chapter
-				if (activePath.includes("02_True Happiness - Aristotle") || activePath.includes("A History of the Bible/00 Introduction")) {
-					this.logger(LogLevel.VERBOSE, `Chapter focus mode - blocked card analysis for ${activePath}:`, {
-						totalCardsInScope: cardsInScope.length,
-						blockedCardsCount: blockedCards.length,
-						firstBlockedParaIdx,
-						blockedCardParaIndices: blockedCards.map(c => ({ paraIdx: c.paraIdx, front: c.front?.substring(0, 30) }))
-					});
-				}
-			}
-
-			for (const card of cardsInScope) {
-				// Debug logging for the problematic chapter
-				if (card.chapter.includes("02_True Happiness - Aristotle")) {
-					this.logger(LogLevel.VERBOSE, `Reviewing card filtering for: ${card.front?.substring(0, 50)}...`, {
-						suspended: card.suspended,
-						due: card.due,
-						dueThreshold,
-						isDue: card.due <= dueThreshold,
-						paraIdx: card.paraIdx,
-						firstBlockedParaIdx,
-						isInRange: (card.paraIdx ?? Infinity) <= firstBlockedParaIdx,
-						blocked: card.blocked,
-						status: card.status
-					});
-				}
-				
-				if (card.suspended) continue;
-				if (card.due > dueThreshold) continue;
-
-				if (this.studyMode === StudyMode.CHAPTER) {
-					// In chapter mode, we want to include:
-					// 1. All cards at or before the first blocked paragraph 
-					// 2. Blocked cards that are due AND not new (so they can be reviewed to unblock progress)
-					const cardParaIdx = card.paraIdx ?? Infinity;
-					const isNew = isUnseen(card);
-					const isBlockedAndDue = card.blocked && card.due <= dueThreshold && !isNew;
-					
-					if (cardParaIdx > firstBlockedParaIdx && !isBlockedAndDue) {
-						if (card.chapter.includes("02_True Happiness - Aristotle") || card.chapter.includes("A History of the Bible/00 Introduction")) {
-							this.logger(LogLevel.VERBOSE, `EXCLUDED card: "${card.front?.substring(0, 50)}..." (paraIdx: ${cardParaIdx}, firstBlockedParaIdx: ${firstBlockedParaIdx}, blocked: ${card.blocked}, due: ${card.due <= dueThreshold}, new: ${isNew})`);
-						}
-						continue;
+		switch (this.studyMode) {
+			case StudyMode.NOTE:
+				// Only read the deck file for the current note's folder
+				const noteDeckPath = getDeckPathForChapter(activePath);
+				if (await this.app.vault.adapter.exists(noteDeckPath)) {
+					const deckFile = this.app.vault.getAbstractFileByPath(noteDeckPath) as TFile;
+					if (deckFile) {
+						relevantDeckFiles = [deckFile];
 					}
-					
-					if (card.chapter.includes("02_True Happiness - Aristotle") || card.chapter.includes("A History of the Bible/00 Introduction")) {
-						this.logger(LogLevel.VERBOSE, `INCLUDED card: "${card.front?.substring(0, 50)}..." (paraIdx: ${cardParaIdx}, firstBlockedParaIdx: ${firstBlockedParaIdx}, blocked: ${card.blocked}, due: ${card.due <= dueThreshold}, new: ${isNew})`);
-					}
-				} else {
-					// In other modes (Subject, Review-only), we don't want to see new cards.
-					const isNew = isUnseen(card);
-					if (isNew) continue;
 				}
-				reviewPool.push({ card, deck });
+				break;
+				
+			case StudyMode.CUSTOM_SESSION:
+				// Get cards from selected folder and subfolders
+				allCards = await this.getCardsForCustomSession();
+				break;
+				
+			case StudyMode.REVIEW:
+			default:
+				// Read all deck files in vault
+				relevantDeckFiles = this.app.vault
+					.getFiles()
+					.filter((f) => f.name.endsWith(DECK_FILE_NAME));
+				break;
+		}
+
+		// For modes that use relevantDeckFiles, read and filter the cards
+		if (relevantDeckFiles.length > 0) {
+			for (const deck of relevantDeckFiles) {
+				const graph = await this.readDeck(deck.path);
+				let cardsInScope: Flashcard[];
+
+				switch (this.studyMode) {
+					case StudyMode.NOTE:
+						cardsInScope = Object.values(graph).filter(
+							(c) => c.chapter === activePath
+						);
+						break;
+					case StudyMode.REVIEW:
+					default:
+						cardsInScope = Object.values(graph);
+						break;
+				}
+
+				// Convert to the expected format with deck reference
+				for (const card of cardsInScope) {
+					allCards.push(card);
+				}
 			}
 		}
 
-		// Debug logging for the final review pool
-		const aristotleCards = reviewPool.filter(({card}) => card.chapter.includes("02_True Happiness - Aristotle"));
-		if (aristotleCards.length > 0) {
-			this.logger(LogLevel.VERBOSE, `Final review pool for Aristotle chapter:`, {
-				totalCards: aristotleCards.length,
-				cards: aristotleCards.map(({card}) => ({
-					front: card.front?.substring(0, 50),
-					paraIdx: card.paraIdx,
-					status: card.status,
-					blocked: card.blocked,
-					due: new Date(card.due).toISOString()
-				}))
-			});
-		} else if (this.studyMode === StudyMode.CHAPTER && reviewPool.length === 0) {
-			this.logger(LogLevel.VERBOSE, `No cards found in review pool for chapter mode`);
+		// Calculate blocked paragraph index for note mode
+		let firstBlockedParaIdx = Infinity;
+		if (this.studyMode === StudyMode.NOTE) {
+			const blockedCards = allCards.filter(
+				(c) => c.blocked && !c.suspended && !isBuried(c)
+			);
+			if (blockedCards.length > 0) {
+				firstBlockedParaIdx = Math.min(
+					...blockedCards.map((c) => c.paraIdx ?? Infinity)
+				);
+			}
+		}
+
+		// Now process all collected cards for review pool
+		for (const card of allCards) {
+			if (card.suspended) continue;
+			if (card.due > dueThreshold) continue;
+
+			// In review-only mode, never include new cards
+			if (this.studyMode === StudyMode.REVIEW && isUnseen(card)) {
+				continue;
+			}
+
+			if (this.studyMode === StudyMode.NOTE) {
+				// In note mode, we want to include:
+				// 1. All cards at or before the first blocked paragraph 
+				// 2. Blocked cards that are due AND not new (so they can be reviewed to unblock progress)
+				const cardParaIdx = card.paraIdx ?? Infinity;
+				const isNew = isUnseen(card);
+				const isBlockedAndDue = card.blocked && card.due <= dueThreshold && !isNew;
+				
+				if (cardParaIdx > firstBlockedParaIdx && !isBlockedAndDue) {
+					continue;
+				}
+			}
+
+			// Find the deck file for this card
+			const cardDeckPath = getDeckPathForChapter(card.chapter);
+			const deckFile = this.app.vault.getAbstractFileByPath(cardDeckPath) as TFile;
+			
+			if (!deckFile) {
+				console.warn(`Could not find deck file for card: ${cardDeckPath}`);
+				continue;
+			}
+
+			reviewPool.push({ card, deck: deckFile });
+		}
+
+		if (this.studyMode === StudyMode.NOTE && reviewPool.length === 0) {
+			this.logger(LogLevel.VERBOSE, `No cards found in review pool for note mode`);
 		}
 
 		reviewPool.sort((a, b) => {
 			const aIsNew = isUnseen(a.card);
 			const bIsNew = isUnseen(b.card);
 
-			// In chapter focus mode, respect the review-before-new setting
-			if (this.studyMode === StudyMode.CHAPTER) {
+			// In note focus mode, respect the review-before-new setting
+			if (this.studyMode === StudyMode.NOTE) {
 				if (aIsNew !== bIsNew) {
 					return this.settings.chapterFocusReviewsFirst 
 						? (aIsNew ? 1 : -1)  // Reviews first (non-new before new)
 						: (aIsNew ? -1 : 1); // New first (new before non-new) - original behavior
+				}
+			} else if (this.studyMode === StudyMode.CUSTOM_SESSION) {
+				// In custom session mode, always put review cards before new cards
+				if (aIsNew !== bIsNew) {
+					return aIsNew ? 1 : -1; // Reviews first (non-new before new)
 				}
 			} else {
 				// In other modes, new cards (if they were to be included) would come first.
@@ -15000,8 +15051,8 @@ class ReviewAheadModal extends Modal {
 		contentEl.empty();
 
 		const modeNames = {
-			[StudyMode.CHAPTER]: "chapter",
-			[StudyMode.SUBJECT]: "subject", 
+			[StudyMode.NOTE]: "note",
+			[StudyMode.CUSTOM_SESSION]: "custom session", 
 			[StudyMode.REVIEW]: "review-only"
 		};
 
@@ -16472,6 +16523,344 @@ async function logLlmCall(
 	log.push(newEntry);
 
 	await plugin.app.vault.adapter.write(logPath, JSON.stringify(log, null, 2));
+}
+
+interface TreeNode {
+	name: string;
+	path: string;
+	type: "folder" | "note";
+	children: Map<string, TreeNode>;
+	expanded: boolean;
+	hasChildren: boolean;
+}
+
+/**
+ * Dialog for selecting a folder for custom session study mode
+ */
+class CustomSessionDialog extends Modal {
+	private selectedPaths: Set<string> = new Set();
+	private excludeNewCards: boolean = true;
+	private treeStructure: TreeNode | null = null;
+
+	constructor(app: App, private onConfirm: (paths: string[], excludeNewCards: boolean) => void) {
+		super(app);
+	}
+
+	onOpen() {
+		this.titleEl.setText("📁 Select Custom Session Folder");
+
+		const { contentEl } = this;
+		contentEl.empty();
+
+		// Description
+		contentEl.createEl("p", {
+			text: "Select folders to study flashcards from those folders and their subfolders. Click folders to toggle selection:",
+		});
+
+		// Exclude new cards option
+		const optionsContainer = contentEl.createEl("div", {
+			attr: { style: "margin: 15px 0; padding: 10px; border: 1px solid var(--background-modifier-border); border-radius: 4px;" }
+		});
+
+		optionsContainer.createEl("h4", { text: "Study Options:" });
+		
+		const radioContainer = optionsContainer.createEl("div", {
+			attr: { style: "display: flex; align-items: center; gap: 10px;" }
+		});
+
+		const excludeNewCardsCheckbox = radioContainer.createEl("input", {
+			type: "checkbox",
+			attr: { id: "exclude-new-cards-checkbox" }
+		});
+		excludeNewCardsCheckbox.checked = this.excludeNewCards;
+		
+		radioContainer.createEl("label", {
+			text: "Exclude new cards (review-only mode)",
+			attr: { for: "exclude-new-cards-checkbox" }
+		});
+
+		excludeNewCardsCheckbox.onchange = () => {
+			this.excludeNewCards = excludeNewCardsCheckbox.checked;
+		};
+
+		// Build folder tree from existing deck files
+		this.buildFolderTree(contentEl);
+
+		// Buttons
+		const buttonContainer = contentEl.createEl("div", {
+			cls: "modal-button-container",
+		});
+
+		buttonContainer.createEl("button", {
+			text: "Study Vault Root",
+			cls: "mod-cta",
+		}).onclick = () => {
+			this.onConfirm([], this.excludeNewCards);
+			this.close();
+		};
+
+		buttonContainer.createEl("button", {
+			text: "Cancel",
+		}).onclick = () => {
+			this.close();
+		};
+	}
+
+	private buildFolderTree(container: HTMLElement) {
+		// Build folder structure with expandable folders and note files
+		const treeContainer = container.createEl("div", {
+			cls: "custom-session-tree",
+			attr: { 
+				style: "max-height: 300px; overflow-y: auto; border: 1px solid var(--background-modifier-border); padding: 10px; margin: 10px 0;" 
+			}
+		});
+
+		// Get all finalized notes (notes that have _flashcards.json in their folder)
+		const finalizedNotes = this.getFinalizedNotes();
+		
+		// Build tree structure starting from root level
+		this.treeStructure = this.buildTreeStructure(finalizedNotes);
+		
+		// Render the tree starting from root
+		this.renderTreeLevel(treeContainer, this.treeStructure, "", 0, container);
+	}
+
+	private getFinalizedNotes(): string[] {
+		const deckFiles = this.app.vault
+			.getFiles()
+			.filter((f) => f.name === DECK_FILE_NAME);
+
+		const finalizedNotes: string[] = [];
+
+		for (const deckFile of deckFiles) {
+			const folderPath = deckFile.path.replace(`/${DECK_FILE_NAME}`, "");
+			
+			// Find all markdown files in this folder
+			const notesInFolder = this.app.vault
+				.getFiles()
+				.filter(f => 
+					f.extension === "md" && 
+					(folderPath === "" ? !f.path.includes("/") : f.path.startsWith(folderPath + "/") && f.path.split("/").length === folderPath.split("/").length + 1)
+				)
+				.map(f => f.path);
+
+			finalizedNotes.push(...notesInFolder);
+		}
+
+		return finalizedNotes;
+	}
+
+	private buildTreeStructure(finalizedNotes: string[]): TreeNode {
+		const root: TreeNode = { 
+			name: "", 
+			path: "", 
+			type: "folder", 
+			children: new Map(), 
+			expanded: false,
+			hasChildren: false
+		};
+
+		// Add all finalized notes to the tree structure
+		for (const notePath of finalizedNotes) {
+			this.addNoteToTree(root, notePath);
+		}
+
+		// Remove empty folders recursively
+		this.pruneEmptyFolders(root);
+
+		return root;
+	}
+
+	private addNoteToTree(root: TreeNode, notePath: string) {
+		const parts = notePath.split("/");
+		let currentNode = root;
+
+		// Navigate through folders
+		for (let i = 0; i < parts.length - 1; i++) {
+			const folderName = parts[i];
+			const folderPath = parts.slice(0, i + 1).join("/");
+
+			if (!currentNode.children.has(folderName)) {
+				currentNode.children.set(folderName, {
+					name: folderName,
+					path: folderPath,
+					type: "folder",
+					children: new Map(),
+					expanded: false,
+					hasChildren: false
+				});
+			}
+
+			currentNode = currentNode.children.get(folderName)!;
+		}
+
+		// Add the note file
+		const fileName = parts[parts.length - 1];
+		const noteName = fileName.replace(".md", "");
+		
+		currentNode.children.set(fileName, {
+			name: noteName,
+			path: notePath,
+			type: "note",
+			children: new Map(),
+			expanded: false,
+			hasChildren: false
+		});
+	}
+
+	private pruneEmptyFolders(node: TreeNode): boolean {
+		if (node.type === "note") {
+			return true; // Notes are always kept
+		}
+
+		// Check children recursively
+		const childrenToKeep: string[] = [];
+		for (const [childName, child] of node.children) {
+			if (this.pruneEmptyFolders(child)) {
+				childrenToKeep.push(childName);
+			}
+		}
+
+		// Remove empty children
+		for (const [childName] of node.children) {
+			if (!childrenToKeep.includes(childName)) {
+				node.children.delete(childName);
+			}
+		}
+
+		// Update hasChildren flag
+		node.hasChildren = node.children.size > 0;
+
+		// Return true if this folder should be kept (has children)
+		return node.children.size > 0 || node.path === ""; // Always keep root
+	}
+
+	private renderTreeLevel(
+		treeContainer: HTMLElement,
+		treeNode: TreeNode,
+		currentPath: string,
+		level: number,
+		container: HTMLElement
+	) {
+		// Sort children: folders first, then notes, both alphabetically
+		const sortedChildren = Array.from(treeNode.children.entries()).sort(([aName, aNode], [bName, bNode]) => {
+			if (aNode.type !== bNode.type) {
+				return aNode.type === "folder" ? -1 : 1;
+			}
+			return aName.localeCompare(bName);
+		});
+
+		for (const [childName, childNode] of sortedChildren) {
+			const element = treeContainer.createEl("div", {
+				cls: childNode.type === "folder" ? "custom-session-folder" : "custom-session-note",
+				attr: { 
+					style: `margin-left: ${level * 20}px; padding: 4px; cursor: pointer; border-radius: 4px; display: flex; align-items: center;`,
+					"data-path": childNode.path
+				}
+			});
+
+			// Add expand/collapse icon for folders with children
+			if (childNode.type === "folder" && childNode.hasChildren) {
+				const expandIcon = element.createEl("span", {
+					text: childNode.expanded ? "▼" : "▶",
+					attr: { 
+						style: "margin-right: 4px; font-size: 10px; cursor: pointer;",
+						"data-action": "expand"
+					}
+				});
+
+				expandIcon.onclick = (e) => {
+					e.stopPropagation();
+					// Toggle expansion
+					childNode.expanded = !childNode.expanded;
+					this.rebuildTree(treeContainer, container);
+				};
+			} else {
+				// Spacer for alignment
+				element.createEl("span", {
+					text: " ",
+					attr: { style: "margin-right: 14px;" }
+				});
+			}
+
+			// Add icon and name
+			const icon = childNode.type === "folder" ? "📁" : "📝";
+			const contentEl = element.createEl("span", {
+				text: `${icon} ${childNode.name}`,
+			});
+
+			// Apply selection styling
+			if (this.selectedPaths.has(childNode.path)) {
+				element.addClass("selected");
+				element.style.backgroundColor = "var(--interactive-accent)";
+				element.style.color = "var(--text-on-accent)";
+			}
+
+			// Handle selection toggle (avoid clicking on expand icon)
+			element.onclick = (e) => {
+				if ((e.target as HTMLElement).getAttribute("data-action") === "expand") {
+					return; // Let expand icon handle this
+				}
+
+				e.stopPropagation();
+				
+				// Toggle selection
+				const isSelected = this.selectedPaths.has(childNode.path);
+				if (isSelected) {
+					this.selectedPaths.delete(childNode.path);
+				} else {
+					this.selectedPaths.add(childNode.path);
+				}
+				
+				this.rebuildTree(treeContainer, container);
+				this.updateConfirmButton(container);
+			};
+
+			// Recursively render expanded children
+			if (childNode.type === "folder" && childNode.expanded && childNode.hasChildren) {
+				this.renderTreeLevel(treeContainer, childNode, childNode.path, level + 1, container);
+			}
+		}
+	}
+
+	private rebuildTree(treeContainer: HTMLElement, container: HTMLElement) {
+		// Clear and re-render the tree to maintain expansion and selection state
+		treeContainer.empty();
+		
+		// Re-render using existing tree structure (preserves expansion state)
+		if (this.treeStructure) {
+			this.renderTreeLevel(treeContainer, this.treeStructure, "", 0, container);
+		}
+	}
+
+	private updateConfirmButton(container: HTMLElement) {
+		const confirmBtn = container.querySelector(".mod-cta") as HTMLButtonElement;
+		if (!confirmBtn) return;
+
+		const selectedCount = this.selectedPaths.size;
+		
+		if (selectedCount === 0) {
+			confirmBtn.textContent = "Study Vault Root";
+			confirmBtn.onclick = () => {
+				this.onConfirm([], this.excludeNewCards);
+				this.close();
+			};
+		} else {
+			const folderText = selectedCount === 1 
+				? "1 folder" 
+				: `${selectedCount} folders`;
+			confirmBtn.textContent = `Study ${folderText}`;
+			confirmBtn.onclick = () => {
+				this.onConfirm(Array.from(this.selectedPaths), this.excludeNewCards);
+				this.close();
+			};
+		}
+	}
+
+	onClose() {
+		this.selectedPaths.clear();
+		this.treeStructure = null;
+	}
 }
 
 class StudyOverviewModal extends Modal {
