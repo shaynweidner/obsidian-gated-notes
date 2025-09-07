@@ -8,18 +8,20 @@ Instead of passively consuming information, you must _earn_ your way through a n
 
 ---
 
-## ✨ What's New in v2.6.0: The Interactive PDF & Smart Review Update!
+## ✨ What's New: The Card Browser & Study Mode Revolution!
 
-This is a massive update focused on giving you unprecedented control over PDF conversions and making your study sessions smarter.
+This release fundamentally transforms the Card Browser with a complete search system and introduces a revolutionary study mode architecture. The old rigid folder structure has been replaced with flexible nested folder support and a powerful custom session system launched directly from the Card Browser.
 
--   **📄 Interactive PDF Editor:** After converting a PDF, a new editor opens allowing you to edit the markdown, view all extracted images, place them, rotate them, and even **stitch** fragmented images together.
--   **✂️ Universal Snipping Tool:** Capture images from your clipboard, a file, or snip a region directly from a PDF to add to your notes.
--   **🔀 Smart Interleaving:** Reviews are now less predictable! The plugin uses a weighted algorithm to show you more overdue cards first.
--   **⏰ Smart Due Time Notifications:** After answering cards, see exactly when they're due next ("due in 2 hours", "due tomorrow", etc.).
--   **🃏 Card Variants System:** Create multiple phrasings of the same flashcard that share progress data but provide variety in reviews.
--   **🔄 Review Ahead:** Don't stop when your queue is empty. The plugin now lets you review cards that are due in the near future.
--   **🧹 Unused Image Cleaner:** A new command to find and delete images in your vault that are no longer used in any notes.
--   **🎨 UI Enhancements:** New filters and status icons (🌱 for new cards) in the Card Browser make managing your collection easier than ever.
+-   **🔍 Complete Card Browser Search & Related Cards:** Brand-new search system with full-text search, advanced tag search (`tag:"exact-tag"`), MathJax rendering, and "Related: X" buttons that instantly find cards sharing the same tags. Performance-optimized with smart result limiting.
+-   **🎯 Study Mode Revolution:** Complete overhaul of study modes with nested folder support:
+    -   **Note Mode** (replaces Chapter Mode): Now supports nested folder structures instead of requiring flat ./subject/chapter.md organization
+    -   **Custom Session Mode** (replaces Subject Mode): Launch targeted study sessions directly from Card Browser selections - choose specific notes, folders, or search results
+    -   **Flexible Vault Organization:** No longer constrained to subject/chapter structure - organize your vault however you want
+-   **🎛️ Enhanced Three-State Filtering:** Upgraded filter system with off/include-only/exclude states for flagged, suspended, buried, and new cards. All filter states are now persistent across sessions.
+-   **🧭 Modal Navigation System:** The Card Browser and Edit Modals now have a navigation history, allowing you to go back and forth between views without losing your place.
+-   **📊 Study Statistics & Badge Fixes:** Fixed critical issues with badge logic that wasn't properly respecting suspended card status throughout the application.
+-   **🧠 Complete Major System Implementation:** Full mnemonic generation system with corrected phonetic mappings (NG→N+G sounds, ER→R sounds), fallback dictionary, CMU dictionary integration, and persistent mnemonic storage within flashcards.
+-   **⏭️ Session Continuation:** Smart session management that prompts users to review additional cards that become due during study sessions, with skip tracking to avoid re-prompting skipped cards.
 
 ---
 
@@ -40,16 +42,18 @@ This is a massive update focused on giving you unprecedented control over PDF co
     -   The plugin keeps a log of all AI API calls, allowing you to track your token usage and spending over time.
 
 -   **🧠 Smarter Review & Learning Engine:**
-    -   **🔀 Smart Interleaving:** In Subject and Review-only modes, cards are now selected using a weighted random algorithm that prioritizes more overdue cards, making study sessions more effective.
+    -   ** mnemonic System (Major System):** Automatically detect numbers in your cards and generate memorable phonetic word associations to aid in memorization.
+    -   **🔀 Smart Interleaving:** In Custom Session and Review-only modes, cards are selected using a weighted random algorithm that prioritizes more overdue cards, making study sessions more effective.
     -   **Review Ahead:** Finished your queue? A new modal prompts you to study cards due in the near future.
     -   **Buried Cards:** A new `buried` state for cards that are temporarily hidden after being answered, preventing them from reappearing in the same session.
-    -   **⚙️ Chapter Focus Control:** New setting to prioritize review cards before new cards in Chapter Focus mode.
+    -   **⚙️ Note Focus Control:** New setting to prioritize review cards before new cards in Note Focus mode.
     -   **🐛 Gating Logic Fix:** Buried cards are now correctly excluded from the gating logic, ensuring smoother content unlocking.
 
--   **🖼️ Multimodal AI:**
+-   **🖼️ Multimodal AI & File Explorer:**
     -   **Contextual Image Analysis:** Automatically analyzes images, using surrounding text to understand diagrams, charts, and photos. It extracts key facts and context, not just visual elements.
     -   **Smarter Card Generation:** Creates flashcards that test factual knowledge *from* diagrams (`key_facts`) or ask visual questions that require seeing the image.
     -   **Intelligent Tagging:** Links image-based cards directly to the source image for quick context-jumping.
+    -   **File Explorer Decorator:** See the status of your notes at a glance with new icons (⏳, 📆, ✅) directly in the file explorer.
 
 -   **🤖 Advanced AI Tools:**
     -   **Post-Generation Review:** After generating new cards, you're prompted to immediately review, edit, or delete them in a streamlined workflow.
@@ -60,16 +64,19 @@ This is a massive update focused on giving you unprecedented control over PDF co
     -   **Auto-Correct Tags:** If the AI generates a tag that isn't a direct quote, it will automatically attempt to fix it.
 
 -   **🗂️ Powerful Card Management:**
-    -   **Enhanced Card Browser:** The browser now remembers its state and includes new filters for "Buried" and "New" cards, an icon-based UI, and status icons (🌱, 🚩, ⏸️) next to each card.
+    -   **Advanced Card Browser:** Complete search system with full-text and tag search, three-state filtering (off/include-only/exclude), MathJax rendering, and persistent state. Navigate seamlessly with modal navigation history.
+    -   **Related Cards Discovery:** "Related: X" buttons in edit modals and review sessions instantly find and display cards sharing the same tags, with performance-optimized search within the same deck.
+    -   **Custom Study Sessions:** Launch targeted study sessions directly from Card Browser - select specific notes, folders, or search results to create focused review sessions.
+    -   **Smart Search & Filtering:** Search across card content with `tag:"exact-tag"` syntax, performance-optimized with result limiting and proper debouncing to prevent UI freezing.
     -   **Flag & Suspend Cards:** Mark cards with a 🚩 for future attention or suspend them (⏸️) to temporarily remove them from reviews.
-    -   **Card Variants:** Edit cards with multiple variant phrasings in a dropdown interface. Shows "Variant (1 only)" vs "Variant (X total)" with preview text.
+    -   **Card Variants:** Edit cards with multiple variant phrasings in a dropdown interface.
     -   **Reset Card Progress:** Reset individual cards back to "new" from the edit modal.
 
 -   **🗓️ SM-2 Scheduling:** Built-in spaced repetition ensures maximum retention.
 
 -   **Multiple Study Modes:**
-    -   **🎯 Chapter Mode:** Review cards for the current chapter in gated reading.
-    -   **📚 Subject Mode:** Review all cards in a subject folder.
+    -   **🎯 Note Mode:** Review cards for the current note in gated reading (supports nested folder structures).
+    -   **🎯 Custom Session Mode:** Launch targeted study sessions directly from Card Browser selections - choose specific notes, folders, or search results to create focused review sessions.
     -   **🧠 Review Mode:** Study all due cards vault-wide.
 
 ---
@@ -102,7 +109,7 @@ Prepare the note for gating by converting paragraphs into trackable units. The p
 ### 4. Study to Unlock Content
 
 -   Open a gated note — only the first section is visible.
--   Start a review in **Chapter Mode**.
+-   Start a review in **Note Mode**.
 -   As you answer correctly, the next section automatically unblurs and the view scrolls to it. When you fail a card, you can instantly jump to the source text or image to review.
 
 ---
@@ -126,22 +133,23 @@ Prepare the note for gating by converting paragraphs into trackable units. The p
 
 ## ⚙️ Key Commands
 
-| Command                                                    | Description                                                                  |
-| :--------------------------------------------------------- | :--------------------------------------------------------------------------- |
-| `Review due cards`                                         | Starts a review session for the current mode.                                |
-| `Toggle content gating`                                    | Enable/disable blur without changing settings.                               |
-| `Browse cards`                                             | Open the stateful Card Browser with filtering options.                       |
-| `Finalize note (auto/manual)`                              | Prepare note for gating using `---GATED-NOTES-SPLIT---`.                     |
-| `Un-finalize chapter`                                      | Revert to plain Markdown, adding split markers between former paragraphs.    |
-| `Convert PDF to Note (Experimental)`                       | Uses AI to convert a PDF file into a structured markdown note.               |
-| `Convert EPUB to Note (Experimental)`                      | Extracts selected sections from an EPUB into a markdown note.                |
-| `Remove all manual split tags...`                          | Deletes all `---GATED-NOTES-SPLIT---` markers from the current note.         |
-| `Reset flashcard review history...`                        | Resets all cards in the chapter to "new," preserving the cards themselves.   |
-| `Recalculate paragraph indexes...`                         | Re-sync all cards with their source text after edits.                        |
-| `Delete all flashcards for this chapter`                   | Remove all cards tied to the active note.                                    |
-| `Remove image analysis for this note`                      | Deletes the cached AI analysis for all images within the current note.       |
-| `Remove all image analysis data`                           | Deletes all cached AI image analysis data across the entire vault.           |
-| `Remove unused images from vault`                      | Scans your vault for unreferenced images and prompts you to delete them.       |
+| Command | Description |
+| :--- | :--- |
+| `Review due cards` | Starts a review session for the current mode. |
+| `Toggle content gating` | Enable/disable blur without changing settings. |
+| `Browse cards` | Open the stateful Card Browser with filtering options. |
+| `Study overview` | Open a modal with vault-wide flashcard statistics. |
+| `Finalize note (auto/manual)` | Prepare note for gating using `---GATED-NOTES-SPLIT---`. |
+| `Un-finalize chapter` | Revert to plain Markdown, adding split markers between former paragraphs. |
+| `Convert PDF to Note (Experimental)` | Uses AI to convert a PDF file into a structured markdown note. |
+| `Convert EPUB to Note (Experimental)`| Extracts selected sections from an EPUB into a markdown note. |
+| `Remove all manual split tags...` | Deletes all `---GATED-NOTES-SPLIT---` markers from the current note. |
+| `Reset flashcard review history...` | Resets all cards in the chapter to "new," preserving the cards themselves. |
+| `Recalculate paragraph indexes...` | Re-sync all cards with their source text after edits. |
+| `Delete all flashcards for this chapter` | Remove all cards tied to the active note. |
+| `Remove image analysis for this note` | Deletes the cached AI analysis for all images within the current note. |
+| `Remove all image analysis data` | Deletes all cached AI image analysis data across the entire vault. |
+| `Remove unused images from vault` | Scans your vault for unreferenced images and prompts you to delete them. |
 
 ---
 

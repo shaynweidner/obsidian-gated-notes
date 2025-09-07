@@ -1,3 +1,69 @@
+# v2.7.0
+
+## ✨ New Release: The Card Browser & Study Mode Revolution! ✨
+
+This release fundamentally transforms both the Card Browser and the study mode architecture. The Card Browser gains a complete search system with related cards functionality, while the rigid subject/chapter folder structure is replaced with flexible nested folder support and a revolutionary custom session system launched directly from the Card Browser.
+
+### 🚀 Major New Features
+
+-   **🔍 Complete Card Browser Search & Related Cards System:** A brand-new search feature with intelligent card discovery:
+    -   **Full-Text Search:** Search across all card fronts and backs instantly
+    -   **Advanced Tag Search:** Use `tag:"exact-tag"` syntax to find cards with specific tags, including tags with nested quotes
+    -   **Related Cards Discovery:** "Related: X" buttons in edit modals and review sessions instantly find cards sharing the same tags
+    -   **MathJax Rendering:** LaTeX expressions now render properly in search results instead of showing raw code
+    -   **Performance Optimized:** Smart result limiting (100 cards max), proper debouncing, and optimized related card search within same deck
+    -   **Search Result Management:** Clear messaging shows "Found 2617 cards (showing first 100)" for large result sets
+
+-   **🎯 Study Mode Architecture Revolution:** Complete overhaul replacing the rigid subject/chapter structure:
+    -   **Nested Folder Support:** Note Mode now works with any folder structure - no longer requires flat ./subject/chapter.md organization
+    -   **Custom Session Mode Replaces Subject Mode:** Launch targeted study sessions directly from Card Browser selections
+    -   **Flexible Vault Organization:** Organize your vault however you want - deep nested folders, any naming convention
+    -   **Card Browser Integration:** Select specific notes, folders, or search results in Card Browser and instantly start custom study sessions
+    -   **Session Flexibility:** Choose to include or exclude new cards, create review-only sessions from any selection
+
+-   **🎛️ Three-State Filter System:** Completely redesigned filtering with much more power:
+    -   **Three States:** Off / Include-Only / Exclude for each filter type
+    -   **Persistent Filters:** All filter preferences are remembered between sessions
+    -   **Enhanced Logic:** Combine filters with AND/OR logic for precise card selection
+    -   **Real-Time Counts:** See exactly how many cards match each filter state
+
+-   **🧭 Modal Navigation System:** Navigate seamlessly between different views:
+    -   **Navigation History:** Go back and forth between Card Browser and Edit Modals
+    -   **Context Preservation:** Never lose your place when moving between different card management interfaces
+    -   **Related Card Navigation:** Click "Related: X" buttons to explore connected cards
+
+### ✨ Critical Fixes & Improvements
+
+-   **📊 Study Statistics & Badge Logic Fixes:** 
+    -   Fixed critical bugs where suspended card status wasn't properly respected in badge calculations
+    -   Study Overview and file explorer badges now show accurate status information
+    -   Removed debug logging that was cluttering the console
+
+-   **🧠 Complete Major System Mnemonic Implementation:** Full implementation of the Major System for memory techniques:
+    -   **Enhanced Phonetic Mappings:** NG sounds now map to both N and G (27) instead of just G (7), ER sounds now map to R (4)
+    -   **Comprehensive Word Generation:** Complete fallback dictionary with thousands of word combinations for number-to-word conversion
+    -   **CMU Dictionary Integration:** Advanced word generation using the CMU pronunciation dictionary for more accurate phonetic matching
+    -   **Persistent Storage:** Mnemonics are stored within flashcard data structure for long-term retention and cross-session availability
+    -   **Smart Number Detection:** Automatic detection of numbers in flashcard content for mnemonic generation opportunities
+
+-   **⏭️ Smart Session Continuation:** 
+    -   **Continuation Prompts:** When sessions end, users are asked if they want to review additional cards that became due
+    -   **Skip Tracking:** Cards skipped during a session won't reappear in continuation prompts
+    -   **Improved Flow:** Better session management prevents interruptions and maintains study momentum
+
+### 🎨 Visual & UX Enhancements
+
+-   **Card Browser Visual Improvements:**
+    -   **Card Separators:** Visual divider lines between search results for better readability
+    -   **Inline Icons:** Status icons (🌱, 🚩) now appear inline with card text instead of on separate lines
+    -   **Clean Chapter Paths:** Source paths appear on separate lines with .md suffixes removed
+    -   **Compact Layout:** Optimized spacing throughout the interface
+
+-   **Performance & Responsiveness:**
+    -   **Eliminated Search Freezing:** Fixed critical issue where typing single characters like "b" or "h" would freeze the UI
+    -   **Faster Interactions:** Improved debouncing and reduced expensive operations during typing
+    -   **Optimized Related Cards:** Related card searches now only scan the same deck instead of the entire vault
+
 # v2.6.0
 
 ## ✨ New Release: The Interactive PDF & Smart Review Update! ✨
