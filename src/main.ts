@@ -70,6 +70,12 @@ enum LogLevel {
 	VERBOSE = 2,
 }
 
+enum FilterState {
+	OFF = "off",
+	INCLUDE_ONLY = "include_only", 
+	EXCLUDE = "exclude",
+}
+
 type CardRating = "Again" | "Hard" | "Good" | "Easy";
 type CardStatus = "new" | "learning" | "review" | "relearn";
 type ReviewResult = "answered" | "skip" | "abort" | "again";
@@ -218,6 +224,11 @@ interface CardBrowserState {
 	isFirstRender: boolean;
 	selectedDeckPath?: string;
 	selectedChapterPath?: string;
+	// Filter states
+	flaggedFilter: FilterState;
+	suspendedFilter: FilterState;
+	buriedFilter: FilterState;
+	newFilter: FilterState;
 }
 
 interface ExtractedImage {
@@ -2978,6 +2989,10 @@ export default class GatedNotesPlugin extends Plugin {
 		treeScroll: 0,
 		editorScroll: 0,
 		isFirstRender: true,
+		flaggedFilter: FilterState.OFF,
+		suspendedFilter: FilterState.OFF,
+		buriedFilter: FilterState.OFF,
+		newFilter: FilterState.OFF,
 	};
 	private explorerObserver: MutationObserver | null = null;
 	private decorateTimeout: NodeJS.Timeout | null = null;
@@ -2989,6 +3004,8 @@ export default class GatedNotesPlugin extends Plugin {
 	private studyMode: StudyMode = StudyMode.NOTE;
 	private customSessionPaths: string[] = []; // Selected folders for custom session
 	private customSessionExcludeNewCards: boolean = true; // Whether to exclude new cards in custom session
+	private customSessionCards: Flashcard[] = []; // Pre-filtered cards for custom session
+	private skippedCardIds: Set<string> = new Set(); // Track cards skipped in current session
 	private isRecalculatingAll = false;
 
 	// Enhanced image management services
@@ -2998,6 +3015,36 @@ export default class GatedNotesPlugin extends Plugin {
 
 	private subjectOf(path: string): string {
 		return path.split("/")[0] ?? "";
+	}
+
+	public startCustomReviewFromPaths(selectedPaths: string[], excludeNewCards: boolean = false): void {
+		this.customSessionPaths = selectedPaths;
+		this.customSessionExcludeNewCards = excludeNewCards;
+		this.studyMode = StudyMode.CUSTOM_SESSION;
+		
+		let pathDisplay = "Vault Root";
+		if (selectedPaths.length > 0) {
+			if (selectedPaths.length === 1) {
+				pathDisplay = selectedPaths[0];
+			} else {
+				pathDisplay = `${selectedPaths.length} selected items`;
+			}
+		}
+		
+		const modeText = excludeNewCards ? " (review-only)" : "";
+		new Notice(`🎯 Custom study: ${pathDisplay}${modeText}`);
+		this.reviewDue();
+	}
+
+	public startCustomReviewFromCards(cards: Flashcard[]): void {
+		// Set up a special custom session mode that uses pre-filtered cards
+		this.customSessionCards = cards;
+		this.customSessionPaths = []; // Clear paths since we're using specific cards
+		this.customSessionExcludeNewCards = false; // Cards are already filtered
+		this.studyMode = StudyMode.CUSTOM_SESSION;
+		
+		new Notice(`🎯 Custom study: ${cards.length} filtered cards`);
+		this.reviewDue();
 	}
 
 	private showCustomSessionDialog(): void {
@@ -3023,6 +3070,11 @@ export default class GatedNotesPlugin extends Plugin {
 	}
 
 	private async getCardsForCustomSession(): Promise<Flashcard[]> {
+		// If we have pre-filtered cards, use them directly
+		if (this.customSessionCards.length > 0) {
+			return this.customSessionCards;
+		}
+		
 		if (this.customSessionPaths.length === 0) {
 			// Fallback to all cards if no path selected
 			const allDeckFiles = this.app.vault
@@ -3928,7 +3980,7 @@ export default class GatedNotesPlugin extends Plugin {
 					async (timeAheadMs: number) => {
 						const aheadQueue = await this.collectReviewPool(activePath, timeAheadMs);
 						if (aheadQueue.length > 0) {
-							await this.processReviewQueue(aheadQueue, activePath, gateBefore);
+							await this.processReviewQueue(aheadQueue, activePath, gateBefore, false);
 						} else {
 							new Notice("🎉 No cards found within the specified time range!");
 						}
@@ -3944,7 +3996,7 @@ export default class GatedNotesPlugin extends Plugin {
 			}
 		}
 
-		await this.processReviewQueue(queue, activePath, gateBefore);
+		await this.processReviewQueue(queue, activePath, gateBefore, false);
 	}
 
 	/**
@@ -3999,11 +4051,17 @@ export default class GatedNotesPlugin extends Plugin {
 	private async processReviewQueue(
 		queue: { card: Flashcard; deck: TFile }[],
 		activePath: string,
-		gateBefore: number
+		gateBefore: number,
+		isSessionContinuation: boolean = false
 	): Promise<void> {
 		let reviewInterrupted = false;
 		let remainingQueue = [...queue]; // Work with a copy
 		let reviewCount = 0;
+
+		// Clear skipped cards tracking at the start of new sessions (not continuations)
+		if (!isSessionContinuation) {
+			this.skippedCardIds.clear();
+		}
 
 		this.logger(LogLevel.VERBOSE, `Review queue processing: Starting with ${remainingQueue.length} cards`);
 
@@ -4035,6 +4093,12 @@ export default class GatedNotesPlugin extends Plugin {
 			});
 			
 			const res = await this.openReviewModal(card, deck);
+
+			// Track skipped cards for session continuation
+			if (res === "skip") {
+				this.skippedCardIds.add(card.id);
+				this.logger(LogLevel.VERBOSE, `Review #${reviewCount}: Card ${card.id} skipped, added to skip list`);
+			}
 
 			// Remove the processed card from the queue
 			remainingQueue.splice(selectedIndex, 1);
@@ -4083,8 +4147,40 @@ export default class GatedNotesPlugin extends Plugin {
 				this.app.vault.getAbstractFileByPath(activePath) as TFile
 			);
 		} else {
-			new Notice("All reviews for this section are complete!");
+			// Check if this was a custom/review-only session that could continue
+			if (this.studyMode === StudyMode.REVIEW || this.studyMode === StudyMode.CUSTOM_SESSION) {
+				await this.checkForSessionContinuation(activePath);
+			} else {
+				new Notice("All reviews for this section are complete!");
+			}
 		}
+	}
+
+	private async checkForSessionContinuation(activePath: string): Promise<void> {
+		// Check if any new cards have become due since the session started
+		const allNewQueue = await this.collectReviewPool(activePath);
+		
+		// Filter out cards that were skipped during this session
+		const newQueue = allNewQueue.filter(item => !this.skippedCardIds.has(item.card.id));
+		
+		this.logger(LogLevel.VERBOSE, `Session continuation check: ${allNewQueue.length} total due, ${newQueue.length} after filtering ${this.skippedCardIds.size} skipped cards`);
+		
+		if (newQueue.length > 0) {
+			// New cards have become due - ask user if they want to continue
+			const continueSession = confirm(
+				`${newQueue.length} additional cards have become due. Would you like to review them now?`
+			);
+			
+			if (continueSession) {
+				// Continue the session with the new cards (mark as continuation)
+				const gateBefore = await this.getFirstBlockedParaIndex(activePath);
+				await this.processReviewQueue(newQueue, activePath, gateBefore, true);
+				return;
+			}
+		}
+		
+		// No new cards or user declined - show completion message
+		new Notice("🎉 All reviews complete!");
 	}
 
 	private async findAndScrollToNextContentfulPara(
@@ -6867,25 +6963,20 @@ ${selection}
 	private async findRelatedCardsForReview(card: Flashcard): Promise<Flashcard[]> {
 		const relatedCards: Flashcard[] = [];
 		
-		// Get all deck files in vault
-		const allDeckFiles = this.app.vault
-			.getFiles()
-			.filter((f) => f.name === "_flashcards.json");
+		// Only search the same deck - related cards (same tag) must be from the same note
+		try {
+			const deckPath = getDeckPathForChapter(card.chapter);
+			const graph = await this.readDeck(deckPath);
+			const cards = Object.values(graph) as Flashcard[];
 			
-		for (const deckFile of allDeckFiles) {
-			try {
-				const graph = await this.readDeck(deckFile.path);
-				const cards = Object.values(graph) as Flashcard[];
-				
-				for (const deckCard of cards) {
-					// Find cards with the same tag, but exclude the current card
-					if (deckCard.tag === card.tag && deckCard.id !== card.id) {
-						relatedCards.push(deckCard);
-					}
+			for (const deckCard of cards) {
+				// Find cards with the same tag, but exclude the current card
+				if (deckCard.tag === card.tag && deckCard.id !== card.id) {
+					relatedCards.push(deckCard);
 				}
-			} catch (error) {
-				console.warn(`Could not read deck ${deckFile.path}:`, error);
 			}
+		} catch (error) {
+			console.warn(`Could not read deck for ${card.chapter}:`, error);
 		}
 		
 		return relatedCards;
@@ -7263,49 +7354,18 @@ ${selection}
 
 		if (cards.length === 0) return undefined;
 		
-		// Debug logging for Feynman Lectures
-		if (chapterPath.includes("The Feynman Lectures on Physics Vol. 1") && 
-		    (chapterPath.includes("02_Basic Physics") || 
-		     chapterPath.includes("03_The Relation of Physics") || 
-		     chapterPath.includes("04_Conservation of Energy"))) {
-			console.log("🐛 BADGE DEBUG for:", chapterPath);
-			console.log("  Total cards:", cards.length);
-			console.log("  Blocked cards:", cards.filter(c => c.blocked).length);
-			console.log("  Suspended cards:", cards.filter(c => c.suspended).length);
-			console.log("  Due cards:", cards.filter(c => c.due <= Date.now()).length);
-			console.log("  Due non-suspended:", cards.filter(c => c.due <= Date.now() && !c.suspended).length);
-			console.log("  Sample card statuses:", cards.slice(0, 3).map(c => ({
-				blocked: c.blocked, 
-				suspended: c.suspended, 
-				status: c.status, 
-				due: c.due, 
-				now: Date.now(),
-				isDue: c.due <= Date.now()
-			})));
-		}
 		
-		// Filter out blocked cards for due/done status calculation
+		
 		const nonBlockedCards = cards.filter((c) => !c.blocked);
 		
-		// If there are any blocked cards that are NOT suspended, show blocked
 		if (cards.some((c) => c.blocked && !c.suspended)) {
-			if (chapterPath.includes("The Feynman Lectures on Physics Vol. 1")) {
-				console.log("  → Result: BLOCKED (hourglass) - has non-suspended blocked cards");
-			}
 			return "blocked";
 		}
 		
-		// Only check due status on non-blocked, non-suspended cards
 		if (nonBlockedCards.some((c) => c.due <= Date.now() && !c.suspended)) {
-			if (chapterPath.includes("The Feynman Lectures on Physics Vol. 1")) {
-				console.log("  → Result: DUE (calendar)");
-			}
 			return "due";
 		}
 		
-		if (chapterPath.includes("The Feynman Lectures on Physics Vol. 1")) {
-			console.log("  → Result: DONE (checkmark) ❌ This shouldn't happen!");
-		}
 		return "done";
 	}
 
@@ -13863,25 +13923,20 @@ Return ONLY valid JSON array of this shape: [{"front":"...","back":"..."}]`;
 	private async findRelatedCards(): Promise<Flashcard[]> {
 		const relatedCards: Flashcard[] = [];
 		
-		// Get all deck files in vault
-		const allDeckFiles = this.plugin.app.vault
-			.getFiles()
-			.filter((f) => f.name === "_flashcards.json");
+		// Only search the same deck - related cards (same tag) must be from the same note
+		try {
+			const deckPath = getDeckPathForChapter(this.card.chapter);
+			const graph = await this.plugin.readDeck(deckPath);
+			const cards = Object.values(graph) as Flashcard[];
 			
-		for (const deckFile of allDeckFiles) {
-			try {
-				const graph = await this.plugin.readDeck(deckFile.path);
-				const cards = Object.values(graph) as Flashcard[];
-				
-				for (const card of cards) {
-					// Find cards with the same tag, but exclude the current card
-					if (card.tag === this.card.tag && card.id !== this.card.id) {
-						relatedCards.push(card);
-					}
+			for (const card of cards) {
+				// Find cards with the same tag, but exclude the current card
+				if (card.tag === this.card.tag && card.id !== this.card.id) {
+					relatedCards.push(card);
 				}
-			} catch (error) {
-				console.warn(`Could not read deck ${deckFile.path}:`, error);
 			}
+		} catch (error) {
+			console.warn(`Could not read deck for ${this.card.chapter}:`, error);
 		}
 		
 		return relatedCards;
@@ -14510,15 +14565,22 @@ class SplitOptionsModal extends Modal {
  * A modal that provides a tree-based browser for all flashcards in the vault.
  */
 class CardBrowser extends NavigationAwareModal {
-	private showOnlyFlagged = false;
-	private showOnlySuspended = false;
-	private showOnlyNew = false;
-	private showOnlyBuried = false;
+	private flaggedFilter = FilterState.OFF;
+	private suspendedFilter = FilterState.OFF;
+	private newFilter = FilterState.OFF;
+	private buriedFilter = FilterState.OFF;
 	private searchQuery = "";
 	private searchInput!: HTMLInputElement;
 	private searchTimeout!: NodeJS.Timeout;
 	private treePane!: HTMLElement;
 	private editorPane!: HTMLElement;
+	private selectedPaths: Set<string> = new Set();
+	private filterCountUpdaters: {
+		flagged: (count: number) => void;
+		suspended: (count: number) => void;
+		buried: (count: number) => void;
+		new: (count: number) => void;
+	} = {} as any;
 
 	constructor(
 		protected plugin: GatedNotesPlugin,
@@ -14529,7 +14591,15 @@ class CardBrowser extends NavigationAwareModal {
 		super(plugin.app, plugin);
 		if (initialSearchQuery) {
 			this.searchQuery = initialSearchQuery;
+			// Clear any existing selections so search results show immediately
+			this.selectedPaths.clear();
 		}
+		
+		// Initialize filter states from persistent state
+		this.flaggedFilter = state.flaggedFilter || FilterState.OFF;
+		this.suspendedFilter = state.suspendedFilter || FilterState.OFF;
+		this.buriedFilter = state.buriedFilter || FilterState.OFF;
+		this.newFilter = state.newFilter || FilterState.OFF;
 	}
 
 	protected createNavigationContext(): CardBrowserContext {
@@ -14611,50 +14681,47 @@ class CardBrowser extends NavigationAwareModal {
 			button.style.textAlign = "center";
 		};
 
-		// Flagged cards filter
-		const flagBtn = filtersContainer.createEl("button", { text: "🚩" });
-		addFilterButtonStyles(flagBtn);
-		flagBtn.style.backgroundColor = this.showOnlyFlagged ? "var(--interactive-accent)" : "var(--interactive-normal)";
-		flagBtn.setAttribute("aria-label", "Show only flagged cards");
-		flagBtn.onclick = async () => {
-			this.showOnlyFlagged = !this.showOnlyFlagged;
-			flagBtn.style.backgroundColor = this.showOnlyFlagged ? "var(--interactive-accent)" : "var(--interactive-normal)";
-			await this.renderContent();
-		};
+		// Flagged cards filter (three-state)
+		const flaggedBtn = this.createThreeStateFilterButton(
+			filtersContainer,
+			"flag",
+			() => this.flaggedFilter,
+			(newState) => { this.flaggedFilter = newState; },
+			"Filter flagged cards (click to cycle: off → only → hide)"
+		);
+		this.filterCountUpdaters.flagged = flaggedBtn.updateCount;
 
-		// Suspended cards filter
-		const suspendBtn = new ButtonComponent(filtersContainer);
-		suspendBtn.setIcon("ban");
-		suspendBtn.setTooltip("Show only suspended cards");
-		suspendBtn.buttonEl.style.backgroundColor = this.showOnlySuspended ? "var(--interactive-accent)" : "var(--interactive-normal)";
-		suspendBtn.onClick(async () => {
-			this.showOnlySuspended = !this.showOnlySuspended;
-			suspendBtn.buttonEl.style.backgroundColor = this.showOnlySuspended ? "var(--interactive-accent)" : "var(--interactive-normal)";
-			await this.renderContent();
-		});
+		// Suspended cards filter (three-state)
+		const suspendedBtn = this.createThreeStateFilterButton(
+			filtersContainer,
+			"ban",
+			() => this.suspendedFilter,
+			(newState) => { this.suspendedFilter = newState; },
+			"Filter suspended cards (click to cycle: off → only → hide)"
+		);
+		this.filterCountUpdaters.suspended = suspendedBtn.updateCount;
 
-		// Buried cards filter
-		const buryBtn = new ButtonComponent(filtersContainer);
-		buryBtn.setIcon("file-down");
-		buryBtn.setTooltip("Show only buried cards");
-		buryBtn.buttonEl.style.backgroundColor = this.showOnlyBuried ? "var(--interactive-accent)" : "var(--interactive-normal)";
-		buryBtn.onClick(async () => {
-			this.showOnlyBuried = !this.showOnlyBuried;
-			buryBtn.buttonEl.style.backgroundColor = this.showOnlyBuried ? "var(--interactive-accent)" : "var(--interactive-normal)";
-			await this.renderContent();
-		});
+		// Buried cards filter (three-state)
+		const buriedBtn = this.createThreeStateFilterButton(
+			filtersContainer,
+			"file-down",
+			() => this.buriedFilter,
+			(newState) => { this.buriedFilter = newState; },
+			"Filter buried cards (click to cycle: off → only → hide)"
+		);
+		this.filterCountUpdaters.buried = buriedBtn.updateCount;
 
-		// New cards filter
+		// New cards filter (three-state)
 		if (this.plugin.settings.showNewCardIndicators) {
-			const newBtn = filtersContainer.createEl("button", { text: "🌱" });
-			addFilterButtonStyles(newBtn);
-			newBtn.style.backgroundColor = this.showOnlyNew ? "var(--interactive-accent)" : "var(--interactive-normal)";
-			newBtn.setAttribute("aria-label", "Show only new cards");
-			newBtn.onclick = async () => {
-				this.showOnlyNew = !this.showOnlyNew;
-				newBtn.style.backgroundColor = this.showOnlyNew ? "var(--interactive-accent)" : "var(--interactive-normal)";
-				await this.renderContent();
-			};
+			const newBtn = this.createThreeStateFilterButton(
+				filtersContainer,
+				"🌱",
+				() => this.newFilter,
+				(newState) => { this.newFilter = newState; },
+				"Filter new cards (click to cycle: off → only → hide)",
+				true // Use emoji instead of icon
+			);
+			this.filterCountUpdaters.new = newBtn.updateCount;
 		}
 
 		// Add search input
@@ -14680,13 +14747,29 @@ class CardBrowser extends NavigationAwareModal {
 		// Add search functionality
 		const performSearch = async () => {
 			this.searchQuery = this.searchInput.value.trim();
+			
+			// Clear any previous selections when searching
+			// Search should take precedence over manual selections
+			if (this.searchQuery) {
+				this.selectedPaths.clear();
+			}
+			
 			await this.renderContent();
+			
+			// Only show search results in right pane after search is complete
+			// and only if no manual selections are made
+			if (this.selectedPaths.size === 0 && (this.searchQuery || this.hasActiveFilters())) {
+				// Use a small delay to avoid interfering with typing
+				setTimeout(() => {
+					this.updateRightPaneForSelections();
+				}, 100);
+			}
 		};
 
 		this.searchInput.addEventListener("input", () => {
 			// Debounce search to avoid excessive re-renders
 			clearTimeout(this.searchTimeout);
-			this.searchTimeout = setTimeout(performSearch, 300);
+			this.searchTimeout = setTimeout(performSearch, 200); // Fast, responsive search without expensive right pane updates
 		});
 
 		this.searchInput.addEventListener("keydown", (e) => {
@@ -14705,7 +14788,9 @@ class CardBrowser extends NavigationAwareModal {
 		clearBtn.onclick = async () => {
 			this.searchInput.value = "";
 			this.searchQuery = "";
+			this.selectedPaths.clear(); // Also clear selections when clearing search
 			await this.renderContent();
+			await this.updateRightPaneForSelections(); // Update right pane after clearing
 		};
 
 		// Add expand/collapse all button
@@ -14715,6 +14800,15 @@ class CardBrowser extends NavigationAwareModal {
 		expandCollapseBtn.addClass("clickable-icon", "nav-action-button");
 		setIcon(expandCollapseBtn, "chevrons-down-up");
 		expandCollapseBtn.onclick = () => this.toggleExpandCollapseAll();
+
+		// Add Custom Study button
+		const customStudyBtn = filtersContainer.createEl("button", { text: "🎯 Custom Study" });
+		addFilterButtonStyles(customStudyBtn);
+		customStudyBtn.style.backgroundColor = "var(--interactive-accent)";
+		customStudyBtn.style.color = "var(--text-on-accent)";
+		customStudyBtn.style.fontWeight = "bold";
+		customStudyBtn.setAttribute("aria-label", "Start custom study session with selected/filtered cards");
+		customStudyBtn.onclick = () => this.startCustomStudy();
 
 		const body = this.contentEl.createDiv({ cls: "gn-body" });
 		this.treePane = body.createDiv({ cls: "gn-tree" });
@@ -14736,6 +14830,11 @@ class CardBrowser extends NavigationAwareModal {
 		});
 
 		await this.renderContent();
+		
+		// If opened with initial search query, populate right pane with search results
+		if (this.searchQuery && this.selectedPaths.size === 0) {
+			await this.updateRightPaneForSelections();
+		}
 	}
 
 	async renderContent() {
@@ -14770,18 +14869,13 @@ class CardBrowser extends NavigationAwareModal {
 				(c) => c.chapter === chapterPath
 			);
 
-			if (this.filter) cards = cards.filter(this.filter);
-			
 			// Apply search filter
 			if (this.searchQuery) {
 				cards = cards.filter(card => this.matchesSearch(card));
 			}
 			
-			if (this.showOnlyFlagged) cards = cards.filter((c) => c.flagged);
-			if (this.showOnlySuspended)
-				cards = cards.filter((c) => c.suspended);
-			if (this.showOnlyBuried) cards = cards.filter((c) => isBuried(c));
-			if (this.showOnlyNew) cards = cards.filter((c) => isUnseen(c));
+			// Apply all filters using the centralized filter system
+			cards = this.applyFiltersToCards(cards);
 
 			if (!cards.length) {
 				this.editorPane.setText("No cards match the current filter.");
@@ -14852,21 +14946,13 @@ class CardBrowser extends NavigationAwareModal {
 		for (const deck of decks) {
 			const graph = await this.plugin.readDeck(deck.path);
 			let cardsInDeck = Object.values(graph);
-			if (this.filter) cardsInDeck = cardsInDeck.filter(this.filter);
-			
 			// Apply search filter
 			if (this.searchQuery) {
 				cardsInDeck = cardsInDeck.filter(card => this.matchesSearch(card));
 			}
 			
-			if (this.showOnlyFlagged)
-				cardsInDeck = cardsInDeck.filter((c) => c.flagged);
-			if (this.showOnlySuspended)
-				cardsInDeck = cardsInDeck.filter((c) => c.suspended);
-			if (this.showOnlyBuried)
-				cardsInDeck = cardsInDeck.filter((c) => isBuried(c));
-			if (this.showOnlyNew)
-				cardsInDeck = cardsInDeck.filter((c) => isUnseen(c));
+			// Apply all filters using the centralized filter system
+			cardsInDeck = this.applyFiltersToCards(cardsInDeck);
 			if (cardsInDeck.length === 0) continue;
 
 			const subject = deck.path.split("/")[0] || "Vault Root";
@@ -14884,7 +14970,41 @@ class CardBrowser extends NavigationAwareModal {
 			});
 			subjectEl.open = shouldBeOpen;
 
-			subjectEl.createEl("summary", { text: subject });
+			const summaryEl = subjectEl.createEl("summary", { text: subject });
+			
+			// Apply selection styling to subject folder
+			if (this.selectedPaths.has(subject)) {
+				summaryEl.addClass("selected");
+				summaryEl.style.backgroundColor = "var(--interactive-accent)";
+				summaryEl.style.color = "var(--text-on-accent)";
+			}
+
+			// Toggle selection on click (no CTRL required)
+			// But allow expand/collapse arrow to work normally
+			summaryEl.addEventListener("click", (e) => {
+				// Check if click was on the expand/collapse arrow area
+				const summaryRect = summaryEl.getBoundingClientRect();
+				const clickX = e.clientX - summaryRect.left;
+				
+				// The arrow is typically in the first ~20px on the left
+				// If click is in that area, let the default expand/collapse happen
+				if (clickX < 20) {
+					return; // Let default behavior handle expand/collapse
+				}
+				
+				// Otherwise, it's a selection click
+				e.preventDefault();
+				e.stopPropagation();
+				
+				const isSelected = this.selectedPaths.has(subject);
+				if (isSelected) {
+					this.selectedPaths.delete(subject);
+				} else {
+					this.selectedPaths.add(subject);
+				}
+				
+				this.updateSelectionDisplay();
+			});
 
 			subjectEl.addEventListener("toggle", () => {
 				if (subjectEl.open) this.state.openSubjects.add(subject);
@@ -14915,11 +15035,33 @@ class CardBrowser extends NavigationAwareModal {
 				const chapterName =
 					chapterPath.split("/").pop()?.replace(/\.md$/, "") ??
 					chapterPath;
-				subjectEl.createEl("div", {
+				const chapterEl = subjectEl.createEl("div", {
 					cls: "gn-chap",
 					text: `${count} card(s) • ${chapterName}`,
 					attr: { "data-chapter-path": chapterPath },
-				}).onclick = () => showCardsForChapter(deck, chapterPath);
+				});
+
+				// Apply selection styling
+				if (this.selectedPaths.has(chapterPath)) {
+					chapterEl.addClass("selected");
+					chapterEl.style.backgroundColor = "var(--interactive-accent)";
+					chapterEl.style.color = "var(--text-on-accent)";
+				}
+
+				chapterEl.onclick = (e) => {
+					// Toggle selection on click (no CTRL required)
+					e.preventDefault();
+					e.stopPropagation();
+					
+					const isSelected = this.selectedPaths.has(chapterPath);
+					if (isSelected) {
+						this.selectedPaths.delete(chapterPath);
+					} else {
+						this.selectedPaths.add(chapterPath);
+					}
+					
+					this.updateSelectionDisplay();
+				};
 			}
 		}
 
@@ -14962,6 +15104,9 @@ class CardBrowser extends NavigationAwareModal {
 			this.treePane.scrollTop = this.state.treeScroll;
 			this.editorPane.scrollTop = this.state.editorScroll;
 		}, 50);
+		
+		// Update filter counts after rendering
+		this.updateFilterCounts();
 	}
 
 	private matchesSearch(card: Flashcard): boolean {
@@ -14969,8 +15114,8 @@ class CardBrowser extends NavigationAwareModal {
 
 		const query = this.searchQuery.toLowerCase();
 		
-		// Check for tag search: tag:"exact-tag"
-		const tagMatch = query.match(/tag:"([^"]+)"/);
+		// Check for tag search: tag:"exact-tag" (handles nested quotes)
+		const tagMatch = query.match(/tag:"(.+)"$/);
 		if (tagMatch) {
 			const tagQuery = tagMatch[1];
 			return card.tag.toLowerCase() === tagQuery.toLowerCase();
@@ -15002,14 +15147,708 @@ class CardBrowser extends NavigationAwareModal {
 		);
 	}
 
+	private updateSelectionDisplay() {
+		// Refresh the tree to show updated selection styling
+		this.renderContent();
+		
+		// Update the right pane to show selected content
+		this.updateRightPaneForSelections();
+		
+		this.plugin.logger(
+			LogLevel.VERBOSE,
+			`CardBrowser: Selection updated -> ${this.selectedPaths.size} items selected: ${Array.from(this.selectedPaths).join(', ')}`
+		);
+	}
+
+	private hasActiveFilters(): boolean {
+		return this.flaggedFilter !== FilterState.OFF ||
+			   this.suspendedFilter !== FilterState.OFF ||
+			   this.buriedFilter !== FilterState.OFF ||
+			   this.newFilter !== FilterState.OFF;
+	}
+
+	private async updateRightPaneForSelections() {
+		if (this.selectedPaths.size === 0) {
+			// No selections - show search/filter results if there's a search query or active filters
+			if (this.searchQuery || this.hasActiveFilters()) {
+				await this.showSearchAndFilterResultsInRightPane();
+			} else {
+				this.editorPane.empty();
+				this.editorPane.setText("Search for cards, apply filters, or select folders/notes to see cards here.");
+			}
+			return;
+		}
+
+		this.editorPane.empty();
+		this.editorPane.setText("Loading selected cards...");
+
+		// Collect cards from all selected paths
+		const allSelectedCards: Flashcard[] = [];
+		
+		for (const selectedPath of this.selectedPaths) {
+			// Check if this is a subject (folder) or individual chapter (note)
+			const isFolder = !selectedPath.includes('.md');
+			
+			if (isFolder) {
+				// It's a subject folder - get all cards from all chapters in that subject
+				const decks = this.app.vault
+					.getFiles()
+					.filter((f) => f.name.endsWith(DECK_FILE_NAME) && f.path.startsWith(selectedPath));
+					
+				for (const deck of decks) {
+					const graph = await this.plugin.readDeck(deck.path);
+					const cardsInDeck = Object.values(graph) as Flashcard[];
+					allSelectedCards.push(...cardsInDeck);
+				}
+			} else {
+				// It's an individual chapter - get cards from that specific chapter
+				const deckPath = getDeckPathForChapter(selectedPath);
+				try {
+					const graph = await this.plugin.readDeck(deckPath);
+					const cardsInDeck = Object.values(graph).filter(
+						(card: Flashcard) => card.chapter === selectedPath
+					) as Flashcard[];
+					allSelectedCards.push(...cardsInDeck);
+				} catch (error) {
+					console.warn(`Could not read deck for ${selectedPath}:`, error);
+				}
+			}
+		}
+
+		// Apply search filter if active
+		let filteredCards = allSelectedCards;
+		if (this.searchQuery) {
+			filteredCards = allSelectedCards.filter(card => this.matchesSearch(card));
+		}
+
+		// Apply all filters using the centralized filter system
+		filteredCards = this.applyFiltersToCards(filteredCards);
+
+		this.displayCardsInRightPane(filteredCards);
+	}
+
+	private async showSearchAndFilterResultsInRightPane() {
+		if (!this.searchQuery && !this.hasActiveFilters()) {
+			this.editorPane.empty();
+			this.editorPane.setText("Enter a search query or apply filters to see results.");
+			return;
+		}
+
+		this.editorPane.empty();
+		this.editorPane.setText("Loading results...");
+
+		// Get search results from entire vault
+		const allDeckFiles = this.app.vault
+			.getFiles()
+			.filter((f) => f.name === DECK_FILE_NAME);
+		
+		const allCards: Flashcard[] = [];
+		for (const deckFile of allDeckFiles) {
+			try {
+				const content = await this.app.vault.read(deckFile);
+				const deckCards = JSON.parse(content);
+				allCards.push(...(Object.values(deckCards) as Flashcard[]));
+			} catch (error) {
+				console.warn(`Could not read deck ${deckFile.path}:`, error);
+			}
+		}
+		
+		// Filter by search query
+		const searchFiltered = allCards.filter(card => this.matchesSearch(card));
+		const filteredCards = this.applyFiltersToCards(searchFiltered);
+
+		// Limit results to prevent UI freezing with large result sets
+		const MAX_DISPLAY_RESULTS = 100;
+		const displayCards = filteredCards.slice(0, MAX_DISPLAY_RESULTS);
+		
+		// Show result count with truncation info if needed
+		this.editorPane.empty();
+		const headerEl = this.editorPane.createEl("div", { 
+			text: filteredCards.length > MAX_DISPLAY_RESULTS 
+				? `Found ${filteredCards.length} cards (showing first ${MAX_DISPLAY_RESULTS})`
+				: `Found ${filteredCards.length} cards`,
+			cls: "gn-search-results-header"
+		});
+		headerEl.style.padding = "10px";
+		headerEl.style.backgroundColor = "var(--background-secondary)";
+		headerEl.style.borderRadius = "4px";
+		headerEl.style.marginBottom = "10px";
+		headerEl.style.fontWeight = "bold";
+
+		// Display cards directly without replacing the header
+		await this.renderCardsInRightPane(displayCards);
+	}
+
+	private async renderCardsInRightPane(cards: Flashcard[]) {
+		if (cards.length === 0) {
+			const noResultsEl = this.editorPane.createEl("div", { text: "No matching cards found." });
+			noResultsEl.style.padding = "10px";
+			noResultsEl.style.fontStyle = "italic";
+			return;
+		}
+
+		// Sort and display cards (same logic as displayCardsInRightPane but without header)
+		cards.sort((a, b) => (a.paraIdx ?? Infinity) - (b.paraIdx ?? Infinity));
+		
+		for (const card of cards) {
+			const row = this.editorPane.createDiv({ cls: "gn-cardrow" });
+			
+			// Add divider line between cards
+			row.style.borderBottom = "1px solid var(--background-modifier-border)";
+			row.style.paddingBottom = "8px";
+			row.style.marginBottom = "8px";
+			
+			// Add status icons (same as existing logic)
+			if (this.plugin.settings.showNewCardIndicators && isUnseen(card)) {
+				row.createEl("span", { text: "🌱" }).style.marginRight = "4px";
+			}
+			if (isBuried(card)) {
+				const iconSpan = row.createEl("span");
+				iconSpan.style.marginRight = "4px";
+				setIcon(iconSpan, "file-down");
+			}
+			if (card.suspended) {
+				const iconSpan = row.createEl("span");
+				iconSpan.style.marginRight = "4px";
+				setIcon(iconSpan, "ban");
+			}
+			if (card.flagged) {
+				const iconSpan = row.createEl("span");
+				iconSpan.style.marginRight = "4px";
+				setIcon(iconSpan, "flag");
+			}
+			
+			// Add card label with markdown rendering - make it inline
+			const labelSpan = row.createEl("span");
+			labelSpan.style.display = "inline"; // Keep everything on the same line
+			const firstVariant = this.plugin.getCurrentVariant(card, 0);
+			const frontText = firstVariant.front || "(empty front)";
+			
+			// Render markdown content including MathJax
+			labelSpan.empty();
+			await MarkdownRenderer.render(
+				this.plugin.app,
+				fixMath(frontText),
+				labelSpan,
+				"", // sourcePath - empty since we don't have a specific file
+				this.plugin // component
+			);
+			
+			// Remove paragraph spacing and make paragraphs inline to maintain compact card display
+			const paragraphs = labelSpan.querySelectorAll("p");
+			paragraphs.forEach(p => {
+				p.style.margin = "0";
+				p.style.padding = "0";
+				p.style.display = "inline"; // Make paragraphs inline so they don't break the line
+			});
+			
+			// Add line break before chapter info
+			row.createEl("br");
+			
+			// Add chapter info on new line, removing .md suffix
+			const chapterSpan = row.createEl("span", { cls: "gn-chapter-info" });
+			chapterSpan.style.opacity = "0.7";
+			chapterSpan.style.fontSize = "0.9em";
+			const chapterDisplay = card.chapter.replace(/\.md$/, "");
+			chapterSpan.setText(`(${chapterDisplay})`);
+			
+			// Add click handler to edit card
+			row.onclick = async () => {
+				const deckPath = getDeckPathForChapter(card.chapter);
+				const graph = await this.plugin.readDeck(deckPath);
+				const deck = this.app.vault.getAbstractFileByPath(deckPath) as TFile;
+				
+				this.plugin.openEditModal(card, graph, deck, async () => {
+					this.updateRightPaneForSelections(); // Refresh after editing
+				});
+			};
+			
+			// Add info button
+			row.createEl("span", { text: "ℹ️", cls: "gn-info" }).onclick = (ev) => {
+				ev.stopPropagation();
+				new CardInfoModal(this.plugin.app, card).open();
+			};
+			
+			// Add delete button
+			row.createEl("span", {
+				text: "🗑️",
+				cls: "gn-trash",
+			}).onclick = async (ev) => {
+				ev.stopPropagation();
+				if (!confirm("Delete this card permanently?")) return;
+				
+				// Get the deck for this card
+				const deckPath = getDeckPathForChapter(card.chapter);
+				const graph = await this.plugin.readDeck(deckPath);
+				delete graph[card.id];
+				await this.plugin.writeDeck(deckPath, graph);
+				
+				// Refresh badges and right pane
+				this.plugin.refreshAllStatuses();
+				
+				// Refresh the display
+				this.updateRightPaneForSelections();
+			};
+		}
+	}
+
+	private async startCustomStudy() {
+		// Get all cards currently visible in the right pane
+		const cardsToStudy = await this.getCardsForCustomStudy();
+		
+		if (cardsToStudy.length === 0) {
+			new Notice("No cards available for custom study. Try adjusting your selection or filters.");
+			return;
+		}
+
+		// Filter for due/reviewable cards
+		const now = Date.now();
+		const dueCards = cardsToStudy.filter(card => 
+			!card.suspended && // Not suspended
+			card.due <= now && // Due for review
+			!isBuried(card) && // Not buried
+			!isUnseen(card) // Not a new card - custom study should only review existing cards
+		);
+
+		if (dueCards.length === 0) {
+			// No due cards - offer study ahead option
+			const studyAhead = confirm(
+				`No cards are currently due in your selection (${cardsToStudy.length} total cards). Would you like to study ahead?`
+			);
+			
+			if (!studyAhead) return;
+			
+			// Use all cards for study ahead
+			this.startCustomReviewSession(cardsToStudy);
+		} else {
+			// Start session with due cards
+			const pathDisplay = this.selectedPaths.size === 0 
+				? "search results"
+				: this.selectedPaths.size === 1 
+					? Array.from(this.selectedPaths)[0]
+					: `${this.selectedPaths.size} selected items`;
+					
+			new Notice(`🎯 Custom study: ${dueCards.length} due cards from ${pathDisplay}`);
+			this.startCustomReviewSession(dueCards);
+		}
+	}
+
+	private async getCardsForCustomStudy(): Promise<Flashcard[]> {
+		if (this.selectedPaths.size > 0) {
+			// Use selected paths
+			const allSelectedCards: Flashcard[] = [];
+			
+			for (const selectedPath of this.selectedPaths) {
+				const isFolder = !selectedPath.includes('.md');
+				
+				if (isFolder) {
+					// Subject folder - get all cards from that subject
+					const decks = this.app.vault
+						.getFiles()
+						.filter((f) => f.name.endsWith(DECK_FILE_NAME) && f.path.startsWith(selectedPath));
+						
+					for (const deck of decks) {
+						const graph = await this.plugin.readDeck(deck.path);
+						const cardsInDeck = Object.values(graph) as Flashcard[];
+						allSelectedCards.push(...cardsInDeck);
+					}
+				} else {
+					// Individual chapter
+					const deckPath = getDeckPathForChapter(selectedPath);
+					try {
+						const graph = await this.plugin.readDeck(deckPath);
+						const cardsInDeck = Object.values(graph).filter(
+							(card: Flashcard) => card.chapter === selectedPath
+						) as Flashcard[];
+						allSelectedCards.push(...cardsInDeck);
+					} catch (error) {
+						console.warn(`Could not read deck for ${selectedPath}:`, error);
+					}
+				}
+			}
+
+			// Apply search filtering if there's a search query
+			const searchFiltered = this.searchQuery 
+				? allSelectedCards.filter(card => this.matchesSearch(card))
+				: allSelectedCards;
+			
+			return this.applyFiltersToCards(searchFiltered);
+		} else if (this.searchQuery) {
+			// Use search results from entire vault
+			const allDeckFiles = this.app.vault
+				.getFiles()
+				.filter((f) => f.name === DECK_FILE_NAME);
+			
+			const allCards: Flashcard[] = [];
+			for (const deckFile of allDeckFiles) {
+				try {
+					const content = await this.app.vault.read(deckFile);
+					const deckCards = JSON.parse(content);
+					allCards.push(...(Object.values(deckCards) as Flashcard[]));
+				} catch (error) {
+					console.warn(`Could not read deck ${deckFile.path}:`, error);
+				}
+			}
+			
+			// Filter by search query
+			const searchFiltered = allCards.filter(card => this.matchesSearch(card));
+			return this.applyFiltersToCards(searchFiltered);
+		} else {
+			// No selection or search - use entire vault
+			const allDeckFiles = this.app.vault
+				.getFiles()
+				.filter((f) => f.name === DECK_FILE_NAME);
+			
+			const allCards: Flashcard[] = [];
+			for (const deckFile of allDeckFiles) {
+				try {
+					const content = await this.app.vault.read(deckFile);
+					const deckCards = JSON.parse(content);
+					allCards.push(...(Object.values(deckCards) as Flashcard[]));
+				} catch (error) {
+					console.warn(`Could not read deck ${deckFile.path}:`, error);
+				}
+			}
+			
+			return this.applyFiltersToCards(allCards);
+		}
+	}
+
+	private cycleFilterState(currentState: FilterState): FilterState {
+		switch (currentState) {
+			case FilterState.OFF:
+				return FilterState.INCLUDE_ONLY;
+			case FilterState.INCLUDE_ONLY:
+				return FilterState.EXCLUDE;
+			case FilterState.EXCLUDE:
+				return FilterState.OFF;
+		}
+	}
+
+	private getFilterButtonStyle(state: FilterState): { backgroundColor: string; color: string; text: string } {
+		switch (state) {
+			case FilterState.OFF:
+				return {
+					backgroundColor: "var(--interactive-normal)",
+					color: "var(--text-normal)",
+					text: "off"
+				};
+			case FilterState.INCLUDE_ONLY:
+				return {
+					backgroundColor: "var(--text-success)",
+					color: "var(--text-on-accent)",
+					text: "only"
+				};
+			case FilterState.EXCLUDE:
+				return {
+					backgroundColor: "var(--text-error)",
+					color: "var(--text-on-accent)", 
+					text: "hide"
+				};
+		}
+	}
+
+	private async calculateFilterCounts(): Promise<{
+		flagged: { total: number; filtered: number };
+		suspended: { total: number; filtered: number };
+		buried: { total: number; filtered: number };
+		new: { total: number; filtered: number };
+	}> {
+		// Get all cards currently visible (after search but before other filters)
+		const allDeckFiles = this.app.vault
+			.getFiles()
+			.filter((f) => f.name === DECK_FILE_NAME);
+		
+		let allCards: Flashcard[] = [];
+		for (const deckFile of allDeckFiles) {
+			try {
+				const graph = await this.plugin.readDeck(deckFile.path);
+				allCards.push(...(Object.values(graph) as Flashcard[]));
+			} catch (error) {
+				console.warn(`Could not read deck ${deckFile.path}:`, error);
+			}
+		}
+		
+		// Apply search filter if active
+		if (this.searchQuery) {
+			allCards = allCards.filter(card => this.matchesSearch(card));
+		}
+		
+		// Count totals for each property
+		const flaggedTotal = allCards.filter(c => c.flagged).length;
+		const suspendedTotal = allCards.filter(c => c.suspended).length;
+		const buriedTotal = allCards.filter(c => isBuried(c)).length;
+		const newTotal = allCards.filter(c => isUnseen(c)).length;
+		
+		// Apply current filters to see how many would remain
+		const filteredCards = this.applyFiltersToCards(allCards);
+		const flaggedFiltered = filteredCards.filter(c => c.flagged).length;
+		const suspendedFiltered = filteredCards.filter(c => c.suspended).length;
+		const buriedFiltered = filteredCards.filter(c => isBuried(c)).length;
+		const newFiltered = filteredCards.filter(c => isUnseen(c)).length;
+		
+		return {
+			flagged: { total: flaggedTotal, filtered: flaggedFiltered },
+			suspended: { total: suspendedTotal, filtered: suspendedFiltered },
+			buried: { total: buriedTotal, filtered: buriedFiltered },
+			new: { total: newTotal, filtered: newFiltered }
+		};
+	}
+
+	private async updateFilterCounts(): Promise<void> {
+		const counts = await this.calculateFilterCounts();
+		
+		// Update each button with appropriate count based on its current state
+		if (this.filterCountUpdaters.flagged) {
+			this.filterCountUpdaters.flagged(counts.flagged.total);
+		}
+		if (this.filterCountUpdaters.suspended) {
+			this.filterCountUpdaters.suspended(counts.suspended.total);
+		}
+		if (this.filterCountUpdaters.buried) {
+			this.filterCountUpdaters.buried(counts.buried.total);
+		}
+		if (this.filterCountUpdaters.new) {
+			this.filterCountUpdaters.new(counts.new.total);
+		}
+	}
+
+	private createThreeStateFilterButton(
+		container: HTMLElement, 
+		iconOrText: string, 
+		getCurrentState: () => FilterState,
+		onStateChange: (newState: FilterState) => void,
+		tooltip: string,
+		useEmoji: boolean = false
+	): { button: HTMLElement; updateCount: (count: number) => void } {
+		const btn = container.createEl("button");
+		const iconEl = btn.createEl("div");
+		
+		if (useEmoji) {
+			iconEl.textContent = iconOrText;
+		} else {
+			setIcon(iconEl, iconOrText);
+		}
+		
+		const currentState = getCurrentState();
+		const stateEl = btn.createEl("div", { 
+			cls: "filter-state-text",
+			text: this.getFilterButtonStyle(currentState).text
+		});
+		stateEl.style.fontSize = "0.7em";
+		stateEl.style.marginTop = "2px";
+		
+		// Add count display
+		const countEl = btn.createEl("div", { 
+			cls: "filter-count-text",
+			text: "(0)"
+		});
+		countEl.style.fontSize = "0.6em";
+		countEl.style.marginTop = "1px";
+		countEl.style.opacity = "0.8";
+		
+		const addFilterButtonStyles = (button: HTMLElement) => {
+			button.style.padding = "4px 8px";
+			button.style.border = "1px solid var(--interactive-normal)";
+			button.style.borderRadius = "4px";
+			button.style.cursor = "pointer";
+			button.style.fontSize = "14px";
+			button.style.minWidth = "32px";
+			button.style.textAlign = "center";
+		};
+		
+		addFilterButtonStyles(btn);
+		const style = this.getFilterButtonStyle(currentState);
+		btn.style.backgroundColor = style.backgroundColor;
+		btn.style.color = style.color;
+		btn.setAttribute("aria-label", tooltip);
+		
+		btn.onclick = async () => {
+			const currentState = getCurrentState();
+			const newState = this.cycleFilterState(currentState);
+			onStateChange(newState);
+			
+			const newStyle = this.getFilterButtonStyle(newState);
+			btn.style.backgroundColor = newStyle.backgroundColor;
+			btn.style.color = newStyle.color;
+			stateEl.textContent = newStyle.text;
+			await this.renderContent();
+			await this.updateRightPaneForSelections(); // Refresh right pane with new filters
+			await this.updateFilterCounts(); // Update counts after filter change
+		};
+		
+		// Return button and count update function
+		return {
+			button: btn,
+			updateCount: (count: number) => {
+				const state = getCurrentState();
+				if (state === FilterState.OFF) {
+					countEl.textContent = ""; // Don't show anything when off
+				} else if (state === FilterState.EXCLUDE) {
+					countEl.textContent = `(-${count})`;
+				} else {
+					countEl.textContent = `(${count})`;
+				}
+			}
+		};
+	}
+
+	private applyFiltersToCards(cards: Flashcard[]): Flashcard[] {
+		let filteredCards = cards;
+		
+		// Apply legacy filter if exists
+		if (this.filter) filteredCards = filteredCards.filter(this.filter);
+		
+		// Apply three-state filters
+		// First apply all INCLUDE_ONLY filters (must match ALL)
+		if (this.flaggedFilter === FilterState.INCLUDE_ONLY) {
+			filteredCards = filteredCards.filter((c) => c.flagged);
+		}
+		if (this.suspendedFilter === FilterState.INCLUDE_ONLY) {
+			filteredCards = filteredCards.filter((c) => c.suspended);
+		}
+		if (this.buriedFilter === FilterState.INCLUDE_ONLY) {
+			filteredCards = filteredCards.filter((c) => isBuried(c));
+		}
+		if (this.newFilter === FilterState.INCLUDE_ONLY) {
+			filteredCards = filteredCards.filter((c) => isUnseen(c));
+		}
+		
+		// Then apply all EXCLUDE filters (must match NONE)
+		if (this.flaggedFilter === FilterState.EXCLUDE) {
+			filteredCards = filteredCards.filter((c) => !c.flagged);
+		}
+		if (this.suspendedFilter === FilterState.EXCLUDE) {
+			filteredCards = filteredCards.filter((c) => !c.suspended);
+		}
+		if (this.buriedFilter === FilterState.EXCLUDE) {
+			filteredCards = filteredCards.filter((c) => !isBuried(c));
+		}
+		if (this.newFilter === FilterState.EXCLUDE) {
+			filteredCards = filteredCards.filter((c) => !isUnseen(c));
+		}
+		
+		return filteredCards;
+	}
+
+	private startCustomReviewSession(cards: Flashcard[]) {
+		// Close the CardBrowser
+		this.close();
+		
+		// Start custom review with the specific filtered cards
+		this.plugin.startCustomReviewFromCards(cards);
+	}
+
+	private displayCardsInRightPane(cards: Flashcard[]) {
+		this.editorPane.empty();
+		
+		if (cards.length === 0) {
+			this.editorPane.setText("No cards found in selected items with current filters.");
+			return;
+		}
+
+		// Add header showing selection info
+		const headerEl = this.editorPane.createDiv({ cls: "gn-selection-header" });
+		headerEl.style.padding = "8px";
+		headerEl.style.marginBottom = "10px";
+		headerEl.style.borderBottom = "1px solid var(--background-modifier-border)";
+		headerEl.createEl("strong", { 
+			text: `${cards.length} cards from ${this.selectedPaths.size} selected items` 
+		});
+
+		// Sort and display cards
+		cards.sort((a, b) => (a.paraIdx ?? Infinity) - (b.paraIdx ?? Infinity));
+		
+		for (const card of cards) {
+			const row = this.editorPane.createDiv({ cls: "gn-cardrow" });
+			
+			// Add status icons (same as existing logic)
+			if (this.plugin.settings.showNewCardIndicators && isUnseen(card)) {
+				row.createEl("span", { text: "🌱" }).style.marginRight = "4px";
+			}
+			if (isBuried(card)) {
+				const iconSpan = row.createEl("span");
+				iconSpan.style.marginRight = "4px";
+				setIcon(iconSpan, "file-down");
+			}
+			if (card.suspended) {
+				const iconSpan = row.createEl("span");
+				iconSpan.style.marginRight = "4px";
+				setIcon(iconSpan, "ban");
+			}
+			if (card.flagged) {
+				const iconSpan = row.createEl("span");
+				iconSpan.style.marginRight = "4px";
+				setIcon(iconSpan, "flag");
+			}
+			
+			// Add card label
+			const labelSpan = row.createEl("span");
+			const firstVariant = this.plugin.getCurrentVariant(card, 0);
+			labelSpan.setText(firstVariant.front || "(empty front)");
+
+			// Add chapter info
+			const chapterSpan = row.createEl("span", { cls: "gn-chapter-info" });
+			chapterSpan.style.marginLeft = "8px";
+			chapterSpan.style.opacity = "0.7";
+			chapterSpan.style.fontSize = "0.9em";
+			chapterSpan.setText(`(${card.chapter})`);
+
+			// Add click handler to edit card
+			row.onclick = async () => {
+				const deckPath = getDeckPathForChapter(card.chapter);
+				const graph = await this.plugin.readDeck(deckPath);
+				const deck = this.app.vault.getAbstractFileByPath(deckPath) as TFile;
+				
+				this.plugin.openEditModal(card, graph, deck, async () => {
+					this.updateRightPaneForSelections(); // Refresh after editing
+				});
+			};
+
+			// Add info button
+			row.createEl("span", { text: "ℹ️", cls: "gn-info" }).onclick = (ev) => {
+				ev.stopPropagation();
+				new CardInfoModal(this.plugin.app, card).open();
+			};
+
+			// Add delete button
+			row.createEl("span", {
+				text: "🗑️",
+				cls: "gn-trash",
+			}).onclick = async (ev) => {
+				ev.stopPropagation();
+				if (!confirm("Delete this card permanently?")) return;
+				
+				// Get the deck for this card
+				const deckPath = getDeckPathForChapter(card.chapter);
+				const graph = await this.plugin.readDeck(deckPath);
+				
+				// Delete the card
+				delete graph[card.id];
+				await this.plugin.writeDeck(deckPath, graph);
+				this.plugin.refreshAllStatuses();
+				
+				// Refresh the display
+				this.updateRightPaneForSelections();
+			};
+		}
+	}
+
 	private saveBrowserState() {
 		// Convert Set to array for serialization
 		this.plugin.settings.cardBrowserExpandedSubjects = Array.from(this.state.openSubjects);
+		
+		// Save filter states to cardBrowserState
+		this.state.flaggedFilter = this.flaggedFilter;
+		this.state.suspendedFilter = this.suspendedFilter;
+		this.state.buriedFilter = this.buriedFilter;
+		this.state.newFilter = this.newFilter;
+		
 		this.plugin.saveSettings();
 		
 		this.plugin.logger(
 			LogLevel.VERBOSE,
-			`CardBrowser: Saved state -> ${this.plugin.settings.cardBrowserExpandedSubjects.length} expanded subjects`
+			`CardBrowser: Saved state -> ${this.plugin.settings.cardBrowserExpandedSubjects.length} expanded subjects, filters: ${this.flaggedFilter}/${this.suspendedFilter}/${this.buriedFilter}/${this.newFilter}`
 		);
 	}
 
@@ -15088,6 +15927,9 @@ class CardBrowser extends NavigationAwareModal {
 		if (this.searchTimeout) {
 			clearTimeout(this.searchTimeout);
 		}
+		
+		// Clear selections
+		this.selectedPaths.clear();
 		
 		this.contentEl.empty();
 	}
