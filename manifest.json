@@ -1,7 +1,7 @@
 {
 	"id": "gated-notes",
 	"name": "Gated Notes",
-	"version": "2.7.0",
+	"version": "2.8.0",
 	"minAppVersion": "1.5.0",
 	"description": "Turn your notes into an interactive learning experience with AI-powered flashcards and gated reading.",
 	"author": "Shayn Weidner",

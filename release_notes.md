@@ -1,3 +1,43 @@
+# v2.8.0
+
+## ✨ Mnemonic Generation System Enhancements ✨
+
+This release significantly expands the AI-powered mnemonic generation system with advanced customization options, improved user control, and better content management. The mnemonic modal now offers comprehensive style selection, card type override capabilities, and intelligent content formatting for iterative workflow support.
+
+### 🚀 New Features
+
+-   **🎨 Mnemonic Style Selection System:** Choose from 6 different AI generation styles for mental imagery and emoji generation:
+    -   **Alliterative:** Focus on words that start with similar sounds for memorable connections
+    -   **Rhyming:** Create rhythmic, musical patterns that stick in memory
+    -   **Humorous:** Use humor and absurd situations to enhance memorability
+    -   **Visual/Concrete:** Emphasize vivid visual imagery with colors, textures, and tangible objects
+    -   **Story-based:** Create narrative structures with characters and plot sequences
+    -   **Default:** Let the AI choose the best approach for your content
+
+-   **🎯 Mnemonic Card Type Override System:** Take manual control over content analysis for AI mnemonic generation:
+    -   **Smart Detection Bypass:** Override automatic card type detection when you know better
+    -   **5 Card Types:** List, Quote/verse, Foreign words, Concept, and Number-focused generation
+    -   **Targeted Instructions:** AI receives specific guidance based on your override selection
+    -   **Toggle Control:** Easy checkbox to enable/disable override functionality
+
+-   **📝 Enhanced Mnemonic Content Management:** Improved workflow for iterative mnemonic development:
+    -   **Markdown Formatting:** Existing mnemonic content is wrapped in code blocks when sent to AI for better context separation
+    -   **Side-by-Side Display:** Clear **ORIGINAL:** and **NEW GENERATION:** sections in mnemonic modal for easy comparison
+    -   **Iterative Support:** Generate multiple mnemonics to build up comprehensive collections
+
+### 🛠️ Bug Fixes
+
+-   **Fixed Mnemonic Temperature Settings:** Removed hardcoded temperature values (0.7, 0.8) in mnemonic LLM calls that weren't respecting the `openaiTemperature` setting
+-   **Fixed Mnemonic Save Button Visibility:** Configure mnemonics modal now always shows save button regardless of number detection
+-   **Fixed Padlock Icon Display:** Gated section padlock icons no longer get hidden behind blur effects - proper CSS layering implemented
+-   **Fixed Card Browser Hierarchy:** Nested folder structures now display correctly with proper parent-child relationships instead of duplicate top-level entries
+
+### 🎨 UX Improvements
+
+-   **Mnemonic Usage Information:** Added informational text in mnemonic modal explaining how existing content is shared with AI for context-aware generation
+-   **Improved Mnemonic Notifications:** Fixed misleading "0 mnemonics saved" messages by properly accounting for both major system and freeform content
+-   **Context-Aware Mnemonic Prompts:** Mnemonic AI generation now receives existing freeform content to generate complementary alternatives rather than duplicating content
+
 # v2.7.0
 
 ## ✨ New Release: The Card Browser & Study Mode Revolution! ✨

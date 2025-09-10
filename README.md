@@ -8,23 +8,6 @@ Instead of passively consuming information, you must _earn_ your way through a n
 
 ---
 
-## ✨ What's New: The Card Browser & Study Mode Revolution!
-
-This release fundamentally transforms the Card Browser with a complete search system and introduces a revolutionary study mode architecture. The old rigid folder structure has been replaced with flexible nested folder support and a powerful custom session system launched directly from the Card Browser.
-
--   **🔍 Complete Card Browser Search & Related Cards:** Brand-new search system with full-text search, advanced tag search (`tag:"exact-tag"`), MathJax rendering, and "Related: X" buttons that instantly find cards sharing the same tags. Performance-optimized with smart result limiting.
--   **🎯 Study Mode Revolution:** Complete overhaul of study modes with nested folder support:
-    -   **Note Mode** (replaces Chapter Mode): Now supports nested folder structures instead of requiring flat ./subject/chapter.md organization
-    -   **Custom Session Mode** (replaces Subject Mode): Launch targeted study sessions directly from Card Browser selections - choose specific notes, folders, or search results
-    -   **Flexible Vault Organization:** No longer constrained to subject/chapter structure - organize your vault however you want
--   **🎛️ Enhanced Three-State Filtering:** Upgraded filter system with off/include-only/exclude states for flagged, suspended, buried, and new cards. All filter states are now persistent across sessions.
--   **🧭 Modal Navigation System:** The Card Browser and Edit Modals now have a navigation history, allowing you to go back and forth between views without losing your place.
--   **📊 Study Statistics & Badge Fixes:** Fixed critical issues with badge logic that wasn't properly respecting suspended card status throughout the application.
--   **🧠 Complete Major System Implementation:** Full mnemonic generation system with corrected phonetic mappings (NG→N+G sounds, ER→R sounds), fallback dictionary, CMU dictionary integration, and persistent mnemonic storage within flashcards.
--   **⏭️ Session Continuation:** Smart session management that prompts users to review additional cards that become due during study sessions, with skip tracking to avoid re-prompting skipped cards.
-
----
-
 ## ✨ Key Features
 
 -   **Gated Reading:** Locks later paragraphs in a note until you’ve mastered the flashcards for the current section. When you unlock new content, the plugin **automatically scrolls to the next contentful paragraph and highlights it**.
@@ -42,12 +25,17 @@ This release fundamentally transforms the Card Browser with a complete search sy
     -   The plugin keeps a log of all AI API calls, allowing you to track your token usage and spending over time.
 
 -   **🧠 Smarter Review & Learning Engine:**
-    -   ** mnemonic System (Major System):** Automatically detect numbers in your cards and generate memorable phonetic word associations to aid in memorization.
+    -   **🎯 Advanced Mnemonic System (Major System):** Comprehensive memory aid system with AI-powered generation:
+        -   **Automatic Number Detection:** Detects numbers in your cards and generates memorable phonetic word associations
+        -   **6 AI Generation Styles:** Choose from Alliterative, Rhyming, Humorous, Visual/Concrete, Story-based, or Default approaches
+        -   **Card Type Override:** Manual control over content analysis - specify List, Quote/verse, Foreign words, Concept, or Number-focused generation
+        -   **Iterative Content Development:** Generate multiple mnemonics with side-by-side comparison (Original vs New Generation)
+        -   **Context-Aware Generation:** AI receives existing mnemonic content to create complementary alternatives
     -   **🔀 Smart Interleaving:** In Custom Session and Review-only modes, cards are selected using a weighted random algorithm that prioritizes more overdue cards, making study sessions more effective.
+    -   **⏭️ Session Continuation:** Smart session management that prompts users to review additional cards that become due during study sessions, with skip tracking to avoid re-prompting skipped cards.
     -   **Review Ahead:** Finished your queue? A new modal prompts you to study cards due in the near future.
     -   **Buried Cards:** A new `buried` state for cards that are temporarily hidden after being answered, preventing them from reappearing in the same session.
     -   **⚙️ Note Focus Control:** New setting to prioritize review cards before new cards in Note Focus mode.
-    -   **🐛 Gating Logic Fix:** Buried cards are now correctly excluded from the gating logic, ensuring smoother content unlocking.
 
 -   **🖼️ Multimodal AI & File Explorer:**
     -   **Contextual Image Analysis:** Automatically analyzes images, using surrounding text to understand diagrams, charts, and photos. It extracts key facts and context, not just visual elements.
@@ -64,10 +52,12 @@ This release fundamentally transforms the Card Browser with a complete search sy
     -   **Auto-Correct Tags:** If the AI generates a tag that isn't a direct quote, it will automatically attempt to fix it.
 
 -   **🗂️ Powerful Card Management:**
-    -   **Advanced Card Browser:** Complete search system with full-text and tag search, three-state filtering (off/include-only/exclude), MathJax rendering, and persistent state. Navigate seamlessly with modal navigation history.
-    -   **Related Cards Discovery:** "Related: X" buttons in edit modals and review sessions instantly find and display cards sharing the same tags, with performance-optimized search within the same deck.
-    -   **Custom Study Sessions:** Launch targeted study sessions directly from Card Browser - select specific notes, folders, or search results to create focused review sessions.
-    -   **Smart Search & Filtering:** Search across card content with `tag:"exact-tag"` syntax, performance-optimized with result limiting and proper debouncing to prevent UI freezing.
+    -   **Advanced Card Browser:** Complete search and filtering system:
+        -   **Full-Text Search:** Search across card fronts, backs, and tags simultaneously
+        -   **Exact String Search:** Wrap any search term in quotes for precise matching
+        -   **Three-State Filtering:** Off/Include-Only/Exclude states for flagged, suspended, buried, and new cards
+        -   **Modal Navigation History:** Navigate seamlessly between views without losing your place
+    -   **Related Cards Discovery:** "Related: X" buttons in edit modals and review sessions instantly find cards sharing the same tags.
     -   **Flag & Suspend Cards:** Mark cards with a 🚩 for future attention or suspend them (⏸️) to temporarily remove them from reviews.
     -   **Card Variants:** Edit cards with multiple variant phrasings in a dropdown interface.
     -   **Reset Card Progress:** Reset individual cards back to "new" from the edit modal.
@@ -75,8 +65,8 @@ This release fundamentally transforms the Card Browser with a complete search sy
 -   **🗓️ SM-2 Scheduling:** Built-in spaced repetition ensures maximum retention.
 
 -   **Multiple Study Modes:**
-    -   **🎯 Note Mode:** Review cards for the current note in gated reading (supports nested folder structures).
-    -   **🎯 Custom Session Mode:** Launch targeted study sessions directly from Card Browser selections - choose specific notes, folders, or search results to create focused review sessions.
+    -   **🎯 Note Mode:** Review cards for the current note in gated reading - supports any folder structure including deeply nested folders (no longer requires flat ./subject/chapter.md organization).
+    -   **🎯 Custom Session Mode:** Launch targeted study sessions directly from Card Browser - select specific notes, folders, or search results to create focused review sessions with flexible vault organization.
     -   **🧠 Review Mode:** Study all due cards vault-wide.
 
 ---
