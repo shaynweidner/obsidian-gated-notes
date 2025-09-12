@@ -175,6 +175,10 @@ interface Settings {
 	enableInterleaving: boolean;
 	/** Array of subject names that should be expanded in the CardBrowser. */
 	cardBrowserExpandedSubjects: string[];
+	/** Saved custom guidance snippets for LLM generation tasks. */
+	guidanceSnippets: { [name: string]: string };
+	/** Order of guidance snippets in the repository modal. */
+	guidanceSnippetOrder: string[];
 }
 
 const DEFAULT_SETTINGS: Settings = {
@@ -202,6 +206,15 @@ const DEFAULT_SETTINGS: Settings = {
 	chapterFocusReviewsFirst: true,
 	enableInterleaving: true,
 	cardBrowserExpandedSubjects: [],
+	guidanceSnippets: {
+		"Essential Cards": "Ignore any requested card count. Produce only 5–10 cards, focusing strictly on backbone concepts. Skip quotes, dates, and supporting examples.",
+		"Essential Additional Cards": "Ignore any requested card count. Produce only 5–10 cards to complement the existing flashcards, focusing strictly on backbone concepts. Skip quotes, dates, and supporting examples.",
+		"Expanded Cards": "Ignore any requested card count. Produce ~15–30 cards, including backbone concepts plus major supporting examples, quotes, or illustrations.",
+		"Expanded Additional Cards": "Ignore any requested card count. Produce ~15–30 cards to complement the existing flashcards, including backbone concepts plus major supporting examples, quotes, or illustrations.",
+		"Comprehensive Cards": "Ignore any requested card count. Produce as many cards as needed (30+ if appropriate), covering all quizzable content including names, dates, quotes, and counterarguments.",
+		"Comprehensive Additional Cards": "Ignore any requested card count. Produce as many cards as needed (30+ if appropriate) to complement the existing flashcards, covering all quizzable content including names, dates, quotes, and counterarguments."
+	},
+	guidanceSnippetOrder: ["Essential Cards", "Essential Additional Cards", "Expanded Cards", "Expanded Additional Cards", "Comprehensive Cards", "Comprehensive Additional Cards"],
 };
 
 interface ImageAnalysis {
@@ -3716,7 +3729,8 @@ export default class GatedNotesPlugin extends Plugin {
 											result.count,
 											result.preventDuplicates
 												? existingCards
-												: undefined
+												: undefined,
+											result.guidance
 										);
 									}
 								}
@@ -5151,12 +5165,29 @@ export default class GatedNotesPlugin extends Plugin {
 		}
 
 		const guidancePrompt = customGuidance
-			? `**User's Custom Instructions:**\n${customGuidance}`
+			? `**USER'S CUSTOM INSTRUCTIONS (HIGHEST PRIORITY):**
+${customGuidance}
+
+The instructions above override any conflicting guidance below and should be prioritized.
+
+---
+
+`
 			: "";
 
-		const initialPrompt = `Create ${count} new, distinct Anki-style flashcards from the following article. The article may contain text and special image placeholders of the format [[IMAGE: HASH=... DESCRIPTION=...]].
-	
-${guidancePrompt}
+		const cardCountInstruction = customGuidance 
+			? `**General Instructions:**
+Generate Anki-style flashcards from the following article, targeting approximately ${count} cards. The article may contain text and special image placeholders of the format [[IMAGE: HASH=... DESCRIPTION=...]]. Follow your guidance above for any specific requirements or modifications.`
+			: `Create ${count} new, distinct Anki-style flashcards from the following article. The article may contain text and special image placeholders of the format [[IMAGE: HASH=... DESCRIPTION=...]].`;
+
+		const initialPrompt = `${guidancePrompt}${cardCountInstruction}
+
+**Flashcard Quality Guidelines:**
+- **Atomicity:** Each card should test ONE specific concept or fact only
+- **Simplicity:** Ask direct, specific questions - avoid compound or broad questions
+- **Conciseness:** Keep answers brief, preferably one sentence
+- **Clarity:** Questions should be immediately understandable
+- **Specificity:** Test concrete facts rather than vague concepts
 
 **Card Generation Rules:**
 1.  **Text-Based Cards:** For cards based on plain text, the "Tag" MUST be a short, verbatim quote from the text.
@@ -5684,10 +5715,15 @@ ${selection}
 					const graph = await this.readDeck(deckPath);
 
 					const blockedCards = Object.values(graph).filter(
-						(c) =>
+						(c) => {
+							if(c.chapter === chapterPath && isBuried(c) ){
+							console.log(c);
+							};
+							return(
 							c.chapter === chapterPath &&
-							c.blocked &&
-							!c.suspended
+							isBlockingGating(c))
+						}
+							
 					);
 					const firstBlockedParaIdx =
 						blockedCards.length > 0
@@ -7849,9 +7885,7 @@ ${selection}
 		const blockedCards = Object.values(graph).filter(
 			(c) =>
 				c.chapter === chapterPath &&
-				c.blocked &&
-				!c.suspended &&
-				!isBuried(c)
+				isBlockingGating(c)
 		);
 
 		if (blockedCards.length === 0) {
@@ -7878,6 +7912,111 @@ ${selection}
 	async saveSettings(): Promise<void> {
 		await this.saveData(this.settings);
 		this.initializeOpenAIClient();
+	}
+
+	/**
+	 * Saves a custom guidance snippet with the given name.
+	 */
+	async saveGuidanceSnippet(name: string, guidance: string): Promise<void> {
+		const isNew = !(name in this.settings.guidanceSnippets);
+		this.settings.guidanceSnippets[name] = guidance;
+		
+		// Add to order array if new
+		if (isNew && !this.settings.guidanceSnippetOrder.includes(name)) {
+			this.settings.guidanceSnippetOrder.push(name);
+		}
+		
+		await this.saveSettings();
+	}
+
+	/**
+	 * Deletes a custom guidance snippet by name.
+	 */
+	async deleteGuidanceSnippet(name: string): Promise<void> {
+		delete this.settings.guidanceSnippets[name];
+		
+		// Remove from order array
+		const index = this.settings.guidanceSnippetOrder.indexOf(name);
+		if (index > -1) {
+			this.settings.guidanceSnippetOrder.splice(index, 1);
+		}
+		
+		await this.saveSettings();
+	}
+
+	/**
+	 * Gets all saved guidance snippet names in display order.
+	 */
+	getGuidanceSnippetNames(): string[] {
+		// Ensure all existing snippets are in the order array
+		const existingNames = Object.keys(this.settings.guidanceSnippets);
+		const orderedNames = this.settings.guidanceSnippetOrder.filter(name => existingNames.includes(name));
+		const unorderedNames = existingNames.filter(name => !this.settings.guidanceSnippetOrder.includes(name));
+		
+		// Return ordered names first, then any unordered ones (alphabetically)
+		return [...orderedNames, ...unorderedNames.sort()];
+	}
+
+	/**
+	 * Gets a guidance snippet by name.
+	 */
+	getGuidanceSnippet(name: string): string | undefined {
+		return this.settings.guidanceSnippets[name];
+	}
+
+	/**
+	 * Updates the order of guidance snippets.
+	 */
+	async updateGuidanceSnippetOrder(orderedNames: string[]): Promise<void> {
+		this.settings.guidanceSnippetOrder = orderedNames;
+		await this.saveSettings();
+	}
+
+	/**
+	 * Creates guidance snippet UI components (load/save dropdown and buttons).
+	 */
+	createGuidanceSnippetUI(
+		container: HTMLElement, 
+		guidanceInput: TextAreaComponent,
+		updateCallback?: () => void
+	): void {
+		const snippetContainer = container.createDiv({ cls: "guidance-snippet-controls" });
+		snippetContainer.style.cssText = "display: flex; gap: 8px; margin-top: 8px; align-items: center;";
+
+		// Repository button (combines select and manage functionality)
+		new ButtonComponent(snippetContainer)
+			.setButtonText("📁 Repository")
+			.setTooltip("Browse, use, edit, and manage saved guidance snippets")
+			.onClick(() => {
+				new GuidanceRepositoryModal(this, guidanceInput, updateCallback || (() => {})).open();
+			});
+
+		// Save button
+		new ButtonComponent(snippetContainer)
+			.setButtonText("Save")
+			.setTooltip("Save current guidance as snippet")
+			.onClick(async () => {
+				const guidance = guidanceInput.getValue().trim();
+				if (!guidance) {
+					new Notice("Please enter some guidance text first");
+					return;
+				}
+
+				const name = await this.promptForSnippetName();
+				if (name) {
+					await this.saveGuidanceSnippet(name, guidance);
+					new Notice(`Saved guidance snippet: ${name}`);
+				}
+			});
+	}
+
+	/**
+	 * Prompts user for a snippet name.
+	 */
+	private async promptForSnippetName(): Promise<string | null> {
+		return new Promise((resolve) => {
+			new SnippetNameModal(this.app, resolve).open();
+		});
 	}
 
 	public async readDeck(deckPath: string): Promise<FlashcardGraph> {
@@ -10733,6 +10872,30 @@ Return ONLY the final, perfected markdown text.`;
 	}
 
 	/**
+	 * Helper function to clean up markdown code fences from LLM responses
+	 */
+	private cleanMarkdownResponse(content: string): string {
+		if (!content) return content;
+		
+		// Remove leading ```markdown or ``` and trailing ```
+		let cleaned = content.trim();
+		
+		// Remove opening markdown code fence
+		if (cleaned.startsWith('```markdown\n') || cleaned.startsWith('```markdown ')) {
+			cleaned = cleaned.replace(/^```markdown\s*\n?/, '');
+		} else if (cleaned.startsWith('```\n') || cleaned.startsWith('``` ')) {
+			cleaned = cleaned.replace(/^```\s*\n?/, '');
+		}
+		
+		// Remove closing code fence
+		if (cleaned.endsWith('\n```') || cleaned.endsWith(' ```')) {
+			cleaned = cleaned.replace(/\s*```\s*$/, '');
+		}
+		
+		return cleaned.trim();
+	}
+
+	/**
 	 * Phase 1: Process a single page with multimodal (image + marked content text)
 	 */
 	private async runPhase1PerPage(
@@ -10754,29 +10917,56 @@ Guidelines:
 		const fullPrompt = `${systemPrompt}\n\n${userPrompt}`;
 
 		const maxTokens = this.getMaxTokensForMainProcessing();
-		return await this.plugin.sendToLlm(
+		const result = await this.plugin.sendToLlm(
 			fullPrompt,
 			pageImageDataUrl,
 			maxTokens ? { maxTokens } : {}
 		);
+		
+		// Clean up markdown code fences from response
+		if (result.content) {
+			result.content = this.cleanMarkdownResponse(result.content);
+		}
+		
+		return result;
 	}
 
 	/**
-	 * Get concatenated marked content text for the whole PDF (no page breaks)
+	 * Get concatenated marked content text for the selected page range only
 	 */
 	private async getFullMarkedText(): Promise<string> {
 		if (!this.selectedFile) {
 			return "";
 		}
 
+		// Use already-rendered pages which respect the user's page range selection
+		if (this.renderedPages.length > 0) {
+			const chunks: string[] = [];
+			for (const pageData of this.renderedPages) {
+				if (pageData.textContent) {
+					chunks.push(pageData.textContent.trim());
+				}
+			}
+			return chunks.join("\n\n");
+		}
+
+		// Fallback: Extract text from selected page range if renderedPages not available
 		const pdfjsLib = await this.loadPdfJs();
 		const typedArray = new Uint8Array(
 			await this.selectedFile.arrayBuffer()
 		);
 		const pdf = await pdfjsLib.getDocument(typedArray).promise;
 
+		// Get page range from UI inputs
+		const fromPage = parseInt(
+			this.pageRangeFromInput?.getValue() || "1"
+		);
+		const toPage = parseInt(
+			this.pageRangeToInput?.getValue() || pdf.numPages.toString()
+		);
+
 		const chunks: string[] = [];
-		for (let i = 1; i <= pdf.numPages; i++) {
+		for (let i = fromPage; i <= Math.min(toPage, pdf.numPages); i++) {
 			const page = await pdf.getPage(i);
 			const textContent = await page.getTextContent({
 				includeMarkedContent: true,
@@ -10849,11 +11039,18 @@ Rules:
 		const maxTokens = this.getMaxTokensForNuclearReview(
 			fullMarkedText.length
 		);
-		return await this.plugin.sendToLlm(
+		const result = await this.plugin.sendToLlm(
 			fullPrompt,
 			undefined,
 			maxTokens ? { maxTokens } : {}
 		);
+		
+		// Clean up markdown code fences from response
+		if (result.content) {
+			result.content = this.cleanMarkdownResponse(result.content);
+		}
+		
+		return result;
 	}
 
 	private async handleConvert(): Promise<void> {
@@ -13372,7 +13569,8 @@ class EditModal extends NavigationAwareModal {
 				currentVariant,
 				existingVariants,
 				includeExisting,
-				options.quantity
+				options.quantity,
+				options.guidance
 			);
 			if (!confirmed) {
 				return;
@@ -13390,7 +13588,8 @@ class EditModal extends NavigationAwareModal {
 				currentVariant,
 				existingVariants,
 				includeExisting,
-				options.quantity
+				options.quantity,
+				options.guidance
 			);
 		} catch (error) {
 			console.error("Error generating variants:", error);
@@ -13412,6 +13611,7 @@ class EditModal extends NavigationAwareModal {
 
 	private showVariantOptionsModal(): Promise<{
 		quantity: "one" | "many";
+		guidance?: string;
 	} | null> {
 		return new Promise((resolve) => {
 			new VariantOptionsModal(this.plugin, (result) =>
@@ -13424,7 +13624,8 @@ class EditModal extends NavigationAwareModal {
 		currentVariant: CardVariant,
 		existingVariants: CardVariant[],
 		includeExisting: boolean,
-		quantity: "one" | "many"
+		quantity: "one" | "many",
+		guidance?: string
 	): Promise<boolean> {
 		return new Promise((resolve) => {
 			const modal = new ActionConfirmationModal(
@@ -13506,7 +13707,8 @@ ${Array.from(
 		currentVariant: CardVariant,
 		existingVariants: CardVariant[],
 		includeExisting: boolean,
-		quantity: "one" | "many"
+		quantity: "one" | "many",
+		guidance?: string
 	) {
 		let promptVariants = "";
 		if (includeExisting) {
@@ -13525,6 +13727,16 @@ ${Array.from(
 		const isMultiple = quantity === "many";
 		const quantityText = isMultiple ? "2–3 NEW" : "1 NEW";
 
+		const customGuidanceSection = guidance 
+			? `
+**User's Custom Instructions:**
+${guidance}
+
+The instructions above override any conflicting guidance below and should be prioritized.
+
+` 
+			: '';
+
 		const prompt = `You are a flashcard variant generator.
 I will give you ${
 			includeExisting ? "existing flashcard variants" : "a flashcard"
@@ -13533,7 +13745,7 @@ Your task is to create ${quantityText} alternative version${
 			isMultiple ? "s" : ""
 		} that quiz${isMultiple ? "" : "es"} the same knowledge.
 
-Rules for variants:
+${customGuidanceSection}Rules for variants:
 - Each variant should quiz the **same knowledge** as the existing ones.
 - Rephrase the wording, structure, or phrasing, but do not change the meaning.
 - Keep the answer semantically equivalent, just optionally rephrased.
@@ -15000,11 +15212,14 @@ class RefocusOptionsModal extends Modal {
  * A modal for selecting options before "generating variants" for a card with AI.
  */
 class VariantOptionsModal extends Modal {
+	private guidanceInput?: TextAreaComponent;
+
 	constructor(
 		private plugin: GatedNotesPlugin,
 		private onDone: (
 			result: {
 				quantity: "one" | "many";
+				guidance?: string;
 			} | null
 		) => void
 	) {
@@ -15021,6 +15236,26 @@ class VariantOptionsModal extends Modal {
 			text: "How many variant flashcards would you like to generate?",
 		});
 
+		// Add custom guidance section
+		const guidanceContainer = this.contentEl.createDiv();
+		const addGuidanceBtn = new ButtonComponent(guidanceContainer)
+			.setButtonText("Add Custom Guidance")
+			.onClick(() => {
+				addGuidanceBtn.buttonEl.style.display = "none";
+				new Setting(guidanceContainer)
+					.setName("Custom Guidance")
+					.setDesc("Provide specific instructions for variant generation.")
+					.addTextArea((text) => {
+						this.guidanceInput = text;
+						text.setPlaceholder("e.g., 'Make variants simpler', 'Focus on application rather than recall', etc.");
+						text.inputEl.rows = 3;
+						text.inputEl.style.width = "100%";
+						
+						// Add guidance snippet UI
+						this.plugin.createGuidanceSnippetUI(guidanceContainer, text);
+					});
+			});
+
 		const btnRow = this.contentEl.createDiv({ cls: "gn-edit-btnrow" });
 
 		new ButtonComponent(btnRow).setButtonText("Cancel").onClick(() => {
@@ -15032,7 +15267,10 @@ class VariantOptionsModal extends Modal {
 		new ButtonComponent(btnRow).setButtonText("Just One").onClick(() => {
 			choiceMade = true;
 			this.close();
-			this.onDone({ quantity: "one" });
+			this.onDone({ 
+				quantity: "one",
+				guidance: this.guidanceInput?.getValue()
+			});
 		});
 
 		new ButtonComponent(btnRow)
@@ -15041,7 +15279,10 @@ class VariantOptionsModal extends Modal {
 			.onClick(() => {
 				choiceMade = true;
 				this.close();
-				this.onDone({ quantity: "many" });
+				this.onDone({ 
+					quantity: "many",
+					guidance: this.guidanceInput?.getValue()
+				});
 			});
 
 		this.onClose = () => {
@@ -16702,7 +16943,7 @@ class GenerateCardsModal extends Modal {
 			.setButtonText("Add Custom Guidance")
 			.onClick(() => {
 				addGuidanceBtn.buttonEl.style.display = "none";
-				new Setting(guidanceContainer)
+				const guidanceSetting = new Setting(guidanceContainer)
 					.setName("Custom Guidance")
 					.setDesc(
 						"Provide specific instructions for the AI (e.g., 'All answers must be a single word')."
@@ -16713,6 +16954,9 @@ class GenerateCardsModal extends Modal {
 						text.inputEl.rows = 4;
 						text.inputEl.style.width = "100%";
 						text.onChange(() => this.costUi.update());
+						
+						// Add guidance snippet UI after textarea is created
+						this.plugin.createGuidanceSnippetUI(guidanceContainer, text, () => this.costUi.update());
 					});
 			});
 		const costContainer = this.contentEl.createDiv();
@@ -16721,7 +16965,10 @@ class GenerateCardsModal extends Modal {
 				Number(this.countInput.getValue()) || this.defaultCardCount;
 			const guidance = this.guidanceInput?.getValue() || "";
 
-			const promptText = `Create ${count} new, distinct Anki-style flashcards...${guidance}...Here is the article:\n${plainText}`;
+			const cardCountInstruction = guidance.trim()
+				? `Generate Anki-style flashcards from the following article, aiming for approximately ${count} cards unless your guidance specifies otherwise.`
+				: `Create ${count} new, distinct Anki-style flashcards from the following article.`;
+			const promptText = `${cardCountInstruction}...${guidance}...Here is the article:\n${plainText}`;
 			return {
 				promptText: promptText,
 				imageCount: 0,
@@ -16868,6 +17115,7 @@ class GenerateAdditionalCardsModal extends Modal {
 			result: {
 				count: number;
 				preventDuplicates: boolean;
+				guidance?: string;
 			} | null
 		) => void
 	) {
@@ -16925,6 +17173,9 @@ class GenerateAdditionalCardsModal extends Modal {
 						text.inputEl.rows = 4;
 						text.inputEl.style.width = "100%";
 						text.onChange(() => this.costUi.update());
+						
+						// Add guidance snippet UI after textarea is created
+						this.plugin.createGuidanceSnippetUI(guidanceContainer, text, () => this.costUi.update());
 					});
 			});
 
@@ -16944,7 +17195,10 @@ class GenerateAdditionalCardsModal extends Modal {
 			const count =
 				Number(this.countInput.getValue()) || defaultCardCount;
 
-			const promptText = `Create ${count} new...${guidance}...${contextPrompt}Here is the article:\n${plainText}`;
+			const cardCountInstruction = guidance.trim()
+				? `Generate additional Anki-style flashcards from the following article, aiming for approximately ${count} cards unless your guidance specifies otherwise.`
+				: `Create ${count} new, additional Anki-style flashcards from the following article.`;
+			const promptText = `${cardCountInstruction}...${guidance}...${contextPrompt}Here is the article:\n${plainText}`;
 			return {
 				promptText: promptText,
 				imageCount: 0,
@@ -16973,6 +17227,7 @@ class GenerateAdditionalCardsModal extends Modal {
 							count: count > 0 ? count : defaultCardCount,
 							preventDuplicates:
 								this.preventDuplicatesToggle.getValue(),
+							guidance: this.guidanceInput?.getValue(),
 						});
 						this.close();
 					})
@@ -17614,8 +17869,26 @@ const isUnseen = (card: Flashcard): boolean =>
  * @param card The flashcard to check.
  * @returns True if the card is buried, false otherwise.
  */
-const isBuried = (card: Flashcard): boolean =>
-	!!card.buried && card.due <= Date.now();
+const isBuried = (card: Flashcard): boolean => {
+	return(!!card.buried && card.due <= Date.now())
+}
+
+/**
+ * Checks if a flashcard should block content gating.
+ * Buried cards stop blocking only while their bury period is active (due time hasn't passed).
+ * Once bury period expires, they resume blocking until reviewed.
+ * @param card The flashcard to check.
+ * @returns True if the card should block content gating, false otherwise.
+ */
+const isBlockingGating = (card: Flashcard): boolean => {
+	if (!card.blocked || card.suspended) return false;
+	
+	// If card is buried but due time hasn't passed yet, don't block
+	if (card.buried && card.due > Date.now()) return false;
+	
+	// Otherwise, block (includes buried cards whose bury period has expired)
+	return true;
+};
 
 /**
  * Parses time input strings like "5m", "2.5h", "1d" into milliseconds.
@@ -18960,6 +19233,308 @@ class StudyOverviewModal extends Modal {
 		} catch (error) {
 			loadingEl.setText("Error gathering statistics: " + error);
 		}
+	}
+
+	onClose() {
+		this.contentEl.empty();
+	}
+}
+
+/**
+ * Modal for entering a name for a guidance snippet.
+ */
+class SnippetNameModal extends Modal {
+	constructor(app: App, private onDone: (name: string | null) => void) {
+		super(app);
+	}
+
+	onOpen() {
+		this.titleEl.setText("Save Guidance Snippet");
+		
+		const nameInput = new TextComponent(this.contentEl);
+		nameInput.setPlaceholder("Enter snippet name...");
+		nameInput.inputEl.focus();
+		
+		nameInput.inputEl.addEventListener("keydown", (event) => {
+			if (event.key === "Enter") {
+				const name = nameInput.getValue().trim();
+				if (name) {
+					this.close();
+					this.onDone(name);
+				}
+			}
+			if (event.key === "Escape") {
+				this.close();
+				this.onDone(null);
+			}
+		});
+
+		const buttonContainer = this.contentEl.createDiv({ cls: "modal-button-container" });
+		buttonContainer.style.marginTop = "16px";
+
+		new ButtonComponent(buttonContainer)
+			.setButtonText("Save")
+			.setCta()
+			.onClick(() => {
+				const name = nameInput.getValue().trim();
+				if (name) {
+					this.close();
+					this.onDone(name);
+				}
+			});
+
+		new ButtonComponent(buttonContainer)
+			.setButtonText("Cancel")
+			.onClick(() => {
+				this.close();
+				this.onDone(null);
+			});
+	}
+}
+
+/**
+ * Modal for managing saved guidance snippets.
+ */
+class GuidanceRepositoryModal extends Modal {
+	constructor(
+		private plugin: GatedNotesPlugin,
+		private textArea: TextAreaComponent,
+		private onUpdate: () => void
+	) {
+		super(plugin.app);
+	}
+
+	onOpen() {
+		this.titleEl.setText("Guidance Repository");
+		this.contentEl.empty();
+
+		const snippetNames = this.plugin.getGuidanceSnippetNames();
+		
+		if (snippetNames.length === 0) {
+			this.contentEl.createEl("p", {
+				text: "No saved guidance snippets found.",
+				cls: "u-center"
+			});
+			return;
+		}
+
+		// Add instructions for reordering
+		if (snippetNames.length > 1) {
+			const instructions = this.contentEl.createDiv({ cls: "guidance-instructions" });
+			instructions.style.cssText = "margin-bottom: 16px; padding: 8px; background: var(--background-secondary); border-radius: 4px; font-size: 0.9em; color: var(--text-muted);";
+			instructions.createEl("span", { text: "💡 Tip: Drag and drop to reorder snippets" });
+		}
+
+		// Create sortable container
+		const listContainer = this.contentEl.createDiv({ cls: "guidance-snippet-list" });
+		
+		snippetNames.forEach((name, index) => {
+			const container = listContainer.createDiv({ 
+				cls: "guidance-snippet-item",
+				attr: { "data-name": name }
+			});
+			container.style.cssText = "padding: 12px; border: 1px solid var(--background-modifier-border); margin-bottom: 8px; border-radius: 4px; cursor: grab; position: relative;";
+			container.draggable = true;
+			
+			// Add drag handle
+			const dragHandle = container.createDiv({ cls: "drag-handle" });
+			dragHandle.style.cssText = "position: absolute; left: 4px; top: 50%; transform: translateY(-50%); color: var(--text-muted); font-size: 14px; cursor: grab;";
+			dragHandle.textContent = "⋮⋮";
+			
+			// Adjust container padding to account for drag handle
+			container.style.paddingLeft = "24px";
+			
+			const header = container.createDiv({ cls: "guidance-snippet-header" });
+			header.style.cssText = "display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px;";
+			const nameEl = header.createEl("strong", { text: name });
+			
+			const preview = container.createDiv({ cls: "guidance-snippet-preview" });
+			preview.style.cssText = "margin-bottom: 12px; color: var(--text-muted); font-size: 0.9em; line-height: 1.3;";
+			const content = this.plugin.getGuidanceSnippet(name);
+			if (!content) return; // Skip if content is undefined
+			
+			const truncated = content.length > 80 ? content.substring(0, 80) + "..." : content;
+			preview.createEl("span", { text: truncated });
+			
+			const buttonContainer = container.createDiv({ cls: "guidance-snippet-buttons" });
+			buttonContainer.style.cssText = "display: flex; gap: 8px;";
+			
+			new ButtonComponent(buttonContainer)
+				.setButtonText("Use")
+				.setCta()
+				.onClick(() => {
+					const currentValue = this.textArea.getValue();
+					const newValue = currentValue ? currentValue + "\n\n" + content : content;
+					this.textArea.setValue(newValue);
+					this.onUpdate();
+					this.close();
+				});
+			
+			new ButtonComponent(buttonContainer)
+				.setButtonText("Edit")
+				.onClick(() => {
+					new GuidanceEditModal(this.plugin, name, content, () => {
+						this.onUpdate();
+						this.onOpen(); // Refresh the repository modal
+					}).open();
+				});
+			
+			new ButtonComponent(buttonContainer)
+				.setButtonText("Delete")
+				.setWarning()
+				.onClick(async () => {
+					if (confirm(`Delete guidance snippet "${name}"?`)) {
+						await this.plugin.deleteGuidanceSnippet(name);
+						this.onUpdate();
+						this.onOpen(); // Refresh the modal
+					}
+				});
+		});
+
+		// Add drag and drop event listeners
+		this.setupDragAndDrop(listContainer);
+	}
+
+	private setupDragAndDrop(container: HTMLElement) {
+		let draggedElement: HTMLElement | null = null;
+		
+		container.addEventListener('dragstart', (e) => {
+			if (e.target instanceof HTMLElement && e.target.classList.contains('guidance-snippet-item')) {
+				draggedElement = e.target;
+				e.target.style.opacity = '0.5';
+			}
+		});
+		
+		container.addEventListener('dragend', (e) => {
+			if (e.target instanceof HTMLElement && e.target.classList.contains('guidance-snippet-item')) {
+				e.target.style.opacity = '1';
+				draggedElement = null;
+			}
+		});
+		
+		container.addEventListener('dragover', (e) => {
+			e.preventDefault();
+		});
+		
+		container.addEventListener('drop', async (e) => {
+			e.preventDefault();
+			
+			if (!draggedElement) return;
+			
+			const targetElement = (e.target as HTMLElement).closest('.guidance-snippet-item') as HTMLElement;
+			if (!targetElement || targetElement === draggedElement) return;
+			
+			// Get the new order
+			const items = Array.from(container.querySelectorAll('.guidance-snippet-item'));
+			const draggedIndex = items.indexOf(draggedElement);
+			const targetIndex = items.indexOf(targetElement);
+			
+			// Move the element in the DOM
+			if (draggedIndex < targetIndex) {
+				targetElement.parentNode?.insertBefore(draggedElement, targetElement.nextSibling);
+			} else {
+				targetElement.parentNode?.insertBefore(draggedElement, targetElement);
+			}
+			
+			// Update the order in settings
+			const newOrder = Array.from(container.querySelectorAll('.guidance-snippet-item'))
+				.map(el => (el as HTMLElement).getAttribute('data-name'))
+				.filter(name => name !== null) as string[];
+			
+			await this.plugin.updateGuidanceSnippetOrder(newOrder);
+		});
+	}
+
+	onClose() {
+		this.contentEl.empty();
+	}
+}
+
+class GuidanceEditModal extends Modal {
+	private editTextArea!: TextAreaComponent;
+	private nameInput!: TextComponent;
+	private hasChanges = false;
+
+	constructor(
+		private plugin: GatedNotesPlugin,
+		private originalName: string,
+		private originalContent: string,
+		private onSave: () => void
+	) {
+		super(plugin.app);
+	}
+
+	onOpen() {
+		this.titleEl.setText(`Edit Guidance Snippet`);
+		this.contentEl.empty();
+
+		new Setting(this.contentEl)
+			.setName("Snippet Name")
+			.addText(text => {
+				this.nameInput = text;
+				text.setValue(this.originalName);
+				text.inputEl.style.width = "100%";
+				text.onChange(() => {
+					this.checkForChanges();
+				});
+			});
+
+		new Setting(this.contentEl)
+			.setName("Guidance Content")
+			.addTextArea(text => {
+				this.editTextArea = text;
+				text.setValue(this.originalContent);
+				text.inputEl.rows = 8;
+				text.inputEl.style.width = "100%";
+				text.onChange(() => {
+					this.checkForChanges();
+				});
+			});
+
+		new Setting(this.contentEl)
+			.addButton(button => 
+				button
+					.setButtonText("Save")
+					.setCta()
+					.onClick(async () => {
+						const newName = this.nameInput.getValue().trim();
+						const newContent = this.editTextArea.getValue().trim();
+						
+						if (!newName) {
+							new Notice("Please enter a name for the snippet");
+							return;
+						}
+						
+						if (!newContent) {
+							new Notice("Please enter content for the snippet");
+							return;
+						}
+						
+						if (this.hasChanges) {
+							// If name changed, delete old snippet
+							if (newName !== this.originalName) {
+								await this.plugin.deleteGuidanceSnippet(this.originalName);
+							}
+							
+							// Save with new name and content
+							await this.plugin.saveGuidanceSnippet(newName, newContent);
+							new Notice(`Saved "${newName}"`);
+							this.onSave();
+						}
+						this.close();
+					})
+			)
+			.addButton(button =>
+				button
+					.setButtonText("Cancel")
+					.onClick(() => this.close())
+			);
+	}
+
+	private checkForChanges() {
+		const nameChanged = this.nameInput.getValue() !== this.originalName;
+		const contentChanged = this.editTextArea.getValue() !== this.originalContent;
+		this.hasChanges = nameChanged || contentChanged;
 	}
 
 	onClose() {
