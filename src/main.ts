@@ -330,6 +330,7 @@ interface EpubStructure {
 	author?: string;
 	sections: EpubSection[];
 	manifest: { [id: string]: { href: string; mediaType: string } };
+	cssStyles: { [className: string]: { [property: string]: string } };
 }
 
 const LLM_LOG_FILE = "_llm_log.json";
@@ -8549,7 +8550,10 @@ class EpubToNoteModal extends Modal {
 			);
 		}
 
-		return { title, author, sections, manifest };
+		// Extract CSS styles
+		const cssStyles = await this.extractCssStyles(this.zipData, manifest, opfPath);
+
+		return { title, author, sections, manifest, cssStyles };
 	}
 
 	private async parseNcxToc(
@@ -8860,23 +8864,17 @@ class EpubToNoteModal extends Modal {
 		}
 
 		try {
-			const basePath = this.getBasePath();
-			const fullPath = basePath + section.href;
+			const fullPath = this.resolveFilePath(section.href);
 
 			const file = this.zipData.file(fullPath);
 			if (!file) {
-				const alternativePath = section.href;
-				const altFile = this.zipData.file(alternativePath);
-				if (!altFile) {
-					const availableFiles = Object.keys(
-						this.zipData.files
-					).slice(0, 10);
-					return {
-						content: `[File not found: ${fullPath}]`,
-						wordCount: 3,
-					};
-				}
-				return await this.extractContentFromFile(altFile);
+				const availableFiles = Object.keys(
+					this.zipData.files
+				).slice(0, 10);
+				return {
+					content: `[File not found: ${fullPath}]`,
+					wordCount: 3,
+				};
 			}
 
 			return await this.extractContentFromFile(file);
@@ -9125,8 +9123,7 @@ class EpubToNoteModal extends Modal {
 			return "[Content extraction failed]";
 		}
 
-		const basePath = this.getBasePath();
-		const fullPath = basePath + section.href;
+		const fullPath = this.resolveFilePath(section.href);
 
 		const file = this.zipData.file(fullPath);
 		if (!file) {
@@ -9147,6 +9144,196 @@ class EpubToNoteModal extends Modal {
 
 	private getBasePath(): string {
 		return this.epubBasePath || "";
+	}
+
+	private resolveFilePath(href: string): string {
+		// Remove fragment identifier if present (e.g., #ch1)
+		const cleanHref = href.split('#')[0];
+		
+		// If href already includes the base path, don't duplicate it
+		const basePath = this.getBasePath();
+		if (cleanHref.startsWith(basePath)) {
+			return cleanHref;
+		}
+		
+		// Otherwise, combine base path with href
+		return basePath + cleanHref;
+	}
+
+	private async extractCssStyles(
+		zip: JSZip,
+		manifest: { [id: string]: { href: string; mediaType: string } },
+		opfPath: string
+	): Promise<{ [className: string]: { [property: string]: string } }> {
+		const cssStyles: { [className: string]: { [property: string]: string } } = {};
+		const basePath = opfPath.substring(0, opfPath.lastIndexOf("/") + 1);
+
+		// Find all CSS files in the manifest
+		const cssFiles = Object.values(manifest).filter(
+			item => item.mediaType === "text/css"
+		);
+
+		for (const cssFile of cssFiles) {
+			try {
+				const fullPath = basePath + cssFile.href;
+				const file = zip.file(fullPath);
+				if (!file) continue;
+
+				const cssContent = await file.async("text");
+				const parsedStyles = this.parseCssContent(cssContent);
+				
+				// Merge parsed styles into the main styles object
+				Object.assign(cssStyles, parsedStyles);
+			} catch (error) {
+				console.warn(`Failed to extract CSS from ${cssFile.href}:`, error);
+			}
+		}
+
+		return cssStyles;
+	}
+
+	private parseCssContent(cssContent: string): { [className: string]: { [property: string]: string } } {
+		const styles: { [className: string]: { [property: string]: string } } = {};
+		
+		// Simple CSS parser - handle class selectors
+		const classRuleRegex = /\.([a-zA-Z0-9_-]+)\s*\{([^}]+)\}/g;
+		let match;
+
+		while ((match = classRuleRegex.exec(cssContent)) !== null) {
+			const className = match[1];
+			const properties = match[2];
+			
+			const parsedProps: { [property: string]: string } = {};
+			
+			// Parse properties
+			const propRegex = /([a-zA-Z-]+)\s*:\s*([^;]+);?/g;
+			let propMatch;
+			
+			while ((propMatch = propRegex.exec(properties)) !== null) {
+				const property = propMatch[1].trim();
+				const value = propMatch[2].trim();
+				parsedProps[property] = value;
+			}
+			
+			styles[className] = parsedProps;
+		}
+
+		return styles;
+	}
+
+	private async computeImageHash(arrayBuffer: ArrayBuffer): Promise<string> {
+		// Simple hash using the first few bytes + length + last few bytes
+		const bytes = new Uint8Array(arrayBuffer);
+		const length = bytes.length;
+		
+		// Take first 8 bytes, length, and last 8 bytes for a simple hash
+		const hashParts = [];
+		for (let i = 0; i < Math.min(8, length); i++) {
+			hashParts.push(bytes[i].toString(16).padStart(2, '0'));
+		}
+		hashParts.push(length.toString(16));
+		for (let i = Math.max(0, length - 8); i < length; i++) {
+			hashParts.push(bytes[i].toString(16).padStart(2, '0'));
+		}
+		
+		return hashParts.join('');
+	}
+
+	private async findExistingImageByHash(hash: string): Promise<string | null> {
+		try {
+			const imagesFile = this.app.vault.getAbstractFileByPath('_images.json');
+			if (!imagesFile || !(imagesFile instanceof TFile)) {
+				return null;
+			}
+			
+			const content = await this.app.vault.read(imagesFile);
+			const imagesData = JSON.parse(content);
+			
+			// Look for an image with this hash
+			for (const [filename, data] of Object.entries(imagesData)) {
+				if (typeof data === 'object' && data && (data as any).hash === hash) {
+					// Check if the file still exists
+					const imageFile = this.app.vault.getAbstractFileByPath(filename);
+					if (imageFile instanceof TFile) {
+						return filename;
+					}
+				}
+			}
+		} catch (error) {
+			console.warn('Error checking existing images:', error);
+		}
+		
+		return null;
+	}
+
+	private async updateImagesJson(filename: string, hash: string): Promise<void> {
+		try {
+			const imagesPath = '_images.json';
+			let imagesData: any = {};
+			
+			// Try to read existing _images.json
+			const imagesFile = this.app.vault.getAbstractFileByPath(imagesPath);
+			if (imagesFile instanceof TFile) {
+				const content = await this.app.vault.read(imagesFile);
+				imagesData = JSON.parse(content);
+			}
+			
+			// Add the new image entry
+			imagesData[filename] = {
+				hash: hash,
+				addedAt: new Date().toISOString(),
+				source: 'epub-conversion'
+			};
+			
+			// Write back to _images.json
+			await this.app.vault.adapter.write(imagesPath, JSON.stringify(imagesData, null, 2));
+		} catch (error) {
+			console.warn('Error updating _images.json:', error);
+		}
+	}
+
+	private getElementStyling(element: Element): { isSubscript: boolean; isSuperscript: boolean } {
+		const result = { isSubscript: false, isSuperscript: false };
+		
+		if (!this.epubStructure?.cssStyles) {
+			return result;
+		}
+		
+		// Check class attribute
+		const className = element.getAttribute("class");
+		if (!className) {
+			return result;
+		}
+		
+		// Split multiple classes and check each one
+		const classNames = className.split(/\s+/);
+		
+		for (const cls of classNames) {
+			const style = this.epubStructure.cssStyles[cls];
+			if (!style) continue;
+			
+			// Check for subscript indicators
+			if (style["vertical-align"] === "sub" || 
+				style["vertical-align"] === "subscript" ||
+				(style["font-size"] && parseFloat(style["font-size"]) < 1.0 && style["vertical-align"]?.includes("sub"))) {
+				result.isSubscript = true;
+			}
+			
+			// Check for superscript indicators  
+			if (style["vertical-align"] === "super" || 
+				style["vertical-align"] === "superscript" ||
+				(style["font-size"] && parseFloat(style["font-size"]) < 1.0 && style["vertical-align"]?.includes("super"))) {
+				result.isSuperscript = true;
+			}
+		}
+		
+		return result;
+	}
+
+	private smartJoinWithSpaces(parts: string[]): string {
+		// Simple approach: just join parts as they come from DOM parsing
+		// The DOM parser preserves the original whitespace from the XHTML
+		return parts.join("");
 	}
 
 	private async convertXhtmlToMarkdown(
@@ -9181,7 +9368,7 @@ class EpubToNoteModal extends Modal {
 
 	private async processNode(node: Node, href: string): Promise<string> {
 		if (node.nodeType === Node.TEXT_NODE) {
-			return node.textContent?.trim() || "";
+			return node.textContent || "";
 		}
 
 		if (node.nodeType !== Node.ELEMENT_NODE) {
@@ -9203,7 +9390,16 @@ class EpubToNoteModal extends Modal {
 				return `${prefix} ${element.textContent?.trim() || ""}`;
 
 			case "p":
-				return element.textContent?.trim() || "";
+				const pChildResults: string[] = [];
+				for (const child of Array.from(element.childNodes)) {
+					const childResult = await this.processNode(child, href);
+					if (childResult) {
+						pChildResults.push(childResult);
+					}
+				}
+				
+				const pContent = this.smartJoinWithSpaces(pChildResults);
+				return pContent;
 
 			case "em":
 			case "i":
@@ -9215,6 +9411,12 @@ class EpubToNoteModal extends Modal {
 
 			case "code":
 				return `\`${element.textContent?.trim() || ""}\``;
+
+			case "sub":
+				return `<sub>${element.textContent?.trim() || ""}</sub>`;
+
+			case "sup":
+				return `<sup>${element.textContent?.trim() || ""}</sup>`;
 
 			case "pre":
 				return `\`\`\`\n${element.textContent?.trim() || ""}\n\`\`\``;
@@ -9250,26 +9452,39 @@ class EpubToNoteModal extends Modal {
 
 				for (const child of Array.from(element.childNodes)) {
 					const childResult = await this.processNode(child, href);
-					if (childResult.trim()) {
-						childResults.push(childResult.trim());
+					if (childResult) {
+						childResults.push(childResult);
 					}
 				}
 
 				if (tagName === "span") {
-					return childResults.join(" ");
+					return this.smartJoinWithSpaces(childResults);
 				} else {
 					return childResults.join("\n\n");
 				}
 
 			default:
-				let unknownContent = "";
+				// Check for CSS-based styling
+				const styling = this.getElementStyling(element);
+				
+				const unknownResults: string[] = [];
 				for (const child of Array.from(element.childNodes)) {
 					const childResult = await this.processNode(child, href);
-					if (childResult.trim()) {
-						unknownContent += childResult.trim() + " ";
+					if (childResult) {
+						unknownResults.push(childResult);
 					}
 				}
-				return unknownContent.trim();
+				
+				const content = unknownResults.join("");
+				
+				// Apply CSS-based formatting
+				if (styling.isSubscript) {
+					return `<sub>${content}</sub>`;
+				} else if (styling.isSuperscript) {
+					return `<sup>${content}</sup>`;
+				}
+				
+				return content;
 		}
 	}
 
@@ -9295,7 +9510,9 @@ class EpubToNoteModal extends Modal {
 			imageFile = this.zipData.file(src);
 
 			if (!imageFile && !src.startsWith("/") && !src.startsWith("http")) {
-				const hrefDir = href.substring(0, href.lastIndexOf("/") + 1);
+				// Remove fragment identifier from href before getting directory
+				const cleanHref = href.split('#')[0];
+				const hrefDir = cleanHref.substring(0, cleanHref.lastIndexOf("/") + 1);
 				const relativePath = hrefDir + src;
 				pathsToTry.push(relativePath);
 				imageFile = this.zipData.file(relativePath);
@@ -9326,6 +9543,20 @@ class EpubToNoteModal extends Modal {
 			}
 
 			const imageData = await imageFile.async("blob");
+			const arrayBuffer = await imageData.arrayBuffer();
+			
+			// Compute hash for deduplication
+			const hash = await this.computeImageHash(arrayBuffer);
+			
+			// Check if we already have this image
+			const existingImage = await this.findExistingImageByHash(hash);
+			if (existingImage) {
+				// Use existing image
+				const imageName = existingImage.split('/').pop() || existingImage;
+				return `![[${imageName}]]`;
+			}
+			
+			// Create new image since we don't have it
 			const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
 			const extension = src.split(".").pop()?.toLowerCase() || "png";
 			const imageName = `epub-image-${timestamp}.${extension}`;
@@ -9343,8 +9574,10 @@ class EpubToNoteModal extends Modal {
 				targetPath = imageName;
 			}
 
-			const arrayBuffer = await imageData.arrayBuffer();
 			await this.app.vault.createBinary(targetPath, arrayBuffer);
+			
+			// Update _images.json with the new image
+			await this.updateImagesJson(targetPath, hash);
 
 			return `![[${imageName}]]`;
 		} catch (error) {
@@ -11389,19 +11622,83 @@ Rules:
 			return await this.processPagesWithNuclearOption(notice);
 		}
 
+		// Decide between single-call processing (<10 pages) or chunked processing (>=10 pages)
+		if (this.renderedPages.length < 10) {
+			return await this.processPagesAsSingleCall(notice);
+		} else {
+			return await this.processPagesInChunks(notice);
+		}
+	}
+
+	/**
+	 * Process all pages in a single LLM call for documents with <10 pages.
+	 */
+	private async processPagesAsSingleCall(
+		notice: Notice
+	): Promise<{ response: string; usage?: OpenAI.CompletionUsage }> {
+		notice.setMessage(
+			`🤖 Processing all ${this.renderedPages.length} pages in single call...`
+		);
+
+		// Build arrays of all images and text content
+		const allImages: string[] = [];
+		const allTextContent: string[] = [];
+		const pageNumbers: number[] = [];
+
+		for (const pageData of this.renderedPages) {
+			allImages.push(pageData.imageData);
+			allTextContent.push(pageData.textContent || "");
+			pageNumbers.push(pageData.pageNum);
+		}
+
+		const promptText = this.buildSingleCallPrompt(
+			pageNumbers,
+			allTextContent,
+			this.guidanceInput?.getValue()
+		);
+
+		const maxTokens = this.getMaxTokensForMainProcessing();
+		const result = await this.plugin.sendToLlm(
+			promptText,
+			allImages,
+			maxTokens ? { maxTokens } : {}
+		);
+
+		if (!result.content) {
+			throw new Error("Empty response from LLM for single-call processing");
+		}
+
+		let cleanedContent = result.content;
+		if (
+			cleanedContent.match(/^\s*```(?:markdown)?\s*([\s\S]*?)\s*```\s*$/)
+		) {
+			cleanedContent = cleanedContent.replace(
+				/^\s*```(?:markdown)?\s*([\s\S]*?)\s*```\s*$/,
+				"$1"
+			);
+		}
+
+		return {
+			response: cleanedContent.trim(),
+			usage: result.usage,
+		};
+	}
+
+	/**
+	 * Process pages in chunks for documents with >=10 pages.
+	 */
+	private async processPagesInChunks(
+		notice: Notice
+	): Promise<{ response: string; usage?: OpenAI.CompletionUsage }> {
+		const chunkSize = 3; // Process 3 pages per chunk
+		const chunks = this.createPageChunks(this.renderedPages, chunkSize);
+
 		let combinedResponse = "";
 		let totalUsage: OpenAI.CompletionUsage = {
 			prompt_tokens: 0,
 			completion_tokens: 0,
 			total_tokens: 0,
 		};
-
-		let fullPdfText = "";
-		for (const pageData of this.renderedPages) {
-			if (pageData.textContent) {
-				fullPdfText += `\n--- PAGE ${pageData.pageNum} ---\n${pageData.textContent}\n`;
-			}
-		}
 
 		const processedResults: string[] = [];
 		const useContext = this.useContextToggle?.getValue() || false;
@@ -11414,28 +11711,28 @@ Rules:
 			? parseInt(this.futureContextPagesInput?.getValue() || "1") || 1
 			: 0;
 
-		for (let i = 0; i < this.renderedPages.length; i++) {
-			const pageData = this.renderedPages[i];
+		for (let chunkIndex = 0; chunkIndex < chunks.length; chunkIndex++) {
+			const chunk = chunks[chunkIndex];
 			notice.setMessage(
-				`🤖 Processing page ${i + 1}/${
-					this.renderedPages.length
-				} with AI...`
+				`🤖 Processing chunk ${chunkIndex + 1}/${chunks.length} (pages ${chunk[0].pageNum}-${chunk[chunk.length - 1].pageNum})...`
 			);
 
+			// Get context pages (prior pages)
 			const contextImages: string[] = [];
 			const contextTranscriptions: string[] = [];
 			const contextTextContent: string[] = [];
 
-			if (useContext && i > 0) {
-				const startIdx = Math.max(0, i - contextPageCount);
-				const endIdx = i;
+			if (useContext && chunkIndex > 0) {
+				// Get context from previous chunks/pages
+				const availableContextPages = chunkIndex * chunkSize;
+				const startIdx = Math.max(0, availableContextPages - contextPageCount);
+				const endIdx = availableContextPages;
 
-				for (let j = startIdx; j < endIdx; j++) {
+				for (let j = startIdx; j < endIdx && j < this.renderedPages.length; j++) {
 					contextImages.push(this.renderedPages[j].imageData);
 					if (j < processedResults.length) {
 						contextTranscriptions.push(processedResults[j]);
 					}
-
 					if (this.renderedPages[j].textContent) {
 						contextTextContent.push(
 							this.renderedPages[j].textContent!
@@ -11444,17 +11741,18 @@ Rules:
 				}
 			}
 
+			// Get future context pages
 			const futureContextImages: string[] = [];
 			const futureContextTextContent: string[] = [];
 
-			if (useFutureContext && i < this.renderedPages.length - 1) {
-				const startIdx = i + 1;
+			if (useFutureContext && chunkIndex < chunks.length - 1) {
+				const nextChunkStartIdx = (chunkIndex + 1) * chunkSize;
 				const endIdx = Math.min(
 					this.renderedPages.length,
-					i + 1 + futureContextPageCount
+					nextChunkStartIdx + futureContextPageCount
 				);
 
-				for (let j = startIdx; j < endIdx; j++) {
+				for (let j = nextChunkStartIdx; j < endIdx; j++) {
 					futureContextImages.push(this.renderedPages[j].imageData);
 					if (this.renderedPages[j].textContent) {
 						futureContextTextContent.push(
@@ -11464,24 +11762,28 @@ Rules:
 				}
 			}
 
-			const promptText =
-				useContext && (i > 0 || useFutureContext)
-					? this.buildHybridPromptWithContext(
-							pageData.pageNum,
-							pageData.textContent,
-							contextTranscriptions,
-							contextTextContent,
-							futureContextTextContent,
-							this.guidanceInput?.getValue()
-					  )
-					: this.buildHybridPrompt(
-							pageData.pageNum,
-							pageData.textContent,
-							this.guidanceInput?.getValue()
-					  );
+			// Build prompt for this chunk
+			const chunkImages = chunk.map(p => p.imageData);
+			const chunkTextContent = chunk.map(p => p.textContent || "");
+			const chunkPageNumbers = chunk.map(p => p.pageNum);
 
-			const allImages = this.buildImageArrayForLlm(
-				pageData.imageData,
+			const promptText = useContext && (chunkIndex > 0 || useFutureContext)
+				? this.buildChunkedPromptWithContext(
+						chunkPageNumbers,
+						chunkTextContent,
+						contextTranscriptions,
+						contextTextContent,
+						futureContextTextContent,
+						this.guidanceInput?.getValue()
+				  )
+				: this.buildChunkedPrompt(
+						chunkPageNumbers,
+						chunkTextContent,
+						this.guidanceInput?.getValue()
+				  );
+
+			const allImages = this.buildImageArrayForLlmChunk(
+				chunkImages,
 				contextImages,
 				futureContextImages
 			);
@@ -11489,32 +11791,30 @@ Rules:
 			const maxTokens = this.getMaxTokensForMainProcessing();
 			const result = await this.plugin.sendToLlm(
 				promptText,
-				allImages.length > 1 ? allImages : pageData.imageData,
+				allImages.length > 1 ? allImages : chunkImages,
 				maxTokens ? { maxTokens } : {}
 			);
 
 			if (!result.content) {
 				this.plugin.logger(
 					LogLevel.NORMAL,
-					`Warning: Empty response for page ${pageData.pageNum}`
+					`Warning: Empty response for chunk ${chunkIndex + 1}`
 				);
 				continue;
 			}
 
-			let pageContent = result.content;
-
+			let chunkContent = result.content;
 			if (
-				pageContent.match(/^\s*```(?:markdown)?\s*([\s\S]*?)\s*```\s*$/)
+				chunkContent.match(/^\s*```(?:markdown)?\s*([\s\S]*?)\s*```\s*$/)
 			) {
-				pageContent = pageContent.replace(
+				chunkContent = chunkContent.replace(
 					/^\s*```(?:markdown)?\s*([\s\S]*?)\s*```\s*$/,
 					"$1"
 				);
 			}
 
-			processedResults.push(pageContent.trim());
-
-			combinedResponse += `\n\n${pageContent.trim()}\n\n`;
+			processedResults.push(chunkContent.trim());
+			combinedResponse += `\n\n${chunkContent.trim()}\n\n`;
 
 			if (result.usage) {
 				totalUsage.prompt_tokens += result.usage.prompt_tokens;
@@ -11532,6 +11832,292 @@ Rules:
 			response: combinedResponse,
 			usage: totalUsage,
 		};
+	}
+
+	/**
+	 * Create chunks of pages for processing.
+	 */
+	private createPageChunks(pages: Array<{
+		pageNum: number;
+		imageData: string;
+		textContent?: string;
+	}>, chunkSize: number): Array<{
+		pageNum: number;
+		imageData: string;
+		textContent?: string;
+	}>[] {
+		const chunks: Array<{
+			pageNum: number;
+			imageData: string;
+			textContent?: string;
+		}>[] = [];
+		for (let i = 0; i < pages.length; i += chunkSize) {
+			chunks.push(pages.slice(i, i + chunkSize));
+		}
+		return chunks;
+	}
+
+	/**
+	 * Build prompt for single-call processing (<10 pages).
+	 */
+	private buildSingleCallPrompt(
+		pageNumbers: number[],
+		textContents: string[],
+		customGuidance?: string
+	): string {
+		const totalImages = pageNumbers.length;
+		
+		let systemPrompt = `You are an expert document processor converting a multi-page PDF document (with optional PDF text) into clean, well-structured Markdown. You are processing pages ${pageNumbers[0]}-${pageNumbers[pageNumbers.length - 1]} of a multi-page document.
+
+IMAGES PROVIDED:`;
+		
+		for (let i = 0; i < totalImages; i++) {
+			systemPrompt += `\n- Image ${i + 1}: Page ${pageNumbers[i]}`;
+		}
+
+		systemPrompt += `
+
+INSTRUCTIONS:
+- Transcribe content from ALL provided pages in order
+- Maintain document flow and structure across pages
+- Continue mid-sentence/paragraph flows between pages seamlessly
+- Avoid repeating headers/footers that appear across multiple pages
+- Maintain consistent formatting and structure throughout
+
+Follow these rules strictly:
+1. **Headers**: Convert section titles into markdown headers ("# Header", "## Subheader", etc.). Skip repeated headers across pages.
+2. **Paragraphs**: If paragraphs span multiple pages, merge them seamlessly. Merge consecutive lines into complete paragraphs.
+3. **Footnotes**: If footnote citations and text appear on the same page, inline them in parentheses.
+4. **Figures & Tables**: Use ![IMAGE_PLACEHOLDER] for figures or recreate tables in markdown. Include captions below.
+5. **Mathematics**: Format all mathematical notation using LaTeX delimiters ("$" for inline, "$$" for block).
+6. **Image is authoritative**: If PDF text conflicts with the image, trust the image. Mark illegible content as [[ILLEGIBLE]].
+7. **Output**: ONLY the final Markdown text. No code fences or commentary.`;
+
+		if (this.exampleNoteContent.trim()) {
+			systemPrompt += `\n\nUse this structural template (but don't follow it too literally if the content doesn't match):\n${this.exampleNoteContent}`;
+
+			if (this.examplePdfFile) {
+				systemPrompt += this.buildExamplePdfContextText();
+			}
+		}
+
+		let userPrompt = `You are processing pages ${pageNumbers[0]}-${pageNumbers[pageNumbers.length - 1]} of a multi-page document.`;
+
+		// Add PDF text content for each page
+		for (let i = 0; i < textContents.length; i++) {
+			if (textContents[i] && textContents[i].trim()) {
+				userPrompt += `\n\n--- PAGE ${pageNumbers[i]} PDF TEXT ---\n${textContents[i]}`;
+			}
+		}
+
+		userPrompt += `\n\nTranscribe all pages (${pageNumbers[0]}-${pageNumbers[pageNumbers.length - 1]}) into a single cohesive markdown document.`;
+
+		if (customGuidance) {
+			userPrompt += `\n\n**User's Custom Instructions:**\n${customGuidance}`;
+		}
+
+		return `${systemPrompt}\n\n${userPrompt}`;
+	}
+
+	/**
+	 * Build prompt for chunked processing without context.
+	 */
+	private buildChunkedPrompt(
+		chunkPageNumbers: number[],
+		chunkTextContents: string[],
+		customGuidance?: string
+	): string {
+		const chunkStart = chunkPageNumbers[0];
+		const chunkEnd = chunkPageNumbers[chunkPageNumbers.length - 1];
+		
+		let systemPrompt = `You are an expert document processor converting PDF page images (with optional PDF text) into clean, well-structured Markdown. You are processing pages ${chunkStart}-${chunkEnd} of a multi-page document.
+
+IMAGES PROVIDED:`;
+		
+		for (let i = 0; i < chunkPageNumbers.length; i++) {
+			systemPrompt += `\n- Image ${i + 1}: Page ${chunkPageNumbers[i]} (FOCUS - transcribe this page)`;
+		}
+
+		systemPrompt += `
+
+INSTRUCTIONS:
+- Transcribe content from all provided pages in order
+- Maintain consistent formatting and structure
+- Continue mid-sentence/paragraph flows between pages if they exist
+- This is part of a larger document, so maintain professional formatting
+
+Follow these rules strictly:
+1. **Headers**: Convert section titles into markdown headers ("# Header", "## Subheader", etc.).
+2. **Paragraphs**: Merge consecutive lines into complete paragraphs. If text flows between pages, continue seamlessly.
+3. **Footnotes**: If footnote citations and text appear on the same page, inline them in parentheses.
+4. **Figures & Tables**: Use ![IMAGE_PLACEHOLDER] for figures or recreate tables in markdown. Include captions below.
+5. **Mathematics**: Format all mathematical notation using LaTeX delimiters ("$" for inline, "$$" for block).
+6. **Image is authoritative**: If PDF text conflicts with the image, trust the image. Mark illegible content as [[ILLEGIBLE]].
+7. **Output**: ONLY the final Markdown text. No code fences or commentary.`;
+
+		if (this.exampleNoteContent.trim()) {
+			systemPrompt += `\n\nUse this structural template (but don't follow it too literally if the content doesn't match):\n${this.exampleNoteContent}`;
+
+			if (this.examplePdfFile) {
+				systemPrompt += this.buildExamplePdfContextText();
+			}
+		}
+
+		let userPrompt = `You are processing pages ${chunkStart}-${chunkEnd} of a multi-page document.`;
+
+		// Add PDF text content for each page in the chunk
+		for (let i = 0; i < chunkTextContents.length; i++) {
+			if (chunkTextContents[i] && chunkTextContents[i].trim()) {
+				userPrompt += `\n\n--- PAGE ${chunkPageNumbers[i]} PDF TEXT ---\n${chunkTextContents[i]}`;
+			}
+		}
+
+		userPrompt += `\n\nTranscribe pages ${chunkStart}-${chunkEnd} to markdown.`;
+
+		if (customGuidance) {
+			userPrompt += `\n\n**User's Custom Instructions:**\n${customGuidance}`;
+		}
+
+		return `${systemPrompt}\n\n${userPrompt}`;
+	}
+
+	/**
+	 * Build prompt for chunked processing with context pages.
+	 */
+	private buildChunkedPromptWithContext(
+		chunkPageNumbers: number[],
+		chunkTextContents: string[],
+		contextTranscriptions: string[],
+		contextTextContents: string[],
+		futureContextTextContents: string[],
+		customGuidance?: string
+	): string {
+		const chunkStart = chunkPageNumbers[0];
+		const chunkEnd = chunkPageNumbers[chunkPageNumbers.length - 1];
+		const totalContextImages = contextTranscriptions.length + futureContextTextContents.length;
+		const currentImageStartIndex = contextTranscriptions.length + 1;
+
+		let systemPrompt = `You are an expert document processor converting PDF page images (with optional PDF text) into clean, well-structured Markdown. You are processing pages ${chunkStart}-${chunkEnd} of a multi-page document.
+
+IMAGES PROVIDED:`;
+
+		if (contextTranscriptions.length > 0) {
+			systemPrompt += `\n- Images 1-${contextTranscriptions.length}: Previous pages (for context only)`;
+		}
+		
+		for (let i = 0; i < chunkPageNumbers.length; i++) {
+			const imageIndex = currentImageStartIndex + i;
+			systemPrompt += `\n- Image ${imageIndex}: Page ${chunkPageNumbers[i]} (FOCUS - transcribe this page)`;
+		}
+		
+		if (futureContextTextContents.length > 0) {
+			const futureStart = currentImageStartIndex + chunkPageNumbers.length;
+			const futureEnd = futureStart + futureContextTextContents.length - 1;
+			systemPrompt += `\n- Images ${futureStart}-${futureEnd}: Future pages (for context only)`;
+		}
+
+		systemPrompt += `
+
+INSTRUCTIONS:
+- Only transcribe content from the current pages (Images ${currentImageStartIndex}-${currentImageStartIndex + chunkPageNumbers.length - 1})
+- Use context images and data to:
+  - Continue mid-sentence/paragraph flows from previous pages
+  - Avoid repeating headers/footers that appear across pages
+  - See where content is heading to make better structural decisions
+  - Maintain consistent formatting and structure throughout
+- Do NOT transcribe content from context images (previous or future pages)
+
+Follow these rules strictly:
+1. **Headers**: Convert section titles into markdown headers ("# Header", "## Subheader", etc.). Skip repeated headers from previous pages.
+2. **Paragraphs**: If a paragraph continues from the previous pages, continue it seamlessly. Merge consecutive lines into complete paragraphs.
+3. **Footnotes**: If footnote citations and text appear on the same page, inline them in parentheses.
+4. **Figures & Tables**: Use ![IMAGE_PLACEHOLDER] for figures or recreate tables in markdown. Include captions below.
+5. **Mathematics**: Format all mathematical notation using LaTeX delimiters ("$" for inline, "$$" for block).
+6. **Image is authoritative**: If PDF text conflicts with the image, trust the image. Mark illegible content as [[ILLEGIBLE]].
+7. **Output**: ONLY the final Markdown text. No code fences or commentary.`;
+
+		if (this.exampleNoteContent.trim()) {
+			systemPrompt += `\n\nUse this structural template (but don't follow it too literally if the content doesn't match):\n${this.exampleNoteContent}`;
+
+			if (this.examplePdfFile) {
+				systemPrompt += this.buildExamplePdfContextText();
+			}
+		}
+
+		let userPrompt = `You are processing pages ${chunkStart}-${chunkEnd} of a multi-page document.`;
+
+		if (contextTranscriptions.length > 0) {
+			userPrompt += `\n\nPREVIOUS PAGE DATA (for context only):\n`;
+			contextTranscriptions.forEach((transcription, index) => {
+				const pageIndex = chunkStart - contextTranscriptions.length + index;
+				userPrompt += `--- PAGE ${pageIndex} TRANSCRIPTION ---\n${transcription}\n\n`;
+				if (contextTextContents[index]) {
+					userPrompt += `--- PAGE ${pageIndex} PDF TEXT ---\n${contextTextContents[index]}\n\n`;
+				}
+			});
+		}
+
+		if (futureContextTextContents.length > 0) {
+			userPrompt += `\n\nFUTURE PAGE DATA (for context only):\n`;
+			futureContextTextContents.forEach((textContent, index) => {
+				const pageIndex = chunkEnd + index + 1;
+				userPrompt += `--- PAGE ${pageIndex} PDF TEXT ---\n${textContent}\n\n`;
+			});
+		}
+
+		const contextDescription = [];
+		if (contextTranscriptions.length > 0) {
+			contextDescription.push("continuing from previous content");
+		}
+		if (futureContextTextContents.length > 0) {
+			contextDescription.push("with awareness of upcoming content");
+		}
+
+		if (contextDescription.length > 0) {
+			userPrompt += `\nNow transcribe pages ${chunkStart}-${chunkEnd} ${contextDescription.join(
+				" and "
+			)}.`;
+		} else {
+			userPrompt += `\nTranscribe pages ${chunkStart}-${chunkEnd} to markdown.`;
+		}
+
+		if (customGuidance) {
+			userPrompt += `\n\n**User's Custom Instructions:**\n${customGuidance}`;
+		}
+
+		// Add PDF text content for current pages
+		for (let i = 0; i < chunkTextContents.length; i++) {
+			if (chunkTextContents[i] && chunkTextContents[i].trim()) {
+				userPrompt += `\n\nCURRENT PAGE ${chunkPageNumbers[i]} PDF TEXT CONTENT (may have layout issues; use current page IMAGE as ground truth):\n${chunkTextContents[i]}`;
+			}
+		}
+
+		return `${systemPrompt}\n\n${userPrompt}`;
+	}
+
+	/**
+	 * Build image array for chunked processing.
+	 */
+	private buildImageArrayForLlmChunk(
+		chunkImages: string[],
+		contextImages: string[] = [],
+		futureContextImages: string[] = []
+	): string[] {
+		const images = [...contextImages, ...chunkImages];
+
+		if (
+			this.examplePdfPages.length > 0 &&
+			this.examplePdfFile &&
+			this.examplePdfModeSelect.value === "hybrid"
+		) {
+			for (const examplePage of this.examplePdfPages) {
+				images.push(examplePage.imageData);
+			}
+		}
+
+		images.push(...futureContextImages);
+
+		return images;
 	}
 
 	private async populateFolderOptions(): Promise<void> {
