@@ -45,6 +45,7 @@ const PARA_MD_ATTR = "data-gn-md";
 const API_URL_COMPLETIONS = "https://api.openai.com/v1/chat/completions";
 const API_URL_MODELS = "https://api.openai.com/v1/models";
 const IMAGE_ANALYSIS_FILE_NAME = "_images.json";
+const POLYGLOT_FILE_NAME = "_polyglot.json";
 
 const ICONS = {
 	blocked: "⏳",
@@ -96,6 +97,25 @@ export interface CardVariant {
 	back: string;
 }
 
+interface PolyglotCluster {
+	firstLinePreview: string;
+	terms: string[];
+	images: string[];
+	checksum: string;
+}
+
+interface PolyglotMetadata {
+	notePath: string;
+	languageTags: string[];
+	clusters: PolyglotCluster[];
+}
+
+interface PolyglotCardData {
+	isPolyglot: boolean;
+	backType: "text" | "image";
+	images?: string[];
+}
+
 interface MnemonicEntry {
 	number: string;
 	words: string[];
@@ -131,6 +151,7 @@ export interface Flashcard {
 		enabled?: boolean;
 		freeformNotes?: string;
 	};
+	polyglot?: PolyglotCardData;
 }
 
 interface FlashcardGraph {
@@ -207,14 +228,27 @@ const DEFAULT_SETTINGS: Settings = {
 	enableInterleaving: true,
 	cardBrowserExpandedSubjects: [],
 	guidanceSnippets: {
-		"Essential Cards": "Ignore any requested card count. Produce only 5–10 cards, focusing strictly on backbone concepts. Skip quotes, dates, and supporting examples.",
-		"Essential Additional Cards": "Ignore any requested card count. Produce only 5–10 cards to complement the existing flashcards, focusing strictly on backbone concepts. Skip quotes, dates, and supporting examples.",
-		"Expanded Cards": "Ignore any requested card count. Produce ~15–30 cards, including backbone concepts plus major supporting examples, quotes, or illustrations.",
-		"Expanded Additional Cards": "Ignore any requested card count. Produce ~15–30 cards to complement the existing flashcards, including backbone concepts plus major supporting examples, quotes, or illustrations.",
-		"Comprehensive Cards": "Ignore any requested card count. Produce as many cards as needed (30+ if appropriate), covering all quizzable content including names, dates, quotes, and counterarguments.",
-		"Comprehensive Additional Cards": "Ignore any requested card count. Produce as many cards as needed (30+ if appropriate) to complement the existing flashcards, covering all quizzable content including names, dates, quotes, and counterarguments."
+		"Essential Cards":
+			"Ignore any requested card count. Produce only 5–10 cards, focusing strictly on backbone concepts. Skip quotes, dates, and supporting examples.",
+		"Essential Additional Cards":
+			"Ignore any requested card count. Produce only 5–10 cards to complement the existing flashcards, focusing strictly on backbone concepts. Skip quotes, dates, and supporting examples.",
+		"Expanded Cards":
+			"Ignore any requested card count. Produce ~15–30 cards, including backbone concepts plus major supporting examples, quotes, or illustrations.",
+		"Expanded Additional Cards":
+			"Ignore any requested card count. Produce ~15–30 cards to complement the existing flashcards, including backbone concepts plus major supporting examples, quotes, or illustrations.",
+		"Comprehensive Cards":
+			"Ignore any requested card count. Produce as many cards as needed (30+ if appropriate), covering all quizzable content including names, dates, quotes, and counterarguments.",
+		"Comprehensive Additional Cards":
+			"Ignore any requested card count. Produce as many cards as needed (30+ if appropriate) to complement the existing flashcards, covering all quizzable content including names, dates, quotes, and counterarguments.",
 	},
-	guidanceSnippetOrder: ["Essential Cards", "Essential Additional Cards", "Expanded Cards", "Expanded Additional Cards", "Comprehensive Cards", "Comprehensive Additional Cards"],
+	guidanceSnippetOrder: [
+		"Essential Cards",
+		"Essential Additional Cards",
+		"Expanded Cards",
+		"Expanded Additional Cards",
+		"Comprehensive Cards",
+		"Comprehensive Additional Cards",
+	],
 };
 
 interface ImageAnalysis {
@@ -3455,13 +3489,20 @@ export default class GatedNotesPlugin extends Plugin {
 				else if (card.status === "review") stats.byStatus.review++;
 				else if (card.status === "relearn") stats.byStatus.relearn++;
 
-				if (card.due <= now && !card.blocked && !card.suspended)
-					stats.byState.due++;
+				// Count as due only if: due time passed, not blocked, not suspended,
+				// and (not polyglot OR polyglot but not "new" status)
+				if (card.due <= now && !card.blocked && !card.suspended) {
+					// For polyglot cards, only count as "due" if they've been reviewed before (not "new")
+					if (!card.polyglot?.isPolyglot || card.status !== "new") {
+						stats.byState.due++;
+					}
+				}
 				if (card.blocked) stats.byState.blocked++;
 				if (card.suspended) stats.byState.suspended++;
 				if (card.buried) stats.byState.buried++;
 				if (card.flagged) stats.byState.flagged++;
-				if (card.paraIdx === undefined || card.paraIdx === null)
+				// Only count missing paraIdx for non-polyglot cards (polyglot cards don't need paraIdx)
+				if ((card.paraIdx === undefined || card.paraIdx === null) && !card.polyglot?.isPolyglot)
 					stats.byState.missingParaIdx++;
 
 				const subject = this.subjectOf(card.chapter);
@@ -3470,8 +3511,14 @@ export default class GatedNotesPlugin extends Plugin {
 				}
 				const subjectStats = subjectMap.get(subject)!;
 				subjectStats.total++;
-				if (card.due <= now && !card.blocked && !card.suspended)
-					subjectStats.due++;
+				// Count as due only if: due time passed, not blocked, not suspended,
+				// and (not polyglot OR polyglot but not "new" status)
+				if (card.due <= now && !card.blocked && !card.suspended) {
+					// For polyglot cards, only count as "due" if they've been reviewed before (not "new")
+					if (!card.polyglot?.isPolyglot || card.status !== "new") {
+						subjectStats.due++;
+					}
+				}
 				if (card.blocked) subjectStats.blocked++;
 			}
 		}
@@ -4022,6 +4069,53 @@ export default class GatedNotesPlugin extends Plugin {
 				this.removeUnusedImages();
 			},
 		});
+
+		// Polyglot commands
+		this.addCommand({
+			id: "gn-polyglot-new-note",
+			name: "Polyglot: New vocabulary note",
+			callback: () => {
+				this.createPolyglotNote();
+			},
+		});
+
+		this.addCommand({
+			id: "gn-polyglot-parse-note",
+			name: "Polyglot: Parse this note",
+			callback: () => {
+				this.parsePolyglotNote();
+			},
+		});
+
+		this.addCommand({
+			id: "gn-polyglot-generate-cards",
+			name: "Polyglot: Generate cards for this note",
+			callback: () => {
+				this.generatePolyglotFlashcards();
+			},
+		});
+
+		this.addCommand({
+			id: "gn-bulk-refocus",
+			name: "Bulk refocus cards for current note",
+			checkCallback: (checking: boolean) => {
+				const view = this.app.workspace.getActiveViewOfType(MarkdownView);
+				if (!view?.file) return false;
+				if (!checking) this.bulkRefocusCards(view.file);
+				return true;
+			},
+		});
+
+		this.addCommand({
+			id: "gn-bulk-variants",
+			name: "Bulk create variants for current note",
+			checkCallback: (checking: boolean) => {
+				const view = this.app.workspace.getActiveViewOfType(MarkdownView);
+				if (!view?.file) return false;
+				if (!checking) this.bulkCreateVariants(view.file);
+				return true;
+			},
+		});
 	}
 
 	private registerRibbonIcons(): void {
@@ -4048,6 +4142,738 @@ export default class GatedNotesPlugin extends Plugin {
 		this.addRibbonIcon("bar-chart", "Study Overview", () => {
 			new StudyOverviewModal(this).open();
 		});
+	}
+
+	/**
+	 * Create a new polyglot vocabulary note
+	 */
+	private async createPolyglotNote(): Promise<void> {
+		// Simple template for a polyglot note
+		const template = `---
+special: polyglot
+languageTags: [L1, L2, L3]
+fetchImages: true
+---
+
+# Vocabulary
+
+> example term 1
+> ejemplo término 1
+> terme d'exemple 1
+
+> example term 2
+> ejemplo término 2
+> terme d'exemple 2
+`;
+
+		try {
+			// Create the note in the root folder for now
+			const fileName = `Polyglot-${new Date()
+				.toISOString()
+				.slice(0, 10)}.md`;
+			const file = await this.app.vault.create(fileName, template);
+
+			// Open the new note
+			await this.app.workspace.getLeaf().openFile(file);
+
+			new Notice("📚 Polyglot vocabulary note created!");
+		} catch (error) {
+			new Notice("❌ Failed to create polyglot note");
+			console.error("Error creating polyglot note:", error);
+		}
+	}
+
+	/**
+	 * Check if a note is a polyglot note by examining its frontmatter
+	 */
+	private isPolyglotNote(content: string): boolean {
+		// Simple frontmatter detection
+		if (!content.startsWith("---\n")) {
+			return false;
+		}
+
+		const frontmatterEnd = content.indexOf("\n---\n", 4);
+		if (frontmatterEnd === -1) {
+			return false;
+		}
+
+		const frontmatter = content.slice(4, frontmatterEnd);
+		return frontmatter.includes("special: polyglot");
+	}
+
+	/**
+	 * Parse frontmatter from a note and return polyglot configuration
+	 */
+	private parsePolyglotFrontmatter(
+		content: string
+	): { languageTags?: string[]; fetchImages?: boolean } | null {
+		if (!this.isPolyglotNote(content)) {
+			return null;
+		}
+
+		const frontmatterEnd = content.indexOf("\n---\n", 4);
+		const frontmatter = content.slice(4, frontmatterEnd);
+
+		const result: { languageTags?: string[]; fetchImages?: boolean } = {};
+
+		// Simple YAML parsing for our specific fields
+		const languageTagsMatch = frontmatter.match(
+			/languageTags:\s*\[(.*?)\]/
+		);
+		if (languageTagsMatch) {
+			result.languageTags = languageTagsMatch[1]
+				.split(",")
+				.map((tag) => tag.trim().replace(/['"]/g, ""));
+		}
+
+		const fetchImagesMatch = frontmatter.match(
+			/fetchImages:\s*(true|false)/
+		);
+		if (fetchImagesMatch) {
+			result.fetchImages = fetchImagesMatch[1] === "true";
+		}
+
+		return result;
+	}
+
+	/**
+	 * Parse polyglot clusters from note content
+	 */
+	private parsePolyglotClusters(content: string): PolyglotCluster[] {
+		if (!this.isPolyglotNote(content)) {
+			return [];
+		}
+
+		// Extract the body content (after frontmatter)
+		const frontmatterEnd = content.indexOf("\n---\n", 4);
+		if (frontmatterEnd === -1) {
+			return [];
+		}
+
+		const bodyContent = content.slice(frontmatterEnd + 5); // Skip past "\n---\n"
+		const clusters: PolyglotCluster[] = [];
+
+		// Split content by double newlines to get potential clusters
+		const blocks = bodyContent.split(/\n\s*\n/);
+
+		for (const block of blocks) {
+			const trimmedBlock = block.trim();
+			if (!trimmedBlock) continue;
+
+			// Parse terms (lines starting with >)
+			const terms: string[] = [];
+			const images: string[] = [];
+			const lines = trimmedBlock.split("\n");
+
+			for (const line of lines) {
+				const trimmedLine = line.trim();
+
+				// Check for terms (lines starting with >)
+				if (trimmedLine.startsWith("> ")) {
+					const term = trimmedLine.slice(2).trim();
+					if (term) {
+						terms.push(term);
+					}
+				}
+				// Check for images (![[image.png]])
+				else if (trimmedLine.match(/^!\[\[([^\]]+)\]\]$/)) {
+					const imageMatch = trimmedLine.match(/^!\[\[([^\]]+)\]\]$/);
+					if (imageMatch) {
+						images.push(imageMatch[1]);
+					}
+				}
+			}
+
+			// Only create cluster if we have at least 2 terms
+			if (terms.length >= 2) {
+				const firstLinePreview = terms[0];
+				const checksum = this.generateClusterChecksum(terms, images);
+
+				clusters.push({
+					firstLinePreview,
+					terms,
+					images,
+					checksum,
+				});
+			}
+		}
+
+		return clusters;
+	}
+
+	/**
+	 * Generate a simple checksum for a cluster to detect changes
+	 */
+	private generateClusterChecksum(terms: string[], images: string[]): string {
+		const combined = [...terms, ...images].join("|");
+		// Simple hash function
+		let hash = 0;
+		for (let i = 0; i < combined.length; i++) {
+			const char = combined.charCodeAt(i);
+			hash = (hash << 5) - hash + char;
+			hash = hash & hash; // Convert to 32-bit integer
+		}
+		return Math.abs(hash).toString(36);
+	}
+
+	/**
+	 * Generate or update _polyglot.json metadata for a note
+	 */
+	private async generatePolyglotMetadata(noteFile: TFile): Promise<void> {
+		try {
+			const content = await this.app.vault.read(noteFile);
+			const frontmatterData = this.parsePolyglotFrontmatter(content);
+
+			if (!frontmatterData) {
+				return; // Not a polyglot note
+			}
+
+			const clusters = this.parsePolyglotClusters(content);
+			const languageTags = frontmatterData.languageTags || [];
+
+			// Auto-generate language tags if missing
+			if (languageTags.length === 0 && clusters.length > 0) {
+				const maxTerms = Math.max(
+					...clusters.map((c) => c.terms.length)
+				);
+				for (let i = 0; i < maxTerms; i++) {
+					languageTags.push(`L${i + 1}`);
+				}
+			}
+
+			const polyglotMetadata: PolyglotMetadata = {
+				notePath: noteFile.path,
+				languageTags,
+				clusters,
+			};
+
+			// Store _polyglot.json in the same folder as the note (like _flashcards.json)
+			const folderPath = noteFile.parent?.path || "";
+			const polyglotPath = folderPath
+				? `${folderPath}/${POLYGLOT_FILE_NAME}`
+				: POLYGLOT_FILE_NAME;
+
+			let allPolyglotData: PolyglotMetadata[] = [];
+
+			const polyglotFile =
+				this.app.vault.getAbstractFileByPath(polyglotPath);
+			if (polyglotFile instanceof TFile) {
+				try {
+					const existingContent = await this.app.vault.read(
+						polyglotFile
+					);
+					allPolyglotData = JSON.parse(existingContent);
+				} catch (error) {
+					console.warn(
+						"Failed to parse existing _polyglot.json:",
+						error
+					);
+				}
+			}
+
+			// Remove existing entry for this note and add updated one
+			allPolyglotData = allPolyglotData.filter(
+				(data) => data.notePath !== noteFile.path
+			);
+			allPolyglotData.push(polyglotMetadata);
+
+			// Write back to _polyglot.json
+			const jsonContent = JSON.stringify(allPolyglotData, null, 2);
+			if (polyglotFile instanceof TFile) {
+				await this.app.vault.modify(polyglotFile, jsonContent);
+			} else {
+				await this.app.vault.create(polyglotPath, jsonContent);
+			}
+
+			new Notice(`📚 Updated polyglot metadata for ${noteFile.name}`);
+		} catch (error) {
+			new Notice("❌ Failed to generate polyglot metadata");
+			console.error("Error generating polyglot metadata:", error);
+		}
+	}
+
+	/**
+	 * Parse an existing polyglot note and update its metadata
+	 */
+	private async parsePolyglotNote(): Promise<void> {
+		const activeFile = this.app.workspace.getActiveFile();
+		if (!activeFile) {
+			new Notice("❌ No active file");
+			return;
+		}
+
+		const content = await this.app.vault.read(activeFile);
+		if (!this.isPolyglotNote(content)) {
+			new Notice("❌ This is not a polyglot note");
+			return;
+		}
+
+		await this.generatePolyglotMetadata(activeFile);
+	}
+
+	/**
+	 * Generate a unique ID for a polyglot flashcard
+	 */
+	private generatePolyglotCardId(front: string, back: string): string {
+		const combined = `${front}→${back}`;
+		// Simple hash function for card ID
+		let hash = 0;
+		for (let i = 0; i < combined.length; i++) {
+			const char = combined.charCodeAt(i);
+			hash = (hash << 5) - hash + char;
+			hash = hash & hash; // Convert to 32-bit integer
+		}
+		return `polyglot_${Math.abs(hash).toString(36)}`;
+	}
+
+	/**
+	 * Generate flashcards from polyglot clusters
+	 */
+	private generatePolyglotCards(
+		clusters: PolyglotCluster[],
+		languageTags: string[],
+		notePath: string
+	): Flashcard[] {
+		const cards: Flashcard[] = [];
+
+		for (const cluster of clusters) {
+			const terms = cluster.terms;
+
+			// Generate all ordered pairs of terms (n × (n-1))
+			for (let i = 0; i < terms.length; i++) {
+				for (let j = 0; j < terms.length; j++) {
+					if (i === j) continue; // Skip same term
+
+					const frontTerm = terms[i];
+					const backTerm = terms[j];
+
+					// Create front/back with language prefixes
+					const frontLang = languageTags[i] || `L${i + 1}`;
+					const backLang = languageTags[j] || `L${j + 1}`;
+
+					const front = `${frontLang}: ${frontTerm}`;
+					const back = `${backLang}: ${backTerm}`;
+
+					const cardId = this.generatePolyglotCardId(front, back);
+
+					const card: Flashcard = {
+						id: cardId,
+						front,
+						back,
+						tag: "polyglot",
+						chapter: notePath,
+						status: "new" as CardStatus,
+						last_reviewed: null,
+						interval: 1,
+						ease_factor: 2.5,
+						due: Date.now(),
+						blocked: false,
+						review_history: [],
+						polyglot: {
+							isPolyglot: true,
+							backType: "text",
+						},
+					};
+
+					cards.push(card);
+				}
+			}
+
+			// TODO: Add image cards in Phase 5
+			// For now, skip images and focus on text-to-text cards only
+		}
+
+		return cards;
+	}
+
+	/**
+	 * Generate flashcards for the current polyglot note
+	 */
+	private async generatePolyglotFlashcards(): Promise<void> {
+		const activeFile = this.app.workspace.getActiveFile();
+		if (!activeFile) {
+			new Notice("❌ No active file");
+			return;
+		}
+
+		try {
+			const content = await this.app.vault.read(activeFile);
+			if (!this.isPolyglotNote(content)) {
+				new Notice("❌ This is not a polyglot note");
+				return;
+			}
+
+			const frontmatterData = this.parsePolyglotFrontmatter(content);
+			const clusters = this.parsePolyglotClusters(content);
+
+			if (clusters.length === 0) {
+				new Notice(
+					"📚 No valid clusters found (need at least 2 terms per cluster)"
+				);
+				return;
+			}
+
+			const languageTags = frontmatterData?.languageTags || [];
+
+			// Auto-generate language tags if missing
+			const finalLanguageTags =
+				languageTags.length > 0
+					? languageTags
+					: Array.from(
+							{
+								length: Math.max(
+									...clusters.map((c) => c.terms.length)
+								),
+							},
+							(_, i) => `L${i + 1}`
+					  );
+
+			// Generate new cards
+			const newCards = this.generatePolyglotCards(
+				clusters,
+				finalLanguageTags,
+				activeFile.path
+			);
+
+			// Load existing flashcards from the same folder using readDeck
+			const folderPath = activeFile.parent?.path || "";
+			const flashcardsPath = folderPath
+				? `${folderPath}/${DECK_FILE_NAME}`
+				: DECK_FILE_NAME;
+
+			let existingGraph = await this.readDeck(flashcardsPath);
+
+			// Remove existing polyglot cards for this note
+			for (const cardId in existingGraph) {
+				const card = existingGraph[cardId];
+				if (
+					card.polyglot?.isPolyglot &&
+					card.chapter === activeFile.path
+				) {
+					delete existingGraph[cardId];
+				}
+			}
+
+			// Add new polyglot cards to the graph
+			for (const card of newCards) {
+				existingGraph[card.id] = card;
+			}
+
+			// Write back to _flashcards.json using writeDeck
+			await this.writeDeck(flashcardsPath, existingGraph);
+
+			new Notice(
+				`📚 Generated ${newCards.length} polyglot flashcards for ${activeFile.name}`
+			);
+		} catch (error) {
+			new Notice("❌ Failed to generate polyglot flashcards");
+			console.error("Error generating polyglot flashcards:", error);
+		}
+	}
+
+	private async executeRefocusForCard(card: Flashcard, preventDuplicates: boolean): Promise<Flashcard[]> {
+		// Extract refocus logic from handleRefocus method
+		const cardJson = JSON.stringify({
+			front: card.front,
+			back: card.back,
+		});
+
+		const isMultiple = true; // Always generate "many" for bulk operations
+		const cardWord = "cards";
+		const verbForm = "are";
+
+		const basePrompt = `You are an AI assistant that creates new, insightful flashcards by "refocusing" an existing one.
+
+		**Core Rule:** Your new ${cardWord} MUST be created by inverting the information **explicitly present** in the original card's "front" and "back" fields. The "Source Text" ${verbForm} provided only for context and should NOT be used to introduce new facts into the new ${cardWord}.
+
+		**Thought Process:**
+		**Formatting Rule:** Preserve all Markdown formatting, especially LaTeX math expressions (e.g., \`$ ... $\` and \`$$ ... $$\`), in the "front" and "back" fields.
+
+		1.  **Deconstruct the Original Card:** Identify the key subject in the "back" and the key detail in the "front".
+		2.  **Invert & Refocus:** Create new cards where the original details become the subject of the questions, and the original subject becomes the answers.
+
+		---
+		**Example 1:**
+		* **Original Card:**
+			* "front": "What was the outcome of the War of Fakery in 1653?"
+			* "back": "Country A decisively defeated Country B."
+		* **Refocused Cards:**
+			* "front": "Which country was decisively defeated in the War of Fakery in 1653?"
+			* "back": "Country B"
+			* "front": "What did Country A do to Country B in the War of Fakery?"
+			* "back": "Decisively defeated them"
+
+		**Source Text for Context (use only to understand the card, not to add new facts):**
+		${JSON.stringify(card.tag)}`;
+
+		let contextPrompt = "";
+		if (preventDuplicates) {
+			const folderPath = card.chapter.split('/').slice(0, -1).join('/');
+			const deckPath = folderPath ? `${folderPath}/${DECK_FILE_NAME}` : DECK_FILE_NAME;
+			const deck = await this.readDeck(deckPath);
+			const otherCards = Object.values(deck).filter(
+				(c) =>
+					c.chapter === card.chapter &&
+					c.id !== card.id
+			);
+			if (otherCards.length > 0) {
+				const simplified = otherCards.map((c) => ({
+					front: c.front,
+					back: c.back,
+				}));
+				contextPrompt = `\n\n**Important:** To avoid duplicates, do not create ${cardWord} that cover the same information as the following existing cards:
+		Existing Cards:
+		${JSON.stringify(simplified)}`;
+			}
+		}
+
+		const quantityInstruction = `Create multiple refocused cards by identifying different aspects or details from the original card that can be inverted. Look for dates, names, locations, concepts, or other discrete elements that could each become the focus of a separate question. Return ONLY valid JSON of this shape: [{"front":"...","back":"..."}]`;
+
+		const promptText = `${basePrompt}${contextPrompt}
+
+		${quantityInstruction}
+
+		**Original Card to Refocus:**
+		${cardJson}`;
+
+		const { content: response, usage } = await this.sendToLlm(promptText);
+
+		if (!response) {
+			throw new Error("LLM returned an empty response.");
+		}
+
+		// Parse the response - refocused cards don't have tags, so use extractJsonObjects
+		const parsedItems = extractJsonObjects<{ front: string; back: string }>(response);
+		const validItems = parsedItems.filter(item =>
+			item.front && item.back &&
+			typeof item.front === "string" && typeof item.back === "string" &&
+			item.front.trim().length > 0 && item.back.trim().length > 0
+		);
+
+		if (validItems.length === 0) {
+			throw new Error("Could not parse new cards from LLM response.");
+		}
+
+		// Add the cards to the deck
+		const folderPath = card.chapter.split('/').slice(0, -1).join('/');
+		const deckPath = folderPath ? `${folderPath}/${DECK_FILE_NAME}` : DECK_FILE_NAME;
+		const deck = await this.readDeck(deckPath);
+		const newCards: Flashcard[] = [];
+		for (const item of validItems) {
+			const cardToAdd = this.createCardObject({
+				front: item.front.trim(),
+				back: item.back.trim(),
+				tag: card.tag, // Use the original card's tag as reference
+				chapter: card.chapter,
+				paraIdx: card.paraIdx,
+			});
+			deck[cardToAdd.id] = cardToAdd;
+			newCards.push(cardToAdd);
+		}
+		await this.writeDeck(deckPath, deck);
+
+		return newCards;
+	}
+
+	private async executeVariantsForCard(card: Flashcard): Promise<Flashcard[]> {
+		// Extract variant logic from executeVariantGeneration method
+		const currentVariant = {
+			front: card.front,
+			back: card.back,
+		};
+
+		const existingVariants = this.getCardVariants(card);
+		const includeExisting = existingVariants.length > 1;
+		const quantity = "many"; // Always generate multiple for bulk
+
+		let promptVariants = "";
+		if (includeExisting) {
+			promptVariants = existingVariants
+				.map((v, i) => `${i + 1}. Front: ${v.front}\n   Back: ${v.back}`)
+				.join("\n");
+		} else {
+			promptVariants = `1. Front: ${currentVariant.front}\n   Back: ${currentVariant.back}`;
+		}
+
+		const isMultiple = true;
+		const quantityText = "2–3 NEW";
+
+		const prompt = `You are a flashcard variant generator. Create ${quantityText} alternative versions that test the EXACT SAME knowledge using different wording to prevent memorization of specific phrases.
+
+**Critical Rule:** The question-answer relationship must remain identical. If the original asks for a definition, variants must ask for the same definition. If it asks for a term, variants must ask for the same term.
+
+**GOOD variant examples:**
+Original: "What is mitosis?" → "The process of cell division..."
+Good variants:
+- "Define mitosis." → "The process of cell division..."
+- "Mitosis refers to what biological process?" → "The process of cell division..."
+
+Original: "What term describes beliefs resistant to change?" → "Doxastic closure"
+Good variants:
+- "What is the name for beliefs that resist revision?" → "Doxastic closure"
+- "Doxastic closure is the term for what?" → "Doxastic closure"
+
+**BAD variant examples:**
+❌ Original asks "What is X?" but variant asks "What term refers to X?" (changes question type)
+❌ Original asks for term but variant asks for definition (mismatched relationship)
+❌ Adding complexity that changes the cognitive demand
+
+**Quality Control:**
+If creating good variants would be difficult or result in awkward phrasing, return an empty array [] instead of forcing poor quality cards.
+
+**Your task:**
+Analyze this card and determine if meaningful variants can be created that preserve the exact question-answer relationship. If yes, create ${quantityText} variants. If the card doesn't lend itself to good variants, return [].
+
+**Existing variants:**
+${promptVariants}
+
+Return ONLY valid JSON of this shape: [{"front":"...","back":"..."}] or [] if no good variants possible`;
+
+		const { content: response, usage } = await this.sendToLlm(prompt);
+
+		if (!response) {
+			throw new Error("LLM returned an empty response.");
+		}
+
+		// Parse the response
+		const parsedItems = extractJsonObjects<{ front: string; back: string }>(response);
+		const validVariants = parsedItems.filter(item => item.front && item.back);
+		if (validVariants.length === 0) {
+			throw new Error("Could not parse new variants from LLM response.");
+		}
+
+		// Add variants to the card
+		const folderPath = card.chapter.split('/').slice(0, -1).join('/');
+		const deckPath = folderPath ? `${folderPath}/${DECK_FILE_NAME}` : DECK_FILE_NAME;
+		const deck = await this.readDeck(deckPath);
+		if (!card.variants) {
+			card.variants = [];
+		}
+
+		for (const variant of validVariants) {
+			card.variants.push({
+				front: variant.front,
+				back: variant.back,
+			});
+		}
+
+		// Update the deck
+		deck[card.id] = card;
+		await this.writeDeck(deckPath, deck);
+
+		// Return pseudo-flashcards for counting purposes
+		return validVariants.map(v => ({ ...card, front: v.front, back: v.back }));
+	}
+
+	private async bulkRefocusCards(file: TFile): Promise<void> {
+		try {
+			// Load deck to get cards for this note
+			const folderPath = file.parent?.path || "";
+			const deckPath = folderPath ? `${folderPath}/${DECK_FILE_NAME}` : DECK_FILE_NAME;
+			const deck = await this.readDeck(deckPath);
+			const noteCards = Object.values(deck).filter(card =>
+				card.chapter === file.path && !card.suspended
+			);
+
+			if (noteCards.length === 0) {
+				new Notice(`📝 No flashcards found for "${file.name}"`);
+				return;
+			}
+
+			// Show confirmation modal
+			const confirmed = await new Promise<boolean>(resolve => {
+				new BulkRefocusConfirmModal(this, noteCards.length, file.name, resolve).open();
+			});
+
+			if (!confirmed) return;
+
+			// Process cards with progress tracking
+			const notice = new Notice(`🔄 Refocusing ${noteCards.length} cards...`, 0);
+			let processed = 0;
+			let successful = 0;
+
+			for (const card of noteCards) {
+				try {
+					notice.setMessage(`🔄 Refocusing cards... (${processed + 1}/${noteCards.length})`);
+
+					// Use refocus logic extracted from handleRefocus method
+					const result = await this.executeRefocusForCard(card, true);
+					if (result && result.length > 0) {
+						successful += result.length;
+					}
+
+					processed++;
+				} catch (error) {
+					console.error(`Failed to refocus card ${card.id}:`, error);
+					processed++;
+				}
+			}
+
+			notice.hide();
+			new Notice(`✅ Bulk refocus complete: ${successful} new cards created from ${processed} originals`);
+
+		} catch (error) {
+			new Notice("❌ Failed to bulk refocus cards");
+			console.error("Bulk refocus error:", error);
+		}
+	}
+
+	private async bulkCreateVariants(file: TFile): Promise<void> {
+		try {
+			// Load deck to get cards for this note
+			const folderPath = file.parent?.path || "";
+			const deckPath = folderPath ? `${folderPath}/${DECK_FILE_NAME}` : DECK_FILE_NAME;
+			const deck = await this.readDeck(deckPath);
+			const noteCards = Object.values(deck).filter(card =>
+				card.chapter === file.path && !card.suspended
+			);
+
+			if (noteCards.length === 0) {
+				new Notice(`📝 No flashcards found for "${file.name}"`);
+				return;
+			}
+
+			// Show confirmation modal
+			const confirmed = await new Promise<boolean>(resolve => {
+				new BulkVariantsConfirmModal(this, noteCards.length, file.name, resolve).open();
+			});
+
+			if (!confirmed) return;
+
+			// Process cards with progress tracking
+			const notice = new Notice(`🎲 Creating variants for ${noteCards.length} cards...`, 0);
+			let processed = 0;
+			let successful = 0;
+			let skipped = 0;
+
+			for (const card of noteCards) {
+				try {
+					notice.setMessage(`🎲 Creating variants... (${processed + 1}/${noteCards.length})`);
+
+					// Use variant logic extracted from executeVariantGeneration method
+					const result = await this.executeVariantsForCard(card);
+					if (result && result.length > 0) {
+						successful += result.length;
+					} else {
+						skipped++;
+					}
+
+					processed++;
+				} catch (error) {
+					console.error(`Failed to create variants for card ${card.id}:`, error);
+					skipped++;
+					processed++;
+				}
+			}
+
+			notice.hide();
+			const skippedMsg = skipped > 0 ? ` (${skipped} cards skipped as unsuitable for variants)` : "";
+			new Notice(`✅ Bulk variants complete: ${successful} new variant cards created from ${processed} originals${skippedMsg}`);
+
+		} catch (error) {
+			new Notice("❌ Failed to bulk create variants");
+			console.error("Bulk variants error:", error);
+		}
 	}
 
 	private registerEvents(): void {
@@ -4885,7 +5711,9 @@ export default class GatedNotesPlugin extends Plugin {
 			if (lastParagraph) paragraphs.push(lastParagraph);
 		}
 
-		const wrappedContent = paragraphs
+		const finalizedIndicator = `<!-- 📝 GATED NOTES: This note is finalized. Switch to Reading View to see content. Use "Unfinalize note" command to edit. -->\n\n`;
+
+		const wrappedContent = finalizedIndicator + paragraphs
 			.map(
 				(md, i) =>
 					`<br class="gn-sentinel"><div class="${PARA_CLASS}" ${PARA_ID_ATTR}="${
@@ -4894,6 +5722,13 @@ export default class GatedNotesPlugin extends Plugin {
 			)
 			.join("\n\n");
 		await this.app.vault.modify(file, wrappedContent);
+
+		// Switch to reading view after finalization
+		const activeView = this.app.workspace.getActiveViewOfType(MarkdownView);
+		if (activeView && activeView.file?.path === file.path) {
+			await activeView.setState({ mode: "preview" }, { history: false });
+		}
+
 		new Notice("Note auto-finalized. Gating is now active.");
 	}
 
@@ -4911,7 +5746,9 @@ export default class GatedNotesPlugin extends Plugin {
 		const normalizedContent = this.normalizeSplitContent(content);
 		const chunks = normalizedContent.split(SPLIT_TAG);
 
-		const wrappedContent = chunks
+		const finalizedIndicator = `<!-- 📝 GATED NOTES: This note is finalized. Switch to Reading View to see content. Use "Unfinalize note" command to edit. -->\n\n`;
+
+		const wrappedContent = finalizedIndicator + chunks
 			.map((md, i) => {
 				const trimmedMd = md.trim();
 				return `<br class="gn-sentinel"><div class="${PARA_CLASS}" ${PARA_ID_ATTR}="${
@@ -4921,6 +5758,13 @@ export default class GatedNotesPlugin extends Plugin {
 			.join("\n\n");
 
 		await this.app.vault.modify(file, wrappedContent);
+
+		// Switch to reading view after finalization
+		const activeView = this.app.workspace.getActiveViewOfType(MarkdownView);
+		if (activeView && activeView.file?.path === file.path) {
+			await activeView.setState({ mode: "preview" }, { history: false });
+		}
+
 		new Notice("Note manually finalized. Gating is now active.");
 	}
 
@@ -4956,6 +5800,12 @@ export default class GatedNotesPlugin extends Plugin {
 		await this.app.vault.modify(file, mdContent);
 		this.refreshReading();
 		this.refreshAllStatuses();
+
+		// Switch to edit mode after unfinalization
+		const activeView = this.app.workspace.getActiveViewOfType(MarkdownView);
+		if (activeView && activeView.file?.path === file.path) {
+			await activeView.setState({ mode: "source" }, { history: false });
+		}
 
 		const deckPath = getDeckPathForChapter(file.path);
 		if (!(await this.app.vault.adapter.exists(deckPath))) {
@@ -5176,10 +6026,10 @@ The instructions above override any conflicting guidance below and should be pri
 `
 			: "";
 
-		const cardCountInstruction = customGuidance 
+		const cardCountInstruction = customGuidance
 			? `**General Instructions:**
-Generate Anki-style flashcards from the following article, targeting approximately ${count} cards. The article may contain text and special image placeholders of the format [[IMAGE: HASH=... DESCRIPTION=...]]. Follow your guidance above for any specific requirements or modifications.`
-			: `Create ${count} new, distinct Anki-style flashcards from the following article. The article may contain text and special image placeholders of the format [[IMAGE: HASH=... DESCRIPTION=...]].`;
+Generate Anki-style flashcards based on the following content, targeting approximately ${count} cards. The content may contain text and special image placeholders of the format [[IMAGE: HASH=... DESCRIPTION=...]]. Follow your guidance above for any specific requirements or modifications.`
+			: `Create ${count} new, distinct Anki-style flashcards based on the following content. The content may contain text and special image placeholders of the format [[IMAGE: HASH=... DESCRIPTION=...]].`;
 
 		const initialPrompt = `${guidancePrompt}${cardCountInstruction}
 
@@ -5189,6 +6039,15 @@ Generate Anki-style flashcards from the following article, targeting approximate
 - **Conciseness:** Keep answers brief, preferably one sentence
 - **Clarity:** Questions should be immediately understandable
 - **Specificity:** Test concrete facts rather than vague concepts
+- **Self-Contained:** Cards should not reference 'the article', 'the text', 'this document', or use phrases like 'according to the text', 'the article states', 'mentioned in the passage'. Include necessary context directly in the question.
+
+**AVOID these bad examples:**
+❌ "What causes photosynthesis, according to the text?"
+❌ "As mentioned in the article, what happens during mitosis?"
+❌ "The passage states that DNA contains four bases. What are they?"
+✅ "What causes photosynthesis?"
+✅ "What happens during mitosis?"
+✅ "What are the four bases in DNA?"
 
 **Card Generation Rules:**
 1.  **Text-Based Cards:** For cards based on plain text, the "Tag" MUST be a short, verbatim quote from the text.
@@ -5202,7 +6061,7 @@ Generate Anki-style flashcards from the following article, targeting approximate
 - Return ONLY valid JSON of this shape: \`[{"front":"...","back":"...","tag":"..."}]\`
 - Every card must have a valid front, back, and tag.
 
-${contextPrompt}Here is the article:
+${contextPrompt}Content:
 ${plainTextForLlm}`;
 
 		notice.setMessage(`🤖 Generating ${count} flashcard(s)...`);
@@ -5403,11 +6262,11 @@ ${JSON.stringify(sourceText)}
 	): Promise<void> {
 		new Notice("🤖 Generating card with AI...");
 
-		const prompt = `From the following text, create a single, concise flashcard.
+		const prompt = `Based on the following content, create a single, concise flashcard. The card should be self-contained and not reference "the text" or "this content".
 **Formatting Rule:** Preserve all Markdown formatting, especially LaTeX math expressions (e.g., \`$ ... $\` and \`$$ ... $$\`), in the "front" and "back" fields.
 Return ONLY valid JSON of this shape: {"front":"...","back":"..."}
 
-Text:
+Content:
 """
 ${selection}
 """`;
@@ -5481,11 +6340,11 @@ ${selection}
 				0
 			);
 
-			const prompt = `From the following text, create ${count} concise flashcard(s).
+			const prompt = `Based on the following content, create ${count} concise flashcard(s). The cards should be self-contained and not reference "the text" or "this content".
 **Formatting Rule:** Preserve all Markdown formatting, especially LaTeX math expressions (e.g., \`$ ... $\` and \`$$ ... $$\`), in the "front" and "back" fields.
 Return ONLY valid JSON of this shape: [{"front":"...","back":"..."}]
 
-Text:
+Content:
 """
 ${selection}
 """`;
@@ -5715,17 +6574,12 @@ ${selection}
 					const deckPath = getDeckPathForChapter(chapterPath);
 					const graph = await this.readDeck(deckPath);
 
-					const blockedCards = Object.values(graph).filter(
-						(c) => {
-							if(c.chapter === chapterPath && isBuried(c) ){
+					const blockedCards = Object.values(graph).filter((c) => {
+						if (c.chapter === chapterPath && isBuried(c)) {
 							console.log(c);
-							};
-							return(
-							c.chapter === chapterPath &&
-							isBlockingGating(c))
 						}
-							
-					);
+						return c.chapter === chapterPath && isBlockingGating(c);
+					});
 					const firstBlockedParaIdx =
 						blockedCards.length > 0
 							? Math.min(
@@ -5833,6 +6687,238 @@ ${selection}
 		});
 	}
 
+	/**
+	 * Handle jump-to-source for polyglot cards at the view level (no paragraph structure)
+	 */
+	private async jumpToPolyglotTermInView(
+		card: Flashcard,
+		mdView: MarkdownView,
+		highlightColor: string
+	): Promise<void> {
+		console.log("[Polyglot] jumpToPolyglotTermInView called", { card, mdView });
+
+		const applyHighlight = (el: HTMLElement) => {
+			el.style.setProperty("--highlight-color", highlightColor);
+			el.classList.add("gn-flash-highlight");
+			setTimeout(() => {
+				el.classList.remove("gn-flash-highlight");
+				el.style.removeProperty("--highlight-color");
+			}, 1500);
+		};
+
+		// Extract terms from front and back, stripping language prefixes
+		const extractTerm = (text: string): string => {
+			const match = text.match(/^[^:]+:\s*(.+)$/);
+			return match ? match[1].trim() : text.trim();
+		};
+
+		const frontTerm = card.front ? extractTerm(card.front) : "";
+		const backTerm = card.back ? extractTerm(card.back) : "";
+
+		console.log("[Polyglot] Extracted terms:", {
+			front: card.front,
+			back: card.back,
+			frontTerm,
+			backTerm
+		});
+
+		const searchTerms = [frontTerm, backTerm].filter(term => term.length > 0);
+		console.log("[Polyglot] Search terms:", searchTerms);
+
+		// Search in the entire preview container
+		const previewContainer = mdView.previewMode.containerEl;
+		console.log("[Polyglot] Preview container:", previewContainer);
+		console.log("[Polyglot] Preview content:", previewContainer.textContent);
+
+		// Find the cluster containing our terms and highlight front green, back red
+		let found = false;
+		const walker = document.createTreeWalker(
+			previewContainer,
+			NodeFilter.SHOW_TEXT
+		);
+
+		let textNode;
+		while (textNode = walker.nextNode()) {
+			const textContent = textNode.textContent || "";
+
+			// Check if this text node contains either of our terms
+			const containsFront = frontTerm && textContent.includes(frontTerm);
+			const containsBack = backTerm && textContent.includes(backTerm);
+
+			if (containsFront || containsBack) {
+				console.log("[Polyglot] Found cluster with terms in text node:", textContent);
+
+				// Find the parent element (likely a <p> containing the cluster)
+				let clusterElement = textNode.parentElement;
+				while (clusterElement && clusterElement.tagName !== 'P') {
+					clusterElement = clusterElement.parentElement;
+				}
+
+				if (clusterElement) {
+					console.log("[Polyglot] Found cluster element:", clusterElement);
+					clusterElement.scrollIntoView({ behavior: "smooth" });
+
+					// Now highlight individual terms within this cluster
+					this.highlightPolyglotTermsInCluster(clusterElement, frontTerm, backTerm);
+					found = true;
+					break;
+				}
+			}
+		}
+
+		if (!found) {
+			console.log("[Polyglot] No term found, highlighting preview container");
+			previewContainer.scrollIntoView({ behavior: "smooth" });
+			applyHighlight(previewContainer);
+		}
+	}
+
+	/**
+	 * Highlight front term in green and back term in red within a cluster element
+	 */
+	private highlightPolyglotTermsInCluster(
+		clusterElement: HTMLElement,
+		frontTerm: string,
+		backTerm: string
+	): void {
+		console.log("[Polyglot] Highlighting terms in cluster:", { frontTerm, backTerm });
+
+		const walker = document.createTreeWalker(
+			clusterElement,
+			NodeFilter.SHOW_TEXT
+		);
+
+		const textNodes: Node[] = [];
+		let textNode;
+		while (textNode = walker.nextNode()) {
+			textNodes.push(textNode);
+		}
+
+		// Process each text node to highlight terms
+		for (const node of textNodes) {
+			const textContent = node.textContent || "";
+			let modifiedContent = textContent;
+			let hasChanges = false;
+
+			// Highlight front term in green
+			if (frontTerm && textContent.includes(frontTerm)) {
+				console.log("[Polyglot] Highlighting front term in green:", frontTerm);
+				modifiedContent = modifiedContent.replace(
+					frontTerm,
+					`<mark style="background-color: ${HIGHLIGHT_COLORS.unlocked};">${frontTerm}</mark>`
+				);
+				hasChanges = true;
+			}
+
+			// Highlight back term in red
+			if (backTerm && textContent.includes(backTerm)) {
+				console.log("[Polyglot] Highlighting back term in red:", backTerm);
+				modifiedContent = modifiedContent.replace(
+					backTerm,
+					`<mark style="background-color: ${HIGHLIGHT_COLORS.failed};">${backTerm}</mark>`
+				);
+				hasChanges = true;
+			}
+
+			// Replace the text node with highlighted HTML if changes were made
+			if (hasChanges && node.parentNode) {
+				console.log("[Polyglot] Applying highlighted content:", modifiedContent);
+				const span = document.createElement('span');
+				span.innerHTML = modifiedContent;
+				node.parentNode.replaceChild(span, node);
+
+				// Remove highlights after 1.5 seconds
+				setTimeout(() => {
+					if (span.parentNode) {
+						span.parentNode.replaceChild(document.createTextNode(textContent), span);
+					}
+				}, 1500);
+			}
+		}
+	}
+
+	/**
+	 * Handle jump-to-source for polyglot cards by searching for raw terms
+	 */
+	private async jumpToPolyglotTerm(
+		card: Flashcard,
+		wrapper: HTMLElement,
+		highlightColor: string
+	): Promise<void> {
+		console.log("[Polyglot] jumpToPolyglotTerm called", { card, wrapper });
+
+		const applyHighlight = (el: HTMLElement) => {
+			el.style.setProperty("--highlight-color", highlightColor);
+			el.classList.add("gn-flash-highlight");
+			setTimeout(() => {
+				el.classList.remove("gn-flash-highlight");
+				el.style.removeProperty("--highlight-color");
+			}, 1500);
+		};
+
+		// Extract terms from front and back, stripping language prefixes
+		const extractTerm = (text: string): string => {
+			// Strip "language: " prefix (e.g., "english: dog" -> "dog")
+			const match = text.match(/^[^:]+:\s*(.+)$/);
+			return match ? match[1].trim() : text.trim();
+		};
+
+		const frontTerm = card.front ? extractTerm(card.front) : "";
+		const backTerm = card.back ? extractTerm(card.back) : "";
+
+		console.log("[Polyglot] Extracted terms:", {
+			front: card.front,
+			back: card.back,
+			frontTerm,
+			backTerm
+		});
+
+		// Try to find either term in the content using simple text search
+		const searchTerms = [frontTerm, backTerm].filter(
+			(term) => term.length > 0
+		);
+
+		console.log("[Polyglot] Search terms:", searchTerms);
+		console.log("[Polyglot] Wrapper content:", wrapper.textContent);
+
+		let found = false;
+		for (const term of searchTerms) {
+			console.log("[Polyglot] Searching for term:", term);
+
+			// Simple approach: find elements containing the term text
+			const walker = document.createTreeWalker(
+				wrapper,
+				NodeFilter.SHOW_TEXT
+			);
+
+			let textNode;
+			while (textNode = walker.nextNode()) {
+				const textContent = textNode.textContent || "";
+				if (textContent.includes(term)) {
+					console.log("[Polyglot] Found term in text node:", textContent);
+					// Found the term! Highlight its parent element
+					const parentElement = textNode.parentElement;
+					if (parentElement) {
+						console.log("[Polyglot] Highlighting parent element:", parentElement);
+						parentElement.scrollIntoView({ behavior: "smooth" });
+						applyHighlight(parentElement);
+						found = true;
+						break;
+					}
+				}
+			}
+
+			if (found) break;
+		}
+
+		// Fallback: just highlight the whole wrapper if no term found
+		if (!found) {
+			console.log("[Polyglot] No term found, highlighting wrapper");
+			wrapper.scrollIntoView({ behavior: "smooth" });
+			applyHighlight(wrapper);
+		}
+	}
+
 	private async navigateToChapter(file: TFile): Promise<MarkdownView | null> {
 		const { workspace } = this.app;
 		const activeView = workspace.getActiveViewOfType(MarkdownView);
@@ -5882,6 +6968,13 @@ ${selection}
 		const mdView = await this.navigateToChapter(file);
 		if (!mdView) {
 			new Notice("Could not open the note for this card.");
+			return;
+		}
+
+		// Handle polyglot cards differently - they don't have paragraph structure
+		if (card.polyglot?.isPolyglot) {
+			console.log("[Jump] Polyglot card detected, using simple search");
+			await this.jumpToPolyglotTermInView(card, mdView, highlightColor);
 			return;
 		}
 
@@ -5943,28 +7036,46 @@ ${selection}
 						applyHighlight(wrapper);
 					}
 				} else {
-					try {
-						const range = findTextRange(card.tag, wrapper);
+					// Branch logic for polyglot vs regular cards
+					console.log("[Jump] Checking card type:", {
+						isPolyglot: card.polyglot?.isPolyglot,
+						polyglot: card.polyglot
+					});
 
-						const startContainer = range.startContainer;
-						const endContainer = range.endContainer;
+					if (card.polyglot?.isPolyglot) {
+						console.log("[Jump] Taking polyglot branch");
+						// Polyglot cards: Search for actual terms in markdown
+						await this.jumpToPolyglotTerm(
+							card,
+							wrapper,
+							highlightColor
+						);
+					} else {
+						console.log("[Jump] Taking regular card branch");
+						// Regular cards: Use existing complex finalized note logic
+						try {
+							const range = findTextRange(card.tag, wrapper);
 
-						if (
-							startContainer !== endContainer ||
-							startContainer.parentElement !==
-								endContainer.parentElement
-						) {
-							wrapper.scrollIntoView({
-								behavior: "smooth",
-							});
+							const startContainer = range.startContainer;
+							const endContainer = range.endContainer;
 
-							const selection = window.getSelection();
-							if (selection) {
-								selection.removeAllRanges();
-								selection.addRange(range);
+							if (
+								startContainer !== endContainer ||
+								startContainer.parentElement !==
+									endContainer.parentElement
+							) {
+								wrapper.scrollIntoView({
+									behavior: "smooth",
+								});
 
-								const style = document.createElement("style");
-								style.textContent = `
+								const selection = window.getSelection();
+								if (selection) {
+									selection.removeAllRanges();
+									selection.addRange(range);
+
+									const style =
+										document.createElement("style");
+									style.textContent = `
 									::selection {
 										background-color: ${highlightColor} !important;
 										color: inherit !important;
@@ -5974,46 +7085,47 @@ ${selection}
 										color: inherit !important;
 									}
 								`;
-								document.head.appendChild(style);
+									document.head.appendChild(style);
 
+									setTimeout(() => {
+										selection.removeAllRanges();
+										document.head.removeChild(style);
+									}, 1500);
+								}
+							} else {
+								const mark = document.createElement("mark");
+								range.surroundContents(mark);
+								mark.scrollIntoView({
+									behavior: "smooth",
+								});
+								applyHighlight(mark);
 								setTimeout(() => {
-									selection.removeAllRanges();
-									document.head.removeChild(style);
+									const parent = mark.parentNode;
+									if (parent) {
+										while (mark.firstChild)
+											parent.insertBefore(
+												mark.firstChild,
+												mark
+											);
+										parent.removeChild(mark);
+									}
 								}, 1500);
 							}
-						} else {
-							const mark = document.createElement("mark");
-							range.surroundContents(mark);
-							mark.scrollIntoView({
+						} catch (e) {
+							this.logger(
+								LogLevel.NORMAL,
+								`Tag highlighting failed: ${
+									(e as Error).message
+								}. Flashing paragraph as fallback.`
+							);
+							wrapper.scrollIntoView({
 								behavior: "smooth",
 							});
-							applyHighlight(mark);
-							setTimeout(() => {
-								const parent = mark.parentNode;
-								if (parent) {
-									while (mark.firstChild)
-										parent.insertBefore(
-											mark.firstChild,
-											mark
-										);
-									parent.removeChild(mark);
-								}
-							}, 1500);
+							applyHighlight(wrapper);
 						}
-					} catch (e) {
-						this.logger(
-							LogLevel.NORMAL,
-							`Tag highlighting failed: ${
-								(e as Error).message
-							}. Flashing paragraph as fallback.`
-						);
-						wrapper.scrollIntoView({
-							behavior: "smooth",
-						});
-						applyHighlight(wrapper);
 					}
+					return;
 				}
-				return;
 			}
 
 			this.logger(
@@ -6969,6 +8081,37 @@ ${selection}
 	}
 
 	/**
+	 * Format polyglot card content for display with language hints
+	 */
+	private formatPolyglotContent(content: string, card: Flashcard, showingFront: boolean): string {
+		if (!card.polyglot?.isPolyglot) {
+			return content;
+		}
+
+		if (card.polyglot.backType === "text") {
+			// For text cards, show the target language hint
+			if (showingFront) {
+				// Front: show the front content + hint about back language
+				const backPrefix = card.back?.split(':')[0] || 'target';
+				return `${content}\n${backPrefix}: ?`;
+			} else {
+				// Back: just show the back content normally
+				return content;
+			}
+		} else if (card.polyglot.backType === "image") {
+			// For image cards, show "image: ?" hint
+			if (showingFront) {
+				return `${content}\nimage: ?`;
+			} else {
+				// Back will be handled by image rendering logic
+				return content;
+			}
+		}
+
+		return content;
+	}
+
+	/**
 	 * Renders card content, processing special placeholders like `[[IMAGE HASH=...]]`.
 	 * @param content The raw markdown content from the card's front or back field.
 	 * @param container The HTMLElement to render the content into.
@@ -7046,8 +8189,9 @@ ${selection}
 
 			const frontContainer = modal.contentEl.createDiv();
 			const selectedVariant = this.getRandomVariant(card);
+			const formattedFront = this.formatPolyglotContent(selectedVariant.front, card, true);
 			this.renderCardContent(
-				selectedVariant.front,
+				formattedFront,
 				frontContainer,
 				card.chapter
 			);
@@ -7073,8 +8217,9 @@ ${selection}
 				revealBtn.buttonEl.style.display = "none";
 
 				const backContainer = modal.contentEl.createDiv();
+				const formattedBack = this.formatPolyglotContent(selectedVariant.back, card, false);
 				await this.renderCardContent(
-					selectedVariant.back,
+					formattedBack,
 					backContainer,
 					card.chapter
 				);
@@ -7660,7 +8805,8 @@ ${selection}
 		for (const deck of allDeckFiles) {
 			const graph = await this.readDeck(deck.path);
 			for (const card of Object.values(graph)) {
-				if (card.paraIdx === undefined || card.paraIdx === null) {
+				// Only count missing paraIdx for non-polyglot cards (polyglot cards don't need paraIdx)
+				if ((card.paraIdx === undefined || card.paraIdx === null) && !card.polyglot?.isPolyglot) {
 					count++;
 				}
 			}
@@ -7884,9 +9030,7 @@ ${selection}
 			(await this.readDeck(getDeckPathForChapter(chapterPath)));
 
 		const blockedCards = Object.values(graph).filter(
-			(c) =>
-				c.chapter === chapterPath &&
-				isBlockingGating(c)
+			(c) => c.chapter === chapterPath && isBlockingGating(c)
 		);
 
 		if (blockedCards.length === 0) {
@@ -7921,12 +9065,12 @@ ${selection}
 	async saveGuidanceSnippet(name: string, guidance: string): Promise<void> {
 		const isNew = !(name in this.settings.guidanceSnippets);
 		this.settings.guidanceSnippets[name] = guidance;
-		
+
 		// Add to order array if new
 		if (isNew && !this.settings.guidanceSnippetOrder.includes(name)) {
 			this.settings.guidanceSnippetOrder.push(name);
 		}
-		
+
 		await this.saveSettings();
 	}
 
@@ -7935,13 +9079,13 @@ ${selection}
 	 */
 	async deleteGuidanceSnippet(name: string): Promise<void> {
 		delete this.settings.guidanceSnippets[name];
-		
+
 		// Remove from order array
 		const index = this.settings.guidanceSnippetOrder.indexOf(name);
 		if (index > -1) {
 			this.settings.guidanceSnippetOrder.splice(index, 1);
 		}
-		
+
 		await this.saveSettings();
 	}
 
@@ -7951,9 +9095,13 @@ ${selection}
 	getGuidanceSnippetNames(): string[] {
 		// Ensure all existing snippets are in the order array
 		const existingNames = Object.keys(this.settings.guidanceSnippets);
-		const orderedNames = this.settings.guidanceSnippetOrder.filter(name => existingNames.includes(name));
-		const unorderedNames = existingNames.filter(name => !this.settings.guidanceSnippetOrder.includes(name));
-		
+		const orderedNames = this.settings.guidanceSnippetOrder.filter((name) =>
+			existingNames.includes(name)
+		);
+		const unorderedNames = existingNames.filter(
+			(name) => !this.settings.guidanceSnippetOrder.includes(name)
+		);
+
 		// Return ordered names first, then any unordered ones (alphabetically)
 		return [...orderedNames, ...unorderedNames.sort()];
 	}
@@ -7977,19 +9125,26 @@ ${selection}
 	 * Creates guidance snippet UI components (load/save dropdown and buttons).
 	 */
 	createGuidanceSnippetUI(
-		container: HTMLElement, 
+		container: HTMLElement,
 		guidanceInput: TextAreaComponent,
 		updateCallback?: () => void
 	): void {
-		const snippetContainer = container.createDiv({ cls: "guidance-snippet-controls" });
-		snippetContainer.style.cssText = "display: flex; gap: 8px; margin-top: 8px; align-items: center;";
+		const snippetContainer = container.createDiv({
+			cls: "guidance-snippet-controls",
+		});
+		snippetContainer.style.cssText =
+			"display: flex; gap: 8px; margin-top: 8px; align-items: center;";
 
 		// Repository button (combines select and manage functionality)
 		new ButtonComponent(snippetContainer)
 			.setButtonText("📁 Repository")
 			.setTooltip("Browse, use, edit, and manage saved guidance snippets")
 			.onClick(() => {
-				new GuidanceRepositoryModal(this, guidanceInput, updateCallback || (() => {})).open();
+				new GuidanceRepositoryModal(
+					this,
+					guidanceInput,
+					updateCallback || (() => {})
+				).open();
 			});
 
 		// Save button
@@ -8551,7 +9706,11 @@ class EpubToNoteModal extends Modal {
 		}
 
 		// Extract CSS styles
-		const cssStyles = await this.extractCssStyles(this.zipData, manifest, opfPath);
+		const cssStyles = await this.extractCssStyles(
+			this.zipData,
+			manifest,
+			opfPath
+		);
 
 		return { title, author, sections, manifest, cssStyles };
 	}
@@ -8626,7 +9785,7 @@ class EpubToNoteModal extends Modal {
 			)
 				continue;
 
-			const filePath = basePath + manifestItem.href;
+			const filePath = basePath + decodeURIComponent(manifestItem.href);
 			const file = zip.file(filePath);
 			if (!file) continue;
 
@@ -8868,9 +10027,10 @@ class EpubToNoteModal extends Modal {
 
 			const file = this.zipData.file(fullPath);
 			if (!file) {
-				const availableFiles = Object.keys(
-					this.zipData.files
-				).slice(0, 10);
+				const availableFiles = Object.keys(this.zipData.files).slice(
+					0,
+					10
+				);
 				return {
 					content: `[File not found: ${fullPath}]`,
 					wordCount: 3,
@@ -9148,16 +10308,19 @@ class EpubToNoteModal extends Modal {
 
 	private resolveFilePath(href: string): string {
 		// Remove fragment identifier if present (e.g., #ch1)
-		const cleanHref = href.split('#')[0];
-		
+		const cleanHref = href.split("#")[0];
+
+		// URL decode the href to handle encoded characters like %21 -> !
+		const decodedHref = decodeURIComponent(cleanHref);
+
 		// If href already includes the base path, don't duplicate it
 		const basePath = this.getBasePath();
-		if (cleanHref.startsWith(basePath)) {
-			return cleanHref;
+		if (decodedHref.startsWith(basePath)) {
+			return decodedHref;
 		}
-		
+
 		// Otherwise, combine base path with href
-		return basePath + cleanHref;
+		return basePath + decodedHref;
 	}
 
 	private async extractCssStyles(
@@ -9165,36 +10328,44 @@ class EpubToNoteModal extends Modal {
 		manifest: { [id: string]: { href: string; mediaType: string } },
 		opfPath: string
 	): Promise<{ [className: string]: { [property: string]: string } }> {
-		const cssStyles: { [className: string]: { [property: string]: string } } = {};
+		const cssStyles: {
+			[className: string]: { [property: string]: string };
+		} = {};
 		const basePath = opfPath.substring(0, opfPath.lastIndexOf("/") + 1);
 
 		// Find all CSS files in the manifest
 		const cssFiles = Object.values(manifest).filter(
-			item => item.mediaType === "text/css"
+			(item) => item.mediaType === "text/css"
 		);
 
 		for (const cssFile of cssFiles) {
 			try {
-				const fullPath = basePath + cssFile.href;
+				const fullPath = basePath + decodeURIComponent(cssFile.href);
 				const file = zip.file(fullPath);
 				if (!file) continue;
 
 				const cssContent = await file.async("text");
 				const parsedStyles = this.parseCssContent(cssContent);
-				
+
 				// Merge parsed styles into the main styles object
 				Object.assign(cssStyles, parsedStyles);
 			} catch (error) {
-				console.warn(`Failed to extract CSS from ${cssFile.href}:`, error);
+				console.warn(
+					`Failed to extract CSS from ${cssFile.href}:`,
+					error
+				);
 			}
 		}
 
 		return cssStyles;
 	}
 
-	private parseCssContent(cssContent: string): { [className: string]: { [property: string]: string } } {
-		const styles: { [className: string]: { [property: string]: string } } = {};
-		
+	private parseCssContent(cssContent: string): {
+		[className: string]: { [property: string]: string };
+	} {
+		const styles: { [className: string]: { [property: string]: string } } =
+			{};
+
 		// Simple CSS parser - handle class selectors
 		const classRuleRegex = /\.([a-zA-Z0-9_-]+)\s*\{([^}]+)\}/g;
 		let match;
@@ -9202,19 +10373,19 @@ class EpubToNoteModal extends Modal {
 		while ((match = classRuleRegex.exec(cssContent)) !== null) {
 			const className = match[1];
 			const properties = match[2];
-			
+
 			const parsedProps: { [property: string]: string } = {};
-			
+
 			// Parse properties
 			const propRegex = /([a-zA-Z-]+)\s*:\s*([^;]+);?/g;
 			let propMatch;
-			
+
 			while ((propMatch = propRegex.exec(properties)) !== null) {
 				const property = propMatch[1].trim();
 				const value = propMatch[2].trim();
 				parsedProps[property] = value;
 			}
-			
+
 			styles[className] = parsedProps;
 		}
 
@@ -9225,108 +10396,133 @@ class EpubToNoteModal extends Modal {
 		// Simple hash using the first few bytes + length + last few bytes
 		const bytes = new Uint8Array(arrayBuffer);
 		const length = bytes.length;
-		
+
 		// Take first 8 bytes, length, and last 8 bytes for a simple hash
 		const hashParts = [];
 		for (let i = 0; i < Math.min(8, length); i++) {
-			hashParts.push(bytes[i].toString(16).padStart(2, '0'));
+			hashParts.push(bytes[i].toString(16).padStart(2, "0"));
 		}
 		hashParts.push(length.toString(16));
 		for (let i = Math.max(0, length - 8); i < length; i++) {
-			hashParts.push(bytes[i].toString(16).padStart(2, '0'));
+			hashParts.push(bytes[i].toString(16).padStart(2, "0"));
 		}
-		
-		return hashParts.join('');
+
+		return hashParts.join("");
 	}
 
-	private async findExistingImageByHash(hash: string): Promise<string | null> {
+	private async findExistingImageByHash(
+		hash: string
+	): Promise<string | null> {
 		try {
-			const imagesFile = this.app.vault.getAbstractFileByPath('_images.json');
+			const imagesFile =
+				this.app.vault.getAbstractFileByPath("_images.json");
 			if (!imagesFile || !(imagesFile instanceof TFile)) {
 				return null;
 			}
-			
+
 			const content = await this.app.vault.read(imagesFile);
 			const imagesData = JSON.parse(content);
-			
+
 			// Look for an image with this hash
 			for (const [filename, data] of Object.entries(imagesData)) {
-				if (typeof data === 'object' && data && (data as any).hash === hash) {
+				if (
+					typeof data === "object" &&
+					data &&
+					(data as any).hash === hash
+				) {
 					// Check if the file still exists
-					const imageFile = this.app.vault.getAbstractFileByPath(filename);
+					const imageFile =
+						this.app.vault.getAbstractFileByPath(filename);
 					if (imageFile instanceof TFile) {
 						return filename;
 					}
 				}
 			}
 		} catch (error) {
-			console.warn('Error checking existing images:', error);
+			console.warn("Error checking existing images:", error);
 		}
-		
+
 		return null;
 	}
 
-	private async updateImagesJson(filename: string, hash: string): Promise<void> {
+	private async updateImagesJson(
+		filename: string,
+		hash: string
+	): Promise<void> {
 		try {
-			const imagesPath = '_images.json';
+			const imagesPath = "_images.json";
 			let imagesData: any = {};
-			
+
 			// Try to read existing _images.json
 			const imagesFile = this.app.vault.getAbstractFileByPath(imagesPath);
 			if (imagesFile instanceof TFile) {
 				const content = await this.app.vault.read(imagesFile);
 				imagesData = JSON.parse(content);
 			}
-			
+
 			// Add the new image entry
 			imagesData[filename] = {
 				hash: hash,
 				addedAt: new Date().toISOString(),
-				source: 'epub-conversion'
+				source: "epub-conversion",
 			};
-			
+
 			// Write back to _images.json
-			await this.app.vault.adapter.write(imagesPath, JSON.stringify(imagesData, null, 2));
+			await this.app.vault.adapter.write(
+				imagesPath,
+				JSON.stringify(imagesData, null, 2)
+			);
 		} catch (error) {
-			console.warn('Error updating _images.json:', error);
+			console.warn("Error updating _images.json:", error);
 		}
 	}
 
-	private getElementStyling(element: Element): { isSubscript: boolean; isSuperscript: boolean } {
+	private getElementStyling(element: Element): {
+		isSubscript: boolean;
+		isSuperscript: boolean;
+	} {
 		const result = { isSubscript: false, isSuperscript: false };
-		
+
 		if (!this.epubStructure?.cssStyles) {
 			return result;
 		}
-		
+
 		// Check class attribute
 		const className = element.getAttribute("class");
 		if (!className) {
 			return result;
 		}
-		
+
 		// Split multiple classes and check each one
 		const classNames = className.split(/\s+/);
-		
+
 		for (const cls of classNames) {
 			const style = this.epubStructure.cssStyles[cls];
 			if (!style) continue;
-			
+
 			// Check for subscript indicators
-			if (style["vertical-align"] === "sub" || 
+			if (
+				style["vertical-align"] === "sub" ||
 				style["vertical-align"] === "subscript" ||
-				(style["font-size"] && parseFloat(style["font-size"]) < 1.0 && style["vertical-align"]?.includes("sub"))) {
+				(style["font-size"] &&
+					parseFloat(style["font-size"]) < 1.0 &&
+					style["vertical-align"]?.includes("sub"))
+			) {
 				result.isSubscript = true;
 			}
-			
-			// Check for superscript indicators  
-			if (style["vertical-align"] === "super" || 
+
+			// Check for superscript indicators
+			if (
+				style["vertical-align"] === "super" ||
 				style["vertical-align"] === "superscript" ||
-				(style["font-size"] && parseFloat(style["font-size"]) < 1.0 && style["vertical-align"]?.includes("super"))) {
+				(style["font-size"] &&
+					parseFloat(style["font-size"]) < 1.0 &&
+					style["vertical-align"]?.includes("super"))
+			) {
 				result.isSuperscript = true;
 			}
 		}
-		
+
 		return result;
 	}
 
@@ -9397,7 +10593,7 @@ class EpubToNoteModal extends Modal {
 						pChildResults.push(childResult);
 					}
 				}
-				
+
 				const pContent = this.smartJoinWithSpaces(pChildResults);
 				return pContent;
 
@@ -9466,7 +10662,7 @@ class EpubToNoteModal extends Modal {
 			default:
 				// Check for CSS-based styling
 				const styling = this.getElementStyling(element);
-				
+
 				const unknownResults: string[] = [];
 				for (const child of Array.from(element.childNodes)) {
 					const childResult = await this.processNode(child, href);
@@ -9474,16 +10670,16 @@ class EpubToNoteModal extends Modal {
 						unknownResults.push(childResult);
 					}
 				}
-				
+
 				const content = unknownResults.join("");
-				
+
 				// Apply CSS-based formatting
 				if (styling.isSubscript) {
 					return `<sub>${content}</sub>`;
 				} else if (styling.isSuperscript) {
 					return `<sup>${content}</sup>`;
 				}
-				
+
 				return content;
 		}
 	}
@@ -9511,14 +10707,17 @@ class EpubToNoteModal extends Modal {
 
 			if (!imageFile && !src.startsWith("/") && !src.startsWith("http")) {
 				// Remove fragment identifier from href before getting directory
-				const cleanHref = href.split('#')[0];
-				const hrefDir = cleanHref.substring(0, cleanHref.lastIndexOf("/") + 1);
-				const relativePath = hrefDir + src;
+				const cleanHref = href.split("#")[0];
+				const hrefDir = cleanHref.substring(
+					0,
+					cleanHref.lastIndexOf("/") + 1
+				);
+				const relativePath = hrefDir + decodeURIComponent(src);
 				pathsToTry.push(relativePath);
 				imageFile = this.zipData.file(relativePath);
 
 				if (!imageFile) {
-					const basePathImage = this.getBasePath() + src;
+					const basePathImage = this.getBasePath() + decodeURIComponent(src);
 					pathsToTry.push(basePathImage);
 					imageFile = this.zipData.file(basePathImage);
 				}
@@ -9544,18 +10743,19 @@ class EpubToNoteModal extends Modal {
 
 			const imageData = await imageFile.async("blob");
 			const arrayBuffer = await imageData.arrayBuffer();
-			
+
 			// Compute hash for deduplication
 			const hash = await this.computeImageHash(arrayBuffer);
-			
+
 			// Check if we already have this image
 			const existingImage = await this.findExistingImageByHash(hash);
 			if (existingImage) {
 				// Use existing image
-				const imageName = existingImage.split('/').pop() || existingImage;
+				const imageName =
+					existingImage.split("/").pop() || existingImage;
 				return `![[${imageName}]]`;
 			}
-			
+
 			// Create new image since we don't have it
 			const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
 			const extension = src.split(".").pop()?.toLowerCase() || "png";
@@ -9575,7 +10775,7 @@ class EpubToNoteModal extends Modal {
 			}
 
 			await this.app.vault.createBinary(targetPath, arrayBuffer);
-			
+
 			// Update _images.json with the new image
 			await this.updateImagesJson(targetPath, hash);
 
@@ -11109,22 +12309,25 @@ Return ONLY the final, perfected markdown text.`;
 	 */
 	private cleanMarkdownResponse(content: string): string {
 		if (!content) return content;
-		
+
 		// Remove leading ```markdown or ``` and trailing ```
 		let cleaned = content.trim();
-		
+
 		// Remove opening markdown code fence
-		if (cleaned.startsWith('```markdown\n') || cleaned.startsWith('```markdown ')) {
-			cleaned = cleaned.replace(/^```markdown\s*\n?/, '');
-		} else if (cleaned.startsWith('```\n') || cleaned.startsWith('``` ')) {
-			cleaned = cleaned.replace(/^```\s*\n?/, '');
+		if (
+			cleaned.startsWith("```markdown\n") ||
+			cleaned.startsWith("```markdown ")
+		) {
+			cleaned = cleaned.replace(/^```markdown\s*\n?/, "");
+		} else if (cleaned.startsWith("```\n") || cleaned.startsWith("``` ")) {
+			cleaned = cleaned.replace(/^```\s*\n?/, "");
 		}
-		
+
 		// Remove closing code fence
-		if (cleaned.endsWith('\n```') || cleaned.endsWith(' ```')) {
-			cleaned = cleaned.replace(/\s*```\s*$/, '');
+		if (cleaned.endsWith("\n```") || cleaned.endsWith(" ```")) {
+			cleaned = cleaned.replace(/\s*```\s*$/, "");
 		}
-		
+
 		return cleaned.trim();
 	}
 
@@ -11155,12 +12358,12 @@ Guidelines:
 			pageImageDataUrl,
 			maxTokens ? { maxTokens } : {}
 		);
-		
+
 		// Clean up markdown code fences from response
 		if (result.content) {
 			result.content = this.cleanMarkdownResponse(result.content);
 		}
-		
+
 		return result;
 	}
 
@@ -11191,9 +12394,7 @@ Guidelines:
 		const pdf = await pdfjsLib.getDocument(typedArray).promise;
 
 		// Get page range from UI inputs
-		const fromPage = parseInt(
-			this.pageRangeFromInput?.getValue() || "1"
-		);
+		const fromPage = parseInt(this.pageRangeFromInput?.getValue() || "1");
 		const toPage = parseInt(
 			this.pageRangeToInput?.getValue() || pdf.numPages.toString()
 		);
@@ -11277,12 +12478,12 @@ Rules:
 			undefined,
 			maxTokens ? { maxTokens } : {}
 		);
-		
+
 		// Clean up markdown code fences from response
 		if (result.content) {
 			result.content = this.cleanMarkdownResponse(result.content);
 		}
-		
+
 		return result;
 	}
 
@@ -11665,7 +12866,9 @@ Rules:
 		);
 
 		if (!result.content) {
-			throw new Error("Empty response from LLM for single-call processing");
+			throw new Error(
+				"Empty response from LLM for single-call processing"
+			);
 		}
 
 		let cleanedContent = result.content;
@@ -11714,7 +12917,11 @@ Rules:
 		for (let chunkIndex = 0; chunkIndex < chunks.length; chunkIndex++) {
 			const chunk = chunks[chunkIndex];
 			notice.setMessage(
-				`🤖 Processing chunk ${chunkIndex + 1}/${chunks.length} (pages ${chunk[0].pageNum}-${chunk[chunk.length - 1].pageNum})...`
+				`🤖 Processing chunk ${chunkIndex + 1}/${
+					chunks.length
+				} (pages ${chunk[0].pageNum}-${
+					chunk[chunk.length - 1].pageNum
+				})...`
 			);
 
 			// Get context pages (prior pages)
@@ -11725,10 +12932,17 @@ Rules:
 			if (useContext && chunkIndex > 0) {
 				// Get context from previous chunks/pages
 				const availableContextPages = chunkIndex * chunkSize;
-				const startIdx = Math.max(0, availableContextPages - contextPageCount);
+				const startIdx = Math.max(
+					0,
+					availableContextPages - contextPageCount
+				);
 				const endIdx = availableContextPages;
 
-				for (let j = startIdx; j < endIdx && j < this.renderedPages.length; j++) {
+				for (
+					let j = startIdx;
+					j < endIdx && j < this.renderedPages.length;
+					j++
+				) {
 					contextImages.push(this.renderedPages[j].imageData);
 					if (j < processedResults.length) {
 						contextTranscriptions.push(processedResults[j]);
@@ -11763,24 +12977,25 @@ Rules:
 			}
 
 			// Build prompt for this chunk
-			const chunkImages = chunk.map(p => p.imageData);
-			const chunkTextContent = chunk.map(p => p.textContent || "");
-			const chunkPageNumbers = chunk.map(p => p.pageNum);
+			const chunkImages = chunk.map((p) => p.imageData);
+			const chunkTextContent = chunk.map((p) => p.textContent || "");
+			const chunkPageNumbers = chunk.map((p) => p.pageNum);
 
-			const promptText = useContext && (chunkIndex > 0 || useFutureContext)
-				? this.buildChunkedPromptWithContext(
-						chunkPageNumbers,
-						chunkTextContent,
-						contextTranscriptions,
-						contextTextContent,
-						futureContextTextContent,
-						this.guidanceInput?.getValue()
-				  )
-				: this.buildChunkedPrompt(
-						chunkPageNumbers,
-						chunkTextContent,
-						this.guidanceInput?.getValue()
-				  );
+			const promptText =
+				useContext && (chunkIndex > 0 || useFutureContext)
+					? this.buildChunkedPromptWithContext(
+							chunkPageNumbers,
+							chunkTextContent,
+							contextTranscriptions,
+							contextTextContent,
+							futureContextTextContent,
+							this.guidanceInput?.getValue()
+					  )
+					: this.buildChunkedPrompt(
+							chunkPageNumbers,
+							chunkTextContent,
+							this.guidanceInput?.getValue()
+					  );
 
 			const allImages = this.buildImageArrayForLlmChunk(
 				chunkImages,
@@ -11805,7 +13020,9 @@ Rules:
 
 			let chunkContent = result.content;
 			if (
-				chunkContent.match(/^\s*```(?:markdown)?\s*([\s\S]*?)\s*```\s*$/)
+				chunkContent.match(
+					/^\s*```(?:markdown)?\s*([\s\S]*?)\s*```\s*$/
+				)
 			) {
 				chunkContent = chunkContent.replace(
 					/^\s*```(?:markdown)?\s*([\s\S]*?)\s*```\s*$/,
@@ -11837,11 +13054,14 @@ Rules:
 	/**
 	 * Create chunks of pages for processing.
 	 */
-	private createPageChunks(pages: Array<{
-		pageNum: number;
-		imageData: string;
-		textContent?: string;
-	}>, chunkSize: number): Array<{
+	private createPageChunks(
+		pages: Array<{
+			pageNum: number;
+			imageData: string;
+			textContent?: string;
+		}>,
+		chunkSize: number
+	): Array<{
 		pageNum: number;
 		imageData: string;
 		textContent?: string;
@@ -11866,11 +13086,13 @@ Rules:
 		customGuidance?: string
 	): string {
 		const totalImages = pageNumbers.length;
-		
-		let systemPrompt = `You are an expert document processor converting a multi-page PDF document (with optional PDF text) into clean, well-structured Markdown. You are processing pages ${pageNumbers[0]}-${pageNumbers[pageNumbers.length - 1]} of a multi-page document.
+
+		let systemPrompt = `You are an expert document processor converting a multi-page PDF document (with optional PDF text) into clean, well-structured Markdown. You are processing pages ${
+			pageNumbers[0]
+		}-${pageNumbers[pageNumbers.length - 1]} of a multi-page document.
 
 IMAGES PROVIDED:`;
-		
+
 		for (let i = 0; i < totalImages; i++) {
 			systemPrompt += `\n- Image ${i + 1}: Page ${pageNumbers[i]}`;
 		}
@@ -11901,7 +13123,9 @@ Follow these rules strictly:
 			}
 		}
 
-		let userPrompt = `You are processing pages ${pageNumbers[0]}-${pageNumbers[pageNumbers.length - 1]} of a multi-page document.`;
+		let userPrompt = `You are processing pages ${pageNumbers[0]}-${
+			pageNumbers[pageNumbers.length - 1]
+		} of a multi-page document.`;
 
 		// Add PDF text content for each page
 		for (let i = 0; i < textContents.length; i++) {
@@ -11910,7 +13134,9 @@ Follow these rules strictly:
 			}
 		}
 
-		userPrompt += `\n\nTranscribe all pages (${pageNumbers[0]}-${pageNumbers[pageNumbers.length - 1]}) into a single cohesive markdown document.`;
+		userPrompt += `\n\nTranscribe all pages (${pageNumbers[0]}-${
+			pageNumbers[pageNumbers.length - 1]
+		}) into a single cohesive markdown document.`;
 
 		if (customGuidance) {
 			userPrompt += `\n\n**User's Custom Instructions:**\n${customGuidance}`;
@@ -11929,13 +13155,15 @@ Follow these rules strictly:
 	): string {
 		const chunkStart = chunkPageNumbers[0];
 		const chunkEnd = chunkPageNumbers[chunkPageNumbers.length - 1];
-		
+
 		let systemPrompt = `You are an expert document processor converting PDF page images (with optional PDF text) into clean, well-structured Markdown. You are processing pages ${chunkStart}-${chunkEnd} of a multi-page document.
 
 IMAGES PROVIDED:`;
-		
+
 		for (let i = 0; i < chunkPageNumbers.length; i++) {
-			systemPrompt += `\n- Image ${i + 1}: Page ${chunkPageNumbers[i]} (FOCUS - transcribe this page)`;
+			systemPrompt += `\n- Image ${i + 1}: Page ${
+				chunkPageNumbers[i]
+			} (FOCUS - transcribe this page)`;
 		}
 
 		systemPrompt += `
@@ -11994,7 +13222,8 @@ Follow these rules strictly:
 	): string {
 		const chunkStart = chunkPageNumbers[0];
 		const chunkEnd = chunkPageNumbers[chunkPageNumbers.length - 1];
-		const totalContextImages = contextTranscriptions.length + futureContextTextContents.length;
+		const totalContextImages =
+			contextTranscriptions.length + futureContextTextContents.length;
 		const currentImageStartIndex = contextTranscriptions.length + 1;
 
 		let systemPrompt = `You are an expert document processor converting PDF page images (with optional PDF text) into clean, well-structured Markdown. You are processing pages ${chunkStart}-${chunkEnd} of a multi-page document.
@@ -12004,22 +13233,26 @@ IMAGES PROVIDED:`;
 		if (contextTranscriptions.length > 0) {
 			systemPrompt += `\n- Images 1-${contextTranscriptions.length}: Previous pages (for context only)`;
 		}
-		
+
 		for (let i = 0; i < chunkPageNumbers.length; i++) {
 			const imageIndex = currentImageStartIndex + i;
 			systemPrompt += `\n- Image ${imageIndex}: Page ${chunkPageNumbers[i]} (FOCUS - transcribe this page)`;
 		}
-		
+
 		if (futureContextTextContents.length > 0) {
-			const futureStart = currentImageStartIndex + chunkPageNumbers.length;
-			const futureEnd = futureStart + futureContextTextContents.length - 1;
+			const futureStart =
+				currentImageStartIndex + chunkPageNumbers.length;
+			const futureEnd =
+				futureStart + futureContextTextContents.length - 1;
 			systemPrompt += `\n- Images ${futureStart}-${futureEnd}: Future pages (for context only)`;
 		}
 
 		systemPrompt += `
 
 INSTRUCTIONS:
-- Only transcribe content from the current pages (Images ${currentImageStartIndex}-${currentImageStartIndex + chunkPageNumbers.length - 1})
+- Only transcribe content from the current pages (Images ${currentImageStartIndex}-${
+			currentImageStartIndex + chunkPageNumbers.length - 1
+		})
 - Use context images and data to:
   - Continue mid-sentence/paragraph flows from previous pages
   - Avoid repeating headers/footers that appear across pages
@@ -12049,7 +13282,8 @@ Follow these rules strictly:
 		if (contextTranscriptions.length > 0) {
 			userPrompt += `\n\nPREVIOUS PAGE DATA (for context only):\n`;
 			contextTranscriptions.forEach((transcription, index) => {
-				const pageIndex = chunkStart - contextTranscriptions.length + index;
+				const pageIndex =
+					chunkStart - contextTranscriptions.length + index;
 				userPrompt += `--- PAGE ${pageIndex} TRANSCRIPTION ---\n${transcription}\n\n`;
 				if (contextTextContents[index]) {
 					userPrompt += `--- PAGE ${pageIndex} PDF TEXT ---\n${contextTextContents[index]}\n\n`;
@@ -14313,15 +15547,15 @@ ${Array.from(
 		const isMultiple = quantity === "many";
 		const quantityText = isMultiple ? "2–3 NEW" : "1 NEW";
 
-		const customGuidanceSection = guidance 
+		const customGuidanceSection = guidance
 			? `
 **User's Custom Instructions:**
 ${guidance}
 
 The instructions above override any conflicting guidance below and should be prioritized.
 
-` 
-			: '';
+`
+			: "";
 
 		const prompt = `You are a flashcard variant generator.
 I will give you ${
@@ -14804,8 +16038,12 @@ Return ONLY valid JSON array of this shape: [{"front":"...","back":"..."}]`;
 	private updateMnemonicsDisplay(): void {
 		this.mnemonicContainer.empty();
 
-		const hasMajorSystemMnemonics = this.card.mnemonics?.majorSystem && this.card.mnemonics.majorSystem.length > 0;
-		const hasFreeformNotes = this.card.mnemonics?.freeformNotes && this.card.mnemonics.freeformNotes.trim().length > 0;
+		const hasMajorSystemMnemonics =
+			this.card.mnemonics?.majorSystem &&
+			this.card.mnemonics.majorSystem.length > 0;
+		const hasFreeformNotes =
+			this.card.mnemonics?.freeformNotes &&
+			this.card.mnemonics.freeformNotes.trim().length > 0;
 
 		if (hasMajorSystemMnemonics && this.card.mnemonics?.majorSystem) {
 			this.card.mnemonics.majorSystem.forEach((mnemonic, index) => {
@@ -14832,7 +16070,7 @@ Return ONLY valid JSON array of this shape: [{"front":"...","back":"..."}]`;
 				});
 			});
 		}
-		
+
 		// Show freeform notes info if they exist (even without major system mnemonics)
 		if (hasFreeformNotes) {
 			const freeformDiv = this.mnemonicContainer.createDiv({
@@ -14842,17 +16080,22 @@ Return ONLY valid JSON array of this shape: [{"front":"...","back":"..."}]`;
 				text: "Freeform Notes",
 				cls: "mnemonic-header",
 			});
-			
+
 			// Show a preview of the freeform notes (first line or first 50 chars)
-			const preview = (this.card.mnemonics?.freeformNotes || '').split('\n')[0];
-			const truncatedPreview = preview.length > 50 ? preview.substring(0, 50) + '...' : preview;
-			
+			const preview = (this.card.mnemonics?.freeformNotes || "").split(
+				"\n"
+			)[0];
+			const truncatedPreview =
+				preview.length > 50
+					? preview.substring(0, 50) + "..."
+					: preview;
+
 			freeformDiv.createEl("div", {
 				text: truncatedPreview,
 				cls: "freeform-preview-text",
 			});
 		}
-		
+
 		// Show "no mnemonics" only if neither type exists
 		if (!hasMajorSystemMnemonics && !hasFreeformNotes) {
 			this.mnemonicContainer.createEl("div", {
@@ -14889,7 +16132,7 @@ Return ONLY valid JSON array of this shape: [{"front":"...","back":"..."}]`;
 				// Create a more informative notice that accounts for both types of mnemonics
 				const majorSystemCount = selectedMnemonics.length;
 				const hasFreeformNotes = freeformNotes.trim().length > 0;
-				
+
 				let noticeText = "";
 				if (majorSystemCount > 0 && hasFreeformNotes) {
 					noticeText = `${majorSystemCount} major system mnemonics + freeform notes saved!`;
@@ -14900,7 +16143,7 @@ Return ONLY valid JSON array of this shape: [{"front":"...","back":"..."}]`;
 				} else {
 					noticeText = "Mnemonics cleared!";
 				}
-				
+
 				new Notice(noticeText);
 			}
 		).open();
@@ -15084,12 +16327,13 @@ class MnemonicsModal extends Modal {
 			text: "AI Generation Style:",
 			cls: "style-selection-label",
 		});
-		
+
 		const styleDropdown = styleContainer.createEl("select", {
 			cls: "style-selection-dropdown",
 		});
-		styleDropdown.style.cssText = "width: 200px; padding: 5px; border-radius: 4px; border: 1px solid var(--background-modifier-border); margin-bottom: 10px;";
-		
+		styleDropdown.style.cssText =
+			"width: 200px; padding: 5px; border-radius: 4px; border: 1px solid var(--background-modifier-border); margin-bottom: 10px;";
+
 		const styleOptions = [
 			{ value: "default", label: "Default" },
 			{ value: "alliterative", label: "Alliterative" },
@@ -15098,14 +16342,14 @@ class MnemonicsModal extends Modal {
 			{ value: "visual", label: "Visual/Concrete" },
 			{ value: "story", label: "Story-based" },
 		];
-		
-		styleOptions.forEach(option => {
+
+		styleOptions.forEach((option) => {
 			const optionEl = styleDropdown.createEl("option", {
 				text: option.label,
 			});
 			optionEl.value = option.value;
 		});
-		
+
 		styleDropdown.value = this.selectedStyle;
 		styleDropdown.addEventListener("change", () => {
 			this.selectedStyle = styleDropdown.value;
@@ -15119,12 +16363,12 @@ class MnemonicsModal extends Modal {
 		const cardTypeToggle = cardTypeContainer.createEl("label", {
 			cls: "card-type-toggle-label",
 		});
-		
+
 		const cardTypeCheckbox = cardTypeToggle.createEl("input", {
 			type: "checkbox",
 			cls: "card-type-checkbox",
 		});
-		
+
 		cardTypeToggle.createSpan({
 			text: " Override card type detection",
 			cls: "card-type-toggle-text",
@@ -15133,8 +16377,9 @@ class MnemonicsModal extends Modal {
 		const cardTypeDropdown = cardTypeContainer.createEl("select", {
 			cls: "card-type-dropdown",
 		});
-		cardTypeDropdown.style.cssText = "width: 200px; padding: 5px; border-radius: 4px; border: 1px solid var(--background-modifier-border); margin-left: 20px; margin-bottom: 10px; display: none;";
-		
+		cardTypeDropdown.style.cssText =
+			"width: 200px; padding: 5px; border-radius: 4px; border: 1px solid var(--background-modifier-border); margin-left: 20px; margin-bottom: 10px; display: none;";
+
 		const cardTypeOptions = [
 			{ value: "list", label: "List (steps, parts, names)" },
 			{ value: "quote", label: "Quote or verse" },
@@ -15142,22 +16387,24 @@ class MnemonicsModal extends Modal {
 			{ value: "concept", label: "Concept or definition" },
 			{ value: "number", label: "Contains numbers" },
 		];
-		
-		cardTypeOptions.forEach(option => {
+
+		cardTypeOptions.forEach((option) => {
 			const optionEl = cardTypeDropdown.createEl("option", {
 				value: option.value,
 				text: option.label,
 			});
 		});
-		
+
 		cardTypeDropdown.value = "list"; // default
-		
+
 		cardTypeCheckbox.addEventListener("change", () => {
 			const isChecked = cardTypeCheckbox.checked;
-			cardTypeDropdown.style.display = isChecked ? "inline-block" : "none";
+			cardTypeDropdown.style.display = isChecked
+				? "inline-block"
+				: "none";
 			this.cardTypeOverride = isChecked ? cardTypeDropdown.value : null;
 		});
-		
+
 		cardTypeDropdown.addEventListener("change", () => {
 			if (cardTypeCheckbox.checked) {
 				this.cardTypeOverride = cardTypeDropdown.value;
@@ -15486,9 +16733,12 @@ class MnemonicsModal extends Modal {
 			const rawValue = this.freeformNotesTextarea.value.trim();
 			let contentForLlm = rawValue;
 			let existingContentForDisplay = rawValue;
-			
+
 			// If content has labels, extract all content for LLM and preserve for display
-			if (rawValue.includes("**ORIGINAL:**\n") && rawValue.includes("\n\n**NEW GENERATION:**\n")) {
+			if (
+				rawValue.includes("**ORIGINAL:**\n") &&
+				rawValue.includes("\n\n**NEW GENERATION:**\n")
+			) {
 				// Remove the labels but keep all content for LLM
 				contentForLlm = rawValue
 					.replace("**ORIGINAL:**\n", "")
@@ -15496,31 +16746,37 @@ class MnemonicsModal extends Modal {
 				// For display, we'll use the cleaned content as "ORIGINAL"
 				existingContentForDisplay = contentForLlm;
 			}
-			
-			const existingMnemonicsContext = contentForLlm 
-				? `\n\nEXISTING MNEMONICS:\n\`\`\`\n${contentForLlm}\n\`\`\`\n\nThe above are mnemonics the user already has. Create additional mental imagery that complements or provides alternatives to what's already there.` 
-				: '';
+
+			const existingMnemonicsContext = contentForLlm
+				? `\n\nEXISTING MNEMONICS:\n\`\`\`\n${contentForLlm}\n\`\`\`\n\nThe above are mnemonics the user already has. Create additional mental imagery that complements or provides alternatives to what's already there.`
+				: "";
 
 			// Get style-specific instructions
 			let styleInstructions = "";
 			switch (this.selectedStyle) {
 				case "alliterative":
-					styleInstructions = "Focus on ALLITERATIVE connections - use words that start with similar sounds to create memorable links between concepts.";
+					styleInstructions =
+						"Focus on ALLITERATIVE connections - use words that start with similar sounds to create memorable links between concepts.";
 					break;
 				case "rhyming":
-					styleInstructions = "Create RHYMING patterns and rhythmic elements that make the content musical and memorable.";
+					styleInstructions =
+						"Create RHYMING patterns and rhythmic elements that make the content musical and memorable.";
 					break;
 				case "humorous":
-					styleInstructions = "Make it FUNNY and absurd - use humor, silly situations, or unexpected combinations to enhance memorability.";
+					styleInstructions =
+						"Make it FUNNY and absurd - use humor, silly situations, or unexpected combinations to enhance memorability.";
 					break;
 				case "visual":
-					styleInstructions = "Focus on VIVID VISUAL and concrete imagery - emphasize colors, textures, shapes, and tangible objects that can be clearly pictured.";
+					styleInstructions =
+						"Focus on VIVID VISUAL and concrete imagery - emphasize colors, textures, shapes, and tangible objects that can be clearly pictured.";
 					break;
 				case "story":
-					styleInstructions = "Create a NARRATIVE story structure with characters, plot, and sequence that connects all elements in a memorable tale.";
+					styleInstructions =
+						"Create a NARRATIVE story structure with characters, plot, and sequence that connects all elements in a memorable tale.";
 					break;
 				default:
-					styleInstructions = "Use any memorable technique that works best for this content.";
+					styleInstructions =
+						"Use any memorable technique that works best for this content.";
 			}
 
 			// Get card type specific instructions
@@ -15528,19 +16784,24 @@ class MnemonicsModal extends Modal {
 			if (this.cardTypeOverride) {
 				switch (this.cardTypeOverride) {
 					case "list":
-						cardTypeInstructions = "CARD TYPE: This is a **list** (steps, parts, names). Create a short visual story where each item appears in order and is clearly symbolized.";
+						cardTypeInstructions =
+							"CARD TYPE: This is a **list** (steps, parts, names). Create a short visual story where each item appears in order and is clearly symbolized.";
 						break;
 					case "quote":
-						cardTypeInstructions = "CARD TYPE: This is a **quote or verse**. Make an image that helps trigger the wording or message.";
+						cardTypeInstructions =
+							"CARD TYPE: This is a **quote or verse**. Make an image that helps trigger the wording or message.";
 						break;
 					case "foreign":
-						cardTypeInstructions = "CARD TYPE: This involves **foreign or unfamiliar words**. Use 'sounds-like' or symbolic associations to anchor the terms.";
+						cardTypeInstructions =
+							"CARD TYPE: This involves **foreign or unfamiliar words**. Use 'sounds-like' or symbolic associations to anchor the terms.";
 						break;
 					case "concept":
-						cardTypeInstructions = "CARD TYPE: This is a **concept or definition**. Use metaphors or striking visual symbols.";
+						cardTypeInstructions =
+							"CARD TYPE: This is a **concept or definition**. Use metaphors or striking visual symbols.";
 						break;
 					case "number":
-						cardTypeInstructions = "CARD TYPE: This **contains numbers**. Incorporate the provided Major System words to enhance memorability.";
+						cardTypeInstructions =
+							"CARD TYPE: This **contains numbers**. Incorporate the provided Major System words to enhance memorability.";
 						break;
 				}
 			} else {
@@ -15552,7 +16813,11 @@ class MnemonicsModal extends Modal {
 - If it's a **concept**, use metaphors or striking visual symbols.`;
 			}
 
-			const prompt = `You are a mnemonic coach helping someone remember flashcards. Your job is to ${this.cardTypeOverride ? 'create' : 'first identify what kind of memory is required and then generate'} a vivid image, scene, or memory hook accordingly.
+			const prompt = `You are a mnemonic coach helping someone remember flashcards. Your job is to ${
+				this.cardTypeOverride
+					? "create"
+					: "first identify what kind of memory is required and then generate"
+			} a vivid image, scene, or memory hook accordingly.
 
 STYLE PREFERENCE: ${styleInstructions}
 
@@ -15571,9 +16836,11 @@ Return only the vivid mental image. Do not explain or label the card type. Do no
 			if (response.content.trim()) {
 				if (existingContentForDisplay) {
 					// Side-by-side format: all previous content as ORIGINAL, new response as NEW GENERATION
-					this.freeformNotesTextarea.value = 
-						"**ORIGINAL:**\n" + existingContentForDisplay + 
-						"\n\n**NEW GENERATION:**\n" + response.content.trim();
+					this.freeformNotesTextarea.value =
+						"**ORIGINAL:**\n" +
+						existingContentForDisplay +
+						"\n\n**NEW GENERATION:**\n" +
+						response.content.trim();
 				} else {
 					this.freeformNotesTextarea.value = response.content.trim();
 				}
@@ -15616,9 +16883,12 @@ Return only the vivid mental image. Do not explain or label the card type. Do no
 			const rawValue = this.freeformNotesTextarea.value.trim();
 			let contentForLlm = rawValue;
 			let existingContentForDisplay = rawValue;
-			
+
 			// If content has labels, extract all content for LLM and preserve for display
-			if (rawValue.includes("**ORIGINAL:**\n") && rawValue.includes("\n\n**NEW GENERATION:**\n")) {
+			if (
+				rawValue.includes("**ORIGINAL:**\n") &&
+				rawValue.includes("\n\n**NEW GENERATION:**\n")
+			) {
 				// Remove the labels but keep all content for LLM
 				contentForLlm = rawValue
 					.replace("**ORIGINAL:**\n", "")
@@ -15626,31 +16896,37 @@ Return only the vivid mental image. Do not explain or label the card type. Do no
 				// For display, we'll use the cleaned content as "ORIGINAL"
 				existingContentForDisplay = contentForLlm;
 			}
-			
-			const existingMnemonicsContext = contentForLlm 
-				? `\n\nEXISTING MNEMONICS:\n\`\`\`\n${contentForLlm}\n\`\`\`\n\nThe above are mnemonics the user already has. Create additional emoji sequences that complement or provide alternatives to what's already there.` 
-				: '';
+
+			const existingMnemonicsContext = contentForLlm
+				? `\n\nEXISTING MNEMONICS:\n\`\`\`\n${contentForLlm}\n\`\`\`\n\nThe above are mnemonics the user already has. Create additional emoji sequences that complement or provide alternatives to what's already there.`
+				: "";
 
 			// Get style-specific instructions for emoji generation
 			let styleInstructions = "";
 			switch (this.selectedStyle) {
 				case "alliterative":
-					styleInstructions = "Focus on ALLITERATIVE emoji choices - select emojis whose names or sounds create alliterative patterns.";
+					styleInstructions =
+						"Focus on ALLITERATIVE emoji choices - select emojis whose names or sounds create alliterative patterns.";
 					break;
 				case "rhyming":
-					styleInstructions = "Create RHYMING emoji sequences - choose emojis whose names or associations create rhythmic, musical patterns.";
+					styleInstructions =
+						"Create RHYMING emoji sequences - choose emojis whose names or associations create rhythmic, musical patterns.";
 					break;
 				case "humorous":
-					styleInstructions = "Make it FUNNY and absurd - use silly, unexpected emoji combinations that create humorous visual puns.";
+					styleInstructions =
+						"Make it FUNNY and absurd - use silly, unexpected emoji combinations that create humorous visual puns.";
 					break;
 				case "visual":
-					styleInstructions = "Focus on CLEAR VISUAL connections - choose emojis that directly represent concepts through obvious visual symbolism.";
+					styleInstructions =
+						"Focus on CLEAR VISUAL connections - choose emojis that directly represent concepts through obvious visual symbolism.";
 					break;
 				case "story":
-					styleInstructions = "Create a NARRATIVE sequence - arrange emojis to tell a story with beginning, middle, and end that connects the concepts.";
+					styleInstructions =
+						"Create a NARRATIVE sequence - arrange emojis to tell a story with beginning, middle, and end that connects the concepts.";
 					break;
 				default:
-					styleInstructions = "Use any creative approach that makes the most memorable emoji sequence.";
+					styleInstructions =
+						"Use any creative approach that makes the most memorable emoji sequence.";
 			}
 
 			// Get card type specific guidance for emoji generation
@@ -15658,23 +16934,29 @@ Return only the vivid mental image. Do not explain or label the card type. Do no
 			if (this.cardTypeOverride) {
 				switch (this.cardTypeOverride) {
 					case "list":
-						cardTypeGuidance = "CARD TYPE: This is a **list**. Create emojis that represent each item in sequence, connected by arrows.";
+						cardTypeGuidance =
+							"CARD TYPE: This is a **list**. Create emojis that represent each item in sequence, connected by arrows.";
 						break;
 					case "quote":
-						cardTypeGuidance = "CARD TYPE: This is a **quote or verse**. Focus on emojis that trigger key words or the main message.";
+						cardTypeGuidance =
+							"CARD TYPE: This is a **quote or verse**. Focus on emojis that trigger key words or the main message.";
 						break;
 					case "foreign":
-						cardTypeGuidance = "CARD TYPE: This has **foreign words**. Use emojis that sound like or visually represent the foreign terms.";
+						cardTypeGuidance =
+							"CARD TYPE: This has **foreign words**. Use emojis that sound like or visually represent the foreign terms.";
 						break;
 					case "concept":
-						cardTypeGuidance = "CARD TYPE: This is a **concept**. Use metaphorical emojis that symbolize the abstract idea.";
+						cardTypeGuidance =
+							"CARD TYPE: This is a **concept**. Use metaphorical emojis that symbolize the abstract idea.";
 						break;
 					case "number":
-						cardTypeGuidance = "CARD TYPE: This has **numbers**. Incorporate Major System word emojis if available, or number-related symbols.";
+						cardTypeGuidance =
+							"CARD TYPE: This has **numbers**. Incorporate Major System word emojis if available, or number-related symbols.";
 						break;
 				}
 			} else {
-				cardTypeGuidance = "Analyze the content and choose the most appropriate emoji approach for the card type.";
+				cardTypeGuidance =
+					"Analyze the content and choose the most appropriate emoji approach for the card type.";
 			}
 
 			const prompt = `Create a creative emoji sequence to help remember this flashcard:
@@ -15702,9 +16984,11 @@ Provide only the emoji sequence, no additional explanation.`;
 			if (response.content.trim()) {
 				if (existingContentForDisplay) {
 					// Side-by-side format: all previous content as ORIGINAL, new response as NEW GENERATION
-					this.freeformNotesTextarea.value = 
-						"**ORIGINAL:**\n" + existingContentForDisplay + 
-						"\n\n**NEW GENERATION:**\n" + response.content.trim();
+					this.freeformNotesTextarea.value =
+						"**ORIGINAL:**\n" +
+						existingContentForDisplay +
+						"\n\n**NEW GENERATION:**\n" +
+						response.content.trim();
 				} else {
 					this.freeformNotesTextarea.value = response.content.trim();
 				}
@@ -15830,15 +17114,22 @@ class VariantOptionsModal extends Modal {
 				addGuidanceBtn.buttonEl.style.display = "none";
 				new Setting(guidanceContainer)
 					.setName("Custom Guidance")
-					.setDesc("Provide specific instructions for variant generation.")
+					.setDesc(
+						"Provide specific instructions for variant generation."
+					)
 					.addTextArea((text) => {
 						this.guidanceInput = text;
-						text.setPlaceholder("e.g., 'Make variants simpler', 'Focus on application rather than recall', etc.");
+						text.setPlaceholder(
+							"e.g., 'Make variants simpler', 'Focus on application rather than recall', etc."
+						);
 						text.inputEl.rows = 3;
 						text.inputEl.style.width = "100%";
-						
+
 						// Add guidance snippet UI
-						this.plugin.createGuidanceSnippetUI(guidanceContainer, text);
+						this.plugin.createGuidanceSnippetUI(
+							guidanceContainer,
+							text
+						);
 					});
 			});
 
@@ -15853,9 +17144,9 @@ class VariantOptionsModal extends Modal {
 		new ButtonComponent(btnRow).setButtonText("Just One").onClick(() => {
 			choiceMade = true;
 			this.close();
-			this.onDone({ 
+			this.onDone({
 				quantity: "one",
-				guidance: this.guidanceInput?.getValue()
+				guidance: this.guidanceInput?.getValue(),
 			});
 		});
 
@@ -15865,9 +17156,9 @@ class VariantOptionsModal extends Modal {
 			.onClick(() => {
 				choiceMade = true;
 				this.close();
-				this.onDone({ 
+				this.onDone({
 					quantity: "many",
-					guidance: this.guidanceInput?.getValue()
+					guidance: this.guidanceInput?.getValue(),
 				});
 			});
 
@@ -17540,9 +18831,13 @@ class GenerateCardsModal extends Modal {
 						text.inputEl.rows = 4;
 						text.inputEl.style.width = "100%";
 						text.onChange(() => this.costUi.update());
-						
+
 						// Add guidance snippet UI after textarea is created
-						this.plugin.createGuidanceSnippetUI(guidanceContainer, text, () => this.costUi.update());
+						this.plugin.createGuidanceSnippetUI(
+							guidanceContainer,
+							text,
+							() => this.costUi.update()
+						);
 					});
 			});
 		const costContainer = this.contentEl.createDiv();
@@ -17552,9 +18847,9 @@ class GenerateCardsModal extends Modal {
 			const guidance = this.guidanceInput?.getValue() || "";
 
 			const cardCountInstruction = guidance.trim()
-				? `Generate Anki-style flashcards from the following article, aiming for approximately ${count} cards unless your guidance specifies otherwise.`
-				: `Create ${count} new, distinct Anki-style flashcards from the following article.`;
-			const promptText = `${cardCountInstruction}...${guidance}...Here is the article:\n${plainText}`;
+				? `Generate Anki-style flashcards from the following content, aiming for approximately ${count} cards unless your guidance specifies otherwise.`
+				: `Create ${count} new, distinct Anki-style flashcards from the following content.`;
+			const promptText = `${cardCountInstruction}...${guidance}...Here is the content:\n${plainText}`;
 			return {
 				promptText: promptText,
 				imageCount: 0,
@@ -17759,9 +19054,13 @@ class GenerateAdditionalCardsModal extends Modal {
 						text.inputEl.rows = 4;
 						text.inputEl.style.width = "100%";
 						text.onChange(() => this.costUi.update());
-						
+
 						// Add guidance snippet UI after textarea is created
-						this.plugin.createGuidanceSnippetUI(guidanceContainer, text, () => this.costUi.update());
+						this.plugin.createGuidanceSnippetUI(
+							guidanceContainer,
+							text,
+							() => this.costUi.update()
+						);
 					});
 			});
 
@@ -17782,9 +19081,9 @@ class GenerateAdditionalCardsModal extends Modal {
 				Number(this.countInput.getValue()) || defaultCardCount;
 
 			const cardCountInstruction = guidance.trim()
-				? `Generate additional Anki-style flashcards from the following article, aiming for approximately ${count} cards unless your guidance specifies otherwise.`
-				: `Create ${count} new, additional Anki-style flashcards from the following article.`;
-			const promptText = `${cardCountInstruction}...${guidance}...${contextPrompt}Here is the article:\n${plainText}`;
+				? `Generate additional Anki-style flashcards from the following content, aiming for approximately ${count} cards unless your guidance specifies otherwise.`
+				: `Create ${count} new, additional Anki-style flashcards from the following content.`;
+			const promptText = `${cardCountInstruction}...${guidance}...${contextPrompt}Here is the content:\n${plainText}`;
 			return {
 				promptText: promptText,
 				imageCount: 0,
@@ -18456,8 +19755,8 @@ const isUnseen = (card: Flashcard): boolean =>
  * @returns True if the card is buried, false otherwise.
  */
 const isBuried = (card: Flashcard): boolean => {
-	return(!!card.buried && card.due <= Date.now())
-}
+	return !!card.buried && card.due <= Date.now();
+};
 
 /**
  * Checks if a flashcard should block content gating.
@@ -18468,10 +19767,10 @@ const isBuried = (card: Flashcard): boolean => {
  */
 const isBlockingGating = (card: Flashcard): boolean => {
 	if (!card.blocked || card.suspended) return false;
-	
+
 	// If card is buried but due time hasn't passed yet, don't block
 	if (card.buried && card.due > Date.now()) return false;
-	
+
 	// Otherwise, block (includes buried cards whose bury period has expired)
 	return true;
 };
@@ -19836,11 +21135,11 @@ class SnippetNameModal extends Modal {
 
 	onOpen() {
 		this.titleEl.setText("Save Guidance Snippet");
-		
+
 		const nameInput = new TextComponent(this.contentEl);
 		nameInput.setPlaceholder("Enter snippet name...");
 		nameInput.inputEl.focus();
-		
+
 		nameInput.inputEl.addEventListener("keydown", (event) => {
 			if (event.key === "Enter") {
 				const name = nameInput.getValue().trim();
@@ -19855,7 +21154,9 @@ class SnippetNameModal extends Modal {
 			}
 		});
 
-		const buttonContainer = this.contentEl.createDiv({ cls: "modal-button-container" });
+		const buttonContainer = this.contentEl.createDiv({
+			cls: "modal-button-container",
+		});
 		buttonContainer.style.marginTop = "16px";
 
 		new ButtonComponent(buttonContainer)
@@ -19895,67 +21196,89 @@ class GuidanceRepositoryModal extends Modal {
 		this.contentEl.empty();
 
 		const snippetNames = this.plugin.getGuidanceSnippetNames();
-		
+
 		if (snippetNames.length === 0) {
 			this.contentEl.createEl("p", {
 				text: "No saved guidance snippets found.",
-				cls: "u-center"
+				cls: "u-center",
 			});
 			return;
 		}
 
 		// Add instructions for reordering
 		if (snippetNames.length > 1) {
-			const instructions = this.contentEl.createDiv({ cls: "guidance-instructions" });
-			instructions.style.cssText = "margin-bottom: 16px; padding: 8px; background: var(--background-secondary); border-radius: 4px; font-size: 0.9em; color: var(--text-muted);";
-			instructions.createEl("span", { text: "💡 Tip: Drag and drop to reorder snippets" });
+			const instructions = this.contentEl.createDiv({
+				cls: "guidance-instructions",
+			});
+			instructions.style.cssText =
+				"margin-bottom: 16px; padding: 8px; background: var(--background-secondary); border-radius: 4px; font-size: 0.9em; color: var(--text-muted);";
+			instructions.createEl("span", {
+				text: "💡 Tip: Drag and drop to reorder snippets",
+			});
 		}
 
 		// Create sortable container
-		const listContainer = this.contentEl.createDiv({ cls: "guidance-snippet-list" });
-		
+		const listContainer = this.contentEl.createDiv({
+			cls: "guidance-snippet-list",
+		});
+
 		snippetNames.forEach((name, index) => {
-			const container = listContainer.createDiv({ 
+			const container = listContainer.createDiv({
 				cls: "guidance-snippet-item",
-				attr: { "data-name": name }
+				attr: { "data-name": name },
 			});
-			container.style.cssText = "padding: 12px; border: 1px solid var(--background-modifier-border); margin-bottom: 8px; border-radius: 4px; cursor: grab; position: relative;";
+			container.style.cssText =
+				"padding: 12px; border: 1px solid var(--background-modifier-border); margin-bottom: 8px; border-radius: 4px; cursor: grab; position: relative;";
 			container.draggable = true;
-			
+
 			// Add drag handle
 			const dragHandle = container.createDiv({ cls: "drag-handle" });
-			dragHandle.style.cssText = "position: absolute; left: 4px; top: 50%; transform: translateY(-50%); color: var(--text-muted); font-size: 14px; cursor: grab;";
+			dragHandle.style.cssText =
+				"position: absolute; left: 4px; top: 50%; transform: translateY(-50%); color: var(--text-muted); font-size: 14px; cursor: grab;";
 			dragHandle.textContent = "⋮⋮";
-			
+
 			// Adjust container padding to account for drag handle
 			container.style.paddingLeft = "24px";
-			
-			const header = container.createDiv({ cls: "guidance-snippet-header" });
-			header.style.cssText = "display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px;";
+
+			const header = container.createDiv({
+				cls: "guidance-snippet-header",
+			});
+			header.style.cssText =
+				"display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px;";
 			const nameEl = header.createEl("strong", { text: name });
-			
-			const preview = container.createDiv({ cls: "guidance-snippet-preview" });
-			preview.style.cssText = "margin-bottom: 12px; color: var(--text-muted); font-size: 0.9em; line-height: 1.3;";
+
+			const preview = container.createDiv({
+				cls: "guidance-snippet-preview",
+			});
+			preview.style.cssText =
+				"margin-bottom: 12px; color: var(--text-muted); font-size: 0.9em; line-height: 1.3;";
 			const content = this.plugin.getGuidanceSnippet(name);
 			if (!content) return; // Skip if content is undefined
-			
-			const truncated = content.length > 80 ? content.substring(0, 80) + "..." : content;
+
+			const truncated =
+				content.length > 80
+					? content.substring(0, 80) + "..."
+					: content;
 			preview.createEl("span", { text: truncated });
-			
-			const buttonContainer = container.createDiv({ cls: "guidance-snippet-buttons" });
+
+			const buttonContainer = container.createDiv({
+				cls: "guidance-snippet-buttons",
+			});
 			buttonContainer.style.cssText = "display: flex; gap: 8px;";
-			
+
 			new ButtonComponent(buttonContainer)
 				.setButtonText("Use")
 				.setCta()
 				.onClick(() => {
 					const currentValue = this.textArea.getValue();
-					const newValue = currentValue ? currentValue + "\n\n" + content : content;
+					const newValue = currentValue
+						? currentValue + "\n\n" + content
+						: content;
 					this.textArea.setValue(newValue);
 					this.onUpdate();
 					this.close();
 				});
-			
+
 			new ButtonComponent(buttonContainer)
 				.setButtonText("Edit")
 				.onClick(() => {
@@ -19964,7 +21287,7 @@ class GuidanceRepositoryModal extends Modal {
 						this.onOpen(); // Refresh the repository modal
 					}).open();
 				});
-			
+
 			new ButtonComponent(buttonContainer)
 				.setButtonText("Delete")
 				.setWarning()
@@ -19983,50 +21306,68 @@ class GuidanceRepositoryModal extends Modal {
 
 	private setupDragAndDrop(container: HTMLElement) {
 		let draggedElement: HTMLElement | null = null;
-		
-		container.addEventListener('dragstart', (e) => {
-			if (e.target instanceof HTMLElement && e.target.classList.contains('guidance-snippet-item')) {
+
+		container.addEventListener("dragstart", (e) => {
+			if (
+				e.target instanceof HTMLElement &&
+				e.target.classList.contains("guidance-snippet-item")
+			) {
 				draggedElement = e.target;
-				e.target.style.opacity = '0.5';
+				e.target.style.opacity = "0.5";
 			}
 		});
-		
-		container.addEventListener('dragend', (e) => {
-			if (e.target instanceof HTMLElement && e.target.classList.contains('guidance-snippet-item')) {
-				e.target.style.opacity = '1';
+
+		container.addEventListener("dragend", (e) => {
+			if (
+				e.target instanceof HTMLElement &&
+				e.target.classList.contains("guidance-snippet-item")
+			) {
+				e.target.style.opacity = "1";
 				draggedElement = null;
 			}
 		});
-		
-		container.addEventListener('dragover', (e) => {
+
+		container.addEventListener("dragover", (e) => {
 			e.preventDefault();
 		});
-		
-		container.addEventListener('drop', async (e) => {
+
+		container.addEventListener("drop", async (e) => {
 			e.preventDefault();
-			
+
 			if (!draggedElement) return;
-			
-			const targetElement = (e.target as HTMLElement).closest('.guidance-snippet-item') as HTMLElement;
+
+			const targetElement = (e.target as HTMLElement).closest(
+				".guidance-snippet-item"
+			) as HTMLElement;
 			if (!targetElement || targetElement === draggedElement) return;
-			
+
 			// Get the new order
-			const items = Array.from(container.querySelectorAll('.guidance-snippet-item'));
+			const items = Array.from(
+				container.querySelectorAll(".guidance-snippet-item")
+			);
 			const draggedIndex = items.indexOf(draggedElement);
 			const targetIndex = items.indexOf(targetElement);
-			
+
 			// Move the element in the DOM
 			if (draggedIndex < targetIndex) {
-				targetElement.parentNode?.insertBefore(draggedElement, targetElement.nextSibling);
+				targetElement.parentNode?.insertBefore(
+					draggedElement,
+					targetElement.nextSibling
+				);
 			} else {
-				targetElement.parentNode?.insertBefore(draggedElement, targetElement);
+				targetElement.parentNode?.insertBefore(
+					draggedElement,
+					targetElement
+				);
 			}
-			
+
 			// Update the order in settings
-			const newOrder = Array.from(container.querySelectorAll('.guidance-snippet-item'))
-				.map(el => (el as HTMLElement).getAttribute('data-name'))
-				.filter(name => name !== null) as string[];
-			
+			const newOrder = Array.from(
+				container.querySelectorAll(".guidance-snippet-item")
+			)
+				.map((el) => (el as HTMLElement).getAttribute("data-name"))
+				.filter((name) => name !== null) as string[];
+
 			await this.plugin.updateGuidanceSnippetOrder(newOrder);
 		});
 	}
@@ -20054,20 +21395,18 @@ class GuidanceEditModal extends Modal {
 		this.titleEl.setText(`Edit Guidance Snippet`);
 		this.contentEl.empty();
 
-		new Setting(this.contentEl)
-			.setName("Snippet Name")
-			.addText(text => {
-				this.nameInput = text;
-				text.setValue(this.originalName);
-				text.inputEl.style.width = "100%";
-				text.onChange(() => {
-					this.checkForChanges();
-				});
+		new Setting(this.contentEl).setName("Snippet Name").addText((text) => {
+			this.nameInput = text;
+			text.setValue(this.originalName);
+			text.inputEl.style.width = "100%";
+			text.onChange(() => {
+				this.checkForChanges();
 			});
+		});
 
 		new Setting(this.contentEl)
 			.setName("Guidance Content")
-			.addTextArea(text => {
+			.addTextArea((text) => {
 				this.editTextArea = text;
 				text.setValue(this.originalContent);
 				text.inputEl.rows = 8;
@@ -20078,49 +21417,151 @@ class GuidanceEditModal extends Modal {
 			});
 
 		new Setting(this.contentEl)
-			.addButton(button => 
+			.addButton((button) =>
 				button
 					.setButtonText("Save")
 					.setCta()
 					.onClick(async () => {
 						const newName = this.nameInput.getValue().trim();
 						const newContent = this.editTextArea.getValue().trim();
-						
+
 						if (!newName) {
 							new Notice("Please enter a name for the snippet");
 							return;
 						}
-						
+
 						if (!newContent) {
 							new Notice("Please enter content for the snippet");
 							return;
 						}
-						
+
 						if (this.hasChanges) {
 							// If name changed, delete old snippet
 							if (newName !== this.originalName) {
-								await this.plugin.deleteGuidanceSnippet(this.originalName);
+								await this.plugin.deleteGuidanceSnippet(
+									this.originalName
+								);
 							}
-							
+
 							// Save with new name and content
-							await this.plugin.saveGuidanceSnippet(newName, newContent);
+							await this.plugin.saveGuidanceSnippet(
+								newName,
+								newContent
+							);
 							new Notice(`Saved "${newName}"`);
 							this.onSave();
 						}
 						this.close();
 					})
 			)
-			.addButton(button =>
-				button
-					.setButtonText("Cancel")
-					.onClick(() => this.close())
+			.addButton((button) =>
+				button.setButtonText("Cancel").onClick(() => this.close())
 			);
 	}
 
 	private checkForChanges() {
 		const nameChanged = this.nameInput.getValue() !== this.originalName;
-		const contentChanged = this.editTextArea.getValue() !== this.originalContent;
+		const contentChanged =
+			this.editTextArea.getValue() !== this.originalContent;
 		this.hasChanges = nameChanged || contentChanged;
+	}
+
+	onClose() {
+		this.contentEl.empty();
+	}
+}
+
+class BulkRefocusConfirmModal extends Modal {
+	constructor(
+		private plugin: GatedNotesPlugin,
+		private cardCount: number,
+		private fileName: string,
+		private onConfirm: (confirmed: boolean) => void
+	) {
+		super(plugin.app);
+	}
+
+	onOpen() {
+		this.titleEl.setText("Bulk Refocus Cards");
+		makeModalDraggable(this, this.plugin);
+
+		this.contentEl.createEl("p", {
+			text: `You are about to refocus ${this.cardCount} flashcards from "${this.fileName}".`,
+		});
+
+		this.contentEl.createEl("p", {
+			text: "This will generate alternative versions of each card by inverting the question/answer relationship. This process may take several minutes and consume LLM tokens.",
+		});
+
+		const buttonContainer = this.contentEl.createDiv();
+		buttonContainer.style.display = "flex";
+		buttonContainer.style.gap = "10px";
+		buttonContainer.style.justifyContent = "flex-end";
+		buttonContainer.style.marginTop = "20px";
+
+		new ButtonComponent(buttonContainer)
+			.setButtonText("Cancel")
+			.onClick(() => {
+				this.onConfirm(false);
+				this.close();
+			});
+
+		new ButtonComponent(buttonContainer)
+			.setButtonText(`Refocus ${this.cardCount} cards`)
+			.setCta()
+			.onClick(() => {
+				this.onConfirm(true);
+				this.close();
+			});
+	}
+
+	onClose() {
+		this.contentEl.empty();
+	}
+}
+
+class BulkVariantsConfirmModal extends Modal {
+	constructor(
+		private plugin: GatedNotesPlugin,
+		private cardCount: number,
+		private fileName: string,
+		private onConfirm: (confirmed: boolean) => void
+	) {
+		super(plugin.app);
+	}
+
+	onOpen() {
+		this.titleEl.setText("Bulk Create Variants");
+		makeModalDraggable(this, this.plugin);
+
+		this.contentEl.createEl("p", {
+			text: `You are about to create variants for ${this.cardCount} flashcards from "${this.fileName}".`,
+		});
+
+		this.contentEl.createEl("p", {
+			text: "This will generate alternative wordings of each card while preserving the same information. This process may take several minutes and consume LLM tokens.",
+		});
+
+		const buttonContainer = this.contentEl.createDiv();
+		buttonContainer.style.display = "flex";
+		buttonContainer.style.gap = "10px";
+		buttonContainer.style.justifyContent = "flex-end";
+		buttonContainer.style.marginTop = "20px";
+
+		new ButtonComponent(buttonContainer)
+			.setButtonText("Cancel")
+			.onClick(() => {
+				this.onConfirm(false);
+				this.close();
+			});
+
+		new ButtonComponent(buttonContainer)
+			.setButtonText(`Create variants for ${this.cardCount} cards`)
+			.setCta()
+			.onClick(() => {
+				this.onConfirm(true);
+				this.close();
+			});
 	}
 
 	onClose() {
