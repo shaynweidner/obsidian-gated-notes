@@ -27,7 +27,9 @@ import { Buffer } from "buffer";
 
 import { encode } from "gpt-tokenizer";
 import { calculateCost as aicostCalculate } from "aicost";
+import { diffWordsWithSpace, Change } from "diff";
 import OpenAI from "openai";
+import nlp from "compromise";
 import { NavigationAwareModal } from "./navigation-aware-modal";
 import {
 	NavigationContextType,
@@ -77,6 +79,14 @@ enum FilterState {
 	EXCLUDE = "exclude",
 }
 
+enum ComparisonMode {
+	FRONT = "front",
+	BACK = "back",
+	FRONT_OR_BACK = "front|back",
+	FRONT_AND_BACK = "front*back",
+	FRONT_PLUS_BACK = "front+back"
+}
+
 type CardRating = "Again" | "Hard" | "Good" | "Easy";
 type CardStatus = "new" | "learning" | "review" | "relearn";
 type ReviewResult = "answered" | "skip" | "abort" | "again";
@@ -95,6 +105,22 @@ interface ReviewLog {
 export interface CardVariant {
 	front: string;
 	back: string;
+}
+
+interface BulkRefocusResult {
+	originalCard: Flashcard;
+	refocusedCards: Array<{
+		front: string;
+		back: string;
+	}>;
+}
+
+interface DuplicateGroup {
+	cards: Array<{
+		card: Flashcard;
+		similarText: string;
+		similarity: number;
+	}>;
 }
 
 interface PolyglotCluster {
@@ -200,6 +226,8 @@ interface Settings {
 	guidanceSnippets: { [name: string]: string };
 	/** Order of guidance snippets in the repository modal. */
 	guidanceSnippetOrder: string[];
+	/** Stored scroll positions for notes, keyed by note path. */
+	scrollPositions: { [notePath: string]: number };
 }
 
 const DEFAULT_SETTINGS: Settings = {
@@ -249,6 +277,7 @@ const DEFAULT_SETTINGS: Settings = {
 		"Comprehensive Cards",
 		"Comprehensive Additional Cards",
 	],
+	scrollPositions: {},
 };
 
 interface ImageAnalysis {
@@ -3246,6 +3275,7 @@ export default class GatedNotesPlugin extends Plugin {
 	};
 	private explorerObserver: MutationObserver | null = null;
 	private decorateTimeout: NodeJS.Timeout | null = null;
+	private currentFilePath: string | null = null;
 
 	private statusBar!: HTMLElement;
 	private gatingStatus!: HTMLElement;
@@ -3298,6 +3328,25 @@ export default class GatedNotesPlugin extends Plugin {
 		this.reviewDue();
 	}
 
+	public startCustomSessionFromPaths(paths: string[], excludeNewCards: boolean): void {
+		this.customSessionPaths = paths;
+		this.customSessionExcludeNewCards = excludeNewCards;
+		this.studyMode = StudyMode.CUSTOM_SESSION;
+
+		let pathDisplay = "Vault Root";
+		if (paths.length > 0) {
+			if (paths.length === 1) {
+				pathDisplay = paths[0];
+			} else {
+				pathDisplay = `${paths.length} folders`;
+			}
+		}
+
+		const modeText = excludeNewCards ? " (excluding new cards)" : "";
+		new Notice(`📁 Custom session: ${pathDisplay}${modeText}`);
+		this.reviewDue();
+	}
+
 	private showCustomSessionDialog(): void {
 		const modal = new CustomSessionDialog(
 			this.app,
@@ -3324,9 +3373,8 @@ export default class GatedNotesPlugin extends Plugin {
 	}
 
 	private async getCardsForCustomSession(): Promise<Flashcard[]> {
-		if (this.customSessionCards.length > 0) {
-			return this.customSessionCards;
-		}
+		// Always refresh custom session cards to get current due dates and card states
+		// Don't return cached cards as they may have stale due dates
 
 		if (this.customSessionPaths.length === 0) {
 			const allDeckFiles = this.app.vault
@@ -4116,6 +4164,28 @@ export default class GatedNotesPlugin extends Plugin {
 				return true;
 			},
 		});
+
+		this.addCommand({
+			id: "gn-find-duplicates",
+			name: "Find duplicate flashcards",
+			checkCallback: (checking: boolean) => {
+				const view = this.app.workspace.getActiveViewOfType(MarkdownView);
+				if (!view?.file) return false;
+				if (!checking) this.findDuplicateCards(view.file);
+				return true;
+			},
+		});
+
+		this.addCommand({
+			id: "gn-llm-edit-note",
+			name: "LLM-assisted note editing",
+			checkCallback: (checking: boolean) => {
+				const view = this.app.workspace.getActiveViewOfType(MarkdownView);
+				if (!view?.file) return false;
+				if (!checking) this.showLlmEditModal(view.file);
+				return true;
+			},
+		});
 	}
 
 	private registerRibbonIcons(): void {
@@ -4675,6 +4745,92 @@ fetchImages: true
 		return newCards;
 	}
 
+	private async executeBulkRefocus(cards: Flashcard[]): Promise<BulkRefocusResult[]> {
+		// Prepare cards for LLM with identifiers
+		const cardsForLlm = cards.map(card => ({
+			id: card.id,
+			front: card.front,
+			back: card.back,
+			tag: card.tag // Include for context
+		}));
+
+		const basePrompt = `You are an AI assistant that creates new, insightful flashcards by "refocusing" existing ones.
+
+**Core Rule:** Your new cards MUST be created by inverting the information **explicitly present** in each original card's "front" and "back" fields. The "tag" field is provided only for context and should NOT be used to introduce new facts.
+
+**Formatting Rule:** Preserve all Markdown formatting, especially LaTeX math expressions (e.g., \`$ ... $\` and \`$$ ... $$\`), in the "front" and "back" fields.
+
+**Process:**
+1. **Deconstruct Each Original Card:** Identify the key subject in the "back" and the key detail in the "front".
+2. **Invert & Refocus:** Create multiple new cards where the original details become the subject of the questions, and the original subject becomes the answers.
+3. **Create Multiple Cards:** For each original card, identify different aspects or details that can be inverted (dates, names, locations, concepts, etc.).
+
+---
+**Example:**
+* **Original Card:**
+	* "front": "What was the outcome of the War of Fakery in 1653?"
+	* "back": "Country A decisively defeated Country B."
+* **Refocused Cards:**
+	* "front": "Which country was decisively defeated in the War of Fakery in 1653?"
+	* "back": "Country B"
+	* "front": "What did Country A do to Country B in the War of Fakery?"
+	* "back": "Decisively defeated them"
+
+**Response Format:** Return ONLY valid JSON in this exact format:
+[
+  {
+    "originalId": "card_id_here",
+    "refocusedCards": [
+      {"front": "...", "back": "..."},
+      {"front": "...", "back": "..."}
+    ]
+  }
+]
+
+**Cards to Refocus:**
+${JSON.stringify(cardsForLlm, null, 2)}`;
+
+		const { content: response, usage } = await this.sendToLlm(basePrompt);
+
+		if (!response) {
+			throw new Error("LLM returned an empty response.");
+		}
+
+		// Parse the response
+		const parsedResponse = extractJsonObjects<{
+			originalId: string;
+			refocusedCards: Array<{ front: string; back: string }>;
+		}>(response);
+
+		// Validate and map back to original cards
+		const results: BulkRefocusResult[] = [];
+		for (const item of parsedResponse) {
+			if (!item.originalId || !item.refocusedCards || !Array.isArray(item.refocusedCards)) {
+				continue;
+			}
+
+			const originalCard = cards.find(c => c.id === item.originalId);
+			if (!originalCard) {
+				continue;
+			}
+
+			const validRefocusedCards = item.refocusedCards.filter(card =>
+				card.front && card.back &&
+				typeof card.front === "string" && typeof card.back === "string" &&
+				card.front.trim().length > 0 && card.back.trim().length > 0
+			);
+
+			if (validRefocusedCards.length > 0) {
+				results.push({
+					originalCard,
+					refocusedCards: validRefocusedCards
+				});
+			}
+		}
+
+		return results;
+	}
+
 	private async executeVariantsForCard(card: Flashcard): Promise<Flashcard[]> {
 		// Extract variant logic from executeVariantGeneration method
 		const currentVariant = {
@@ -4698,31 +4854,41 @@ fetchImages: true
 		const isMultiple = true;
 		const quantityText = "2–3 NEW";
 
-		const prompt = `You are a flashcard variant generator. Create ${quantityText} alternative versions that test the EXACT SAME knowledge using different wording to prevent memorization of specific phrases.
+		const prompt = `You are a flashcard variant generator. Create ${quantityText} alternative versions that test the EXACT SAME knowledge using different wording for the QUESTION ONLY.
 
-**Critical Rule:** The question-answer relationship must remain identical. If the original asks for a definition, variants must ask for the same definition. If it asks for a term, variants must ask for the same term.
+**Critical Rule:** Create variants of the FRONT (question) while keeping the BACK (answer) completely identical. The goal is to test the same knowledge with different question phrasings to prevent memorization of specific wording.
 
 **GOOD variant examples:**
-Original: "What is mitosis?" → "The process of cell division..."
-Good variants:
-- "Define mitosis." → "The process of cell division..."
-- "Mitosis refers to what biological process?" → "The process of cell division..."
+Original Front: "What is mitosis?"
+Good variant fronts:
+- "Define mitosis."
+- "Mitosis refers to what biological process?"
+- "What process involves cell division to create identical cells?"
+(All have SAME back: "The process of cell division...")
 
-Original: "What term describes beliefs resistant to change?" → "Doxastic closure"
-Good variants:
-- "What is the name for beliefs that resist revision?" → "Doxastic closure"
-- "Doxastic closure is the term for what?" → "Doxastic closure"
+Original Front: "What term describes beliefs resistant to change?"
+Good variant fronts:
+- "What is the name for beliefs that resist revision?"
+- "Beliefs that are resistant to change are called what?"
+- "The concept of doxastic closure refers to what kind of beliefs?"
+(All have SAME back: "Doxastic closure")
 
 **BAD variant examples:**
-❌ Original asks "What is X?" but variant asks "What term refers to X?" (changes question type)
-❌ Original asks for term but variant asks for definition (mismatched relationship)
-❌ Adding complexity that changes the cognitive demand
+❌ Changing the answer/back content
+❌ Asking for different information than the original
+❌ Making the question significantly easier or harder
+❌ Adding unrelated complexity
+
+**Focus Areas for Variants:**
+- Rephrase question words: "What is X?" → "Define X" → "X refers to what?"
+- Vary question structure: "What does X mean?" → "How is X defined?" → "X is described as what?"
+- Use synonyms for question terms while preserving meaning
 
 **Quality Control:**
-If creating good variants would be difficult or result in awkward phrasing, return an empty array [] instead of forcing poor quality cards.
+If creating good front variants would result in awkward phrasing or change the cognitive demand, return an empty array [] instead.
 
 **Your task:**
-Analyze this card and determine if meaningful variants can be created that preserve the exact question-answer relationship. If yes, create ${quantityText} variants. If the card doesn't lend itself to good variants, return [].
+Create ${quantityText} variants of the FRONT only. Keep the BACK exactly the same for all variants.
 
 **Existing variants:**
 ${promptVariants}
@@ -4787,35 +4953,420 @@ Return ONLY valid JSON of this shape: [{"front":"...","back":"..."}] or [] if no
 
 			if (!confirmed) return;
 
-			// Process cards with progress tracking
+			// Execute bulk refocus with single LLM call
 			const notice = new Notice(`🔄 Refocusing ${noteCards.length} cards...`, 0);
-			let processed = 0;
-			let successful = 0;
 
-			for (const card of noteCards) {
-				try {
-					notice.setMessage(`🔄 Refocusing cards... (${processed + 1}/${noteCards.length})`);
+			try {
+				const refocusResults = await this.executeBulkRefocus(noteCards);
+				notice.hide();
 
-					// Use refocus logic extracted from handleRefocus method
-					const result = await this.executeRefocusForCard(card, true);
-					if (result && result.length > 0) {
-						successful += result.length;
-					}
-
-					processed++;
-				} catch (error) {
-					console.error(`Failed to refocus card ${card.id}:`, error);
-					processed++;
+				if (refocusResults.length === 0) {
+					new Notice("❌ No refocused cards were generated");
+					return;
 				}
-			}
 
-			notice.hide();
-			new Notice(`✅ Bulk refocus complete: ${successful} new cards created from ${processed} originals`);
+				// Show review interface
+				const approved = await new Promise<boolean>(resolve => {
+					new BulkRefocusReviewModal(this, refocusResults, resolve).open();
+				});
+
+				if (!approved) {
+					new Notice("🚫 Bulk refocus cancelled");
+					return;
+				}
+
+				// Apply approved cards to deck
+				let totalAdded = 0;
+				for (const result of refocusResults) {
+					for (const newCard of result.refocusedCards) {
+						const cardToAdd = this.createCardObject({
+							front: newCard.front.trim(),
+							back: newCard.back.trim(),
+							tag: result.originalCard.tag,
+							chapter: result.originalCard.chapter,
+							paraIdx: result.originalCard.paraIdx,
+						});
+						deck[cardToAdd.id] = cardToAdd;
+						totalAdded++;
+					}
+				}
+
+				await this.writeDeck(deckPath, deck);
+				new Notice(`✅ Bulk refocus complete: ${totalAdded} new cards created`);
+
+			} catch (error) {
+				notice.hide();
+				new Notice("❌ Failed to refocus cards");
+				console.error("Bulk refocus error:", error);
+			}
 
 		} catch (error) {
 			new Notice("❌ Failed to bulk refocus cards");
 			console.error("Bulk refocus error:", error);
 		}
+	}
+
+	private async findDuplicateCards(currentFile: TFile): Promise<void> {
+		try {
+			// Determine if current note is polyglot to decide card filtering strategy
+			const currentFileContent = await this.app.vault.read(currentFile);
+			const isCurrentNotePolyglot = this.isPolyglotNote(currentFileContent);
+
+			// Load all deck files
+			const allDeckFiles = this.app.vault
+				.getFiles()
+				.filter((f) => f.name === DECK_FILE_NAME);
+
+			if (allDeckFiles.length === 0) {
+				new Notice("📝 No deck files found");
+				return;
+			}
+
+			// Calculate total comparisons estimate
+			let totalComparisons = 0;
+			let totalTargetCards = 0;
+
+			for (const deckFile of allDeckFiles) {
+				try {
+					const deck = await this.readDeck(deckFile.path);
+					const allDeckCards = Object.values(deck);
+					const targetCards = isCurrentNotePolyglot
+						? allDeckCards.filter(card => this.isPolyglotCard(card))
+						: allDeckCards.filter(card => !this.isPolyglotCard(card));
+
+					if (targetCards.length >= 2) {
+						const deckComparisons = (targetCards.length * (targetCards.length - 1)) / 2;
+						totalComparisons += deckComparisons;
+						totalTargetCards += targetCards.length;
+					}
+				} catch (error) {
+					// Skip decks that can't be read
+					continue;
+				}
+			}
+
+			// Show confirmation prompt with scope selection
+			const noteTypeText = isCurrentNotePolyglot ? "is" : "is not";
+			const cardTypeText = isCurrentNotePolyglot ? "polyglot" : "non-polyglot";
+			const result = await new Promise<{ confirmed: boolean; selectedScope: string; excludeSuspended: boolean; excludeFlagged: boolean; comparisonMode: ComparisonMode } | null>(resolve => {
+				new DuplicateDetectionConfirmModal(
+					this,
+					currentFile,
+					noteTypeText,
+					cardTypeText,
+					isCurrentNotePolyglot,
+					resolve
+				).open();
+			});
+
+			if (!result || !result.confirmed) return;
+
+			const { selectedScope, excludeSuspended, excludeFlagged, comparisonMode } = result;
+
+			const notice = new Notice("🔍 Scanning for duplicate cards...", 0);
+			let allDuplicateGroups: DuplicateGroup[] = [];
+			let totalDecksProcessed = 0;
+
+			// Filter deck files based on selected scope
+			const filteredDeckFiles = allDeckFiles.filter(deckFile => {
+				if (selectedScope === currentFile.path) {
+					// Current note only - check if this deck contains cards from current note
+					return deckFile.path === this.getDeckPathForNote(currentFile.path);
+				} else if (selectedScope === "/") {
+					// Vault-wide - include all
+					return true;
+				} else {
+					// Folder scope - include decks within the selected folder
+					return deckFile.path.startsWith(selectedScope);
+				}
+			});
+
+			this.logger(LogLevel.NORMAL, `Starting duplicate detection across ${filteredDeckFiles.length} deck files in scope "${selectedScope}" (${cardTypeText} cards only)`);
+
+			for (const deckFile of filteredDeckFiles) {
+				try {
+					const deck = await this.readDeck(deckFile.path);
+					const allDeckCards = Object.values(deck);
+
+					// Filter cards based on current note type
+					let deckCards = isCurrentNotePolyglot
+						? allDeckCards.filter(card => this.isPolyglotCard(card))  // Only polyglot cards
+						: allDeckCards.filter(card => !this.isPolyglotCard(card)); // Only non-polyglot cards
+
+					// Apply suspended/flagged filtering
+					deckCards = deckCards.filter(card => {
+						if (card.suspended && excludeSuspended) return false;
+						if (card.flagged && excludeFlagged) return false;
+						return true;
+					});
+
+					if (deckCards.length < 2) {
+						// Skip decks with less than 2 cards of the target type
+						continue;
+					}
+
+					// Find duplicates within this deck only
+					const deckDuplicateGroups = this.detectDuplicateCards(deckCards, deckFile.path, comparisonMode);
+					allDuplicateGroups.push(...deckDuplicateGroups);
+
+					totalDecksProcessed++;
+					notice.setMessage(`🔍 Scanning for duplicates... (${totalDecksProcessed}/${allDeckFiles.length} decks)`);
+
+				} catch (error) {
+					console.warn(`Could not read deck ${deckFile.path}:`, error);
+				}
+			}
+
+			notice.hide();
+			this.logger(LogLevel.NORMAL, `Duplicate detection complete: processed ${totalDecksProcessed} decks, found ${allDuplicateGroups.length} duplicate groups`);
+
+			if (allDuplicateGroups.length === 0) {
+				new Notice("✅ No duplicate cards found");
+				return;
+			}
+
+			// Show results
+			new DuplicateCardsModal(this, allDuplicateGroups).open();
+
+		} catch (error) {
+			new Notice("❌ Failed to scan for duplicates");
+			console.error("Duplicate detection error:", error);
+		}
+	}
+
+	private detectDuplicateCards(allCards: Flashcard[], deckPath?: string, comparisonMode: ComparisonMode = ComparisonMode.FRONT_PLUS_BACK): DuplicateGroup[] {
+		const duplicateGroups: DuplicateGroup[] = [];
+		const processedCards = new Set<string>();
+		const totalComparisons = (allCards.length * (allCards.length - 1)) / 2;
+		let comparisonsCompleted = 0;
+		let lastLogTime = Date.now();
+
+		// Extract deck name from path (e.g., "folder/subfolder/_flashcards.json" -> "subfolder")
+		let deckName = 'All cards';
+		if (deckPath) {
+			const pathParts = deckPath.split('/');
+			if (pathParts.length > 1) {
+				// Get the parent folder name (the folder containing _flashcards.json)
+				deckName = pathParts[pathParts.length - 2] || 'Root';
+			} else {
+				deckName = 'Root';
+			}
+		}
+
+		// Only log for larger decks to avoid spam
+		if (allCards.length >= 100) {
+			this.logger(LogLevel.NORMAL, `Checking deck "${deckName}": ${allCards.length} cards, ~${totalComparisons} comparisons`);
+		}
+
+		// Pre-lemmatize all cards for this deck to avoid redundant processing
+		this.logger(LogLevel.VERBOSE, `Pre-processing ${allCards.length} cards for lemmatization (mode: ${comparisonMode})...`);
+		const lemmaCache = new Map<string, { front: string[], back: string[], combined: string[] }>();
+		let lemmatizationStart = Date.now();
+
+		for (let k = 0; k < allCards.length; k++) {
+			const card = allCards[k];
+			if (processedCards.has(card.id)) continue;
+
+			const frontLemmas = card.front ? this.lemmatize(card.front) : [];
+			const backLemmas = card.back ? this.lemmatize(card.back) : [];
+			let combinedLemmas: string[] = [];
+
+			// For front+back mode, concatenate and lemmatize together
+			if (comparisonMode === ComparisonMode.FRONT_PLUS_BACK) {
+				const combinedText = [card.front || "", card.back || ""].filter(t => t.trim()).join(" ");
+				combinedLemmas = combinedText ? this.lemmatize(combinedText) : [];
+			}
+
+			lemmaCache.set(card.id, {
+				front: frontLemmas,
+				back: backLemmas,
+				combined: combinedLemmas
+			});
+
+			// Progress logging for lemmatization
+			if (allCards.length >= 200 && (k % 100 === 0 || k === allCards.length - 1)) {
+				const progress = Math.round(((k + 1) / allCards.length) * 100);
+				this.logger(LogLevel.VERBOSE, `  Lemmatization progress: ${progress}% (${k + 1}/${allCards.length} cards)`);
+			}
+		}
+
+		const lemmatizationTime = Date.now() - lemmatizationStart;
+		this.logger(LogLevel.VERBOSE, `Lemmatization complete in ${lemmatizationTime}ms`);
+
+		for (let i = 0; i < allCards.length; i++) {
+			const card1 = allCards[i];
+			if (processedCards.has(card1.id)) continue;
+
+			// Progress logging for comparison phase
+			const now = Date.now();
+			if (allCards.length >= 500 && (i % 250 === 0 || now - lastLogTime > 3000)) {
+				const progress = Math.round((i / allCards.length) * 100);
+				const comparisonsLeft = (allCards.length - i) * (allCards.length - i - 1) / 2;
+				this.logger(LogLevel.VERBOSE, `  "${deckName}" comparison progress: ${progress}% (card ${i}/${allCards.length}, ~${Math.round(comparisonsLeft)} comparisons left)`);
+				lastLogTime = now;
+			}
+
+			const similarCards: Array<{
+				card: Flashcard;
+				similarText: string;
+				similarity: number;
+			}> = [];
+
+			// Get pre-lemmatized data for card1
+			const lemmas1 = lemmaCache.get(card1.id) || { front: [], back: [], combined: [] };
+
+			for (let j = i + 1; j < allCards.length; j++) {
+				const card2 = allCards[j];
+				if (processedCards.has(card2.id)) continue;
+
+				// Get pre-lemmatized data for card2
+				const lemmas2 = lemmaCache.get(card2.id) || { front: [], back: [], combined: [] };
+
+				// Calculate similarity based on comparison mode
+				let bestSimilarity = 0;
+				let bestText1 = "";
+				let bestText2 = "";
+
+				switch (comparisonMode) {
+					case ComparisonMode.FRONT:
+						// Only compare fronts
+						bestSimilarity = this.calculateJaccardSimilarity(lemmas1.front, lemmas2.front);
+						if (card1.front && card2.front) {
+							bestText1 = card1.front;
+							bestText2 = card2.front;
+						}
+						break;
+
+					case ComparisonMode.BACK:
+						// Only compare backs
+						bestSimilarity = this.calculateJaccardSimilarity(lemmas1.back, lemmas2.back);
+						if (card1.back && card2.back) {
+							bestText1 = card1.back;
+							bestText2 = card2.back;
+						}
+						break;
+
+					case ComparisonMode.FRONT_OR_BACK:
+						// Max of front-to-front and back-to-back similarities
+						const frontSimilarity = this.calculateJaccardSimilarity(lemmas1.front, lemmas2.front);
+						const backSimilarity = this.calculateJaccardSimilarity(lemmas1.back, lemmas2.back);
+						bestSimilarity = Math.max(frontSimilarity, backSimilarity);
+
+						// Show text pair with higher similarity
+						if (frontSimilarity >= backSimilarity && card1.front && card2.front) {
+							bestText1 = card1.front;
+							bestText2 = card2.front;
+						} else if (card1.back && card2.back) {
+							bestText1 = card1.back;
+							bestText2 = card2.back;
+						}
+						break;
+
+					case ComparisonMode.FRONT_AND_BACK:
+						// Combined similarity: 1-(1-front)*(1-back) (probabilistic)
+						const frontSim = this.calculateJaccardSimilarity(lemmas1.front, lemmas2.front);
+						const backSim = this.calculateJaccardSimilarity(lemmas1.back, lemmas2.back);
+						bestSimilarity = 1 - (1 - frontSim) * (1 - backSim);
+
+						// Show text pair with higher individual similarity
+						if (frontSim >= backSim && card1.front && card2.front) {
+							bestText1 = card1.front;
+							bestText2 = card2.front;
+						} else if (card1.back && card2.back) {
+							bestText1 = card1.back;
+							bestText2 = card2.back;
+						}
+						break;
+
+					case ComparisonMode.FRONT_PLUS_BACK:
+						// Compare concatenated front+back strings
+						bestSimilarity = this.calculateJaccardSimilarity(lemmas1.combined, lemmas2.combined);
+						const combinedText1 = [card1.front || "", card1.back || ""].filter(t => t.trim()).join(" ");
+						const combinedText2 = [card2.front || "", card2.back || ""].filter(t => t.trim()).join(" ");
+						bestText1 = combinedText1;
+						bestText2 = combinedText2;
+						break;
+				}
+
+				comparisonsCompleted++;
+
+				// If similarity exceeds threshold, consider as duplicate
+				if (bestSimilarity >= 0.8) {
+					// Add card1 to similar cards if not already added
+					if (similarCards.length === 0) {
+						similarCards.push({
+							card: card1,
+							similarText: bestText1,
+							similarity: 1.0
+						});
+					}
+
+					similarCards.push({
+						card: card2,
+						similarText: bestText2,
+						similarity: bestSimilarity
+					});
+
+					processedCards.add(card2.id);
+				}
+			}
+
+			if (similarCards.length > 1) {
+				duplicateGroups.push({ cards: similarCards });
+				processedCards.add(card1.id);
+			}
+		}
+
+		// Log completion with timing information
+		const processingTime = Date.now() - lemmatizationStart;
+		if (duplicateGroups.length > 0 || allCards.length >= 100) {
+			this.logger(LogLevel.NORMAL, `  "${deckName}" complete: ${comparisonsCompleted} comparisons, found ${duplicateGroups.length} duplicate groups (${processingTime}ms total, ${lemmatizationTime}ms lemmatization)`);
+		} else {
+			this.logger(LogLevel.VERBOSE, `  "${deckName}" complete: ${comparisonsCompleted} comparisons, found ${duplicateGroups.length} duplicate groups (${processingTime}ms total, ${lemmatizationTime}ms lemmatization)`);
+		}
+		return duplicateGroups;
+	}
+
+	// Stopwords for lemmatization
+	private readonly stopwords = new Set([
+		"a", "an", "the", "is", "was", "were", "are", "of", "to", "in", "and", "that", "it", "on", "for", "with", "as", "at", "by", "from",
+		"be", "been", "being", "have", "has", "had", "do", "does", "did", "will", "would", "could", "should", "may", "might", "can", "must", "shall",
+		"this", "that", "these", "those", "but", "or", "not", "no", "yes", "so", "if", "when", "where", "why", "how", "what", "who", "which", "i", "you", "he", "she", "we", "they", "me", "him", "her", "us", "them"
+	]);
+
+	private lemmatize(text: string): string[] {
+		if (!text || text.trim() === '') return [];
+
+		let doc = nlp(text);
+		doc.verbs().toInfinitive();
+		doc.nouns().toSingular();
+		return doc.terms().out('array')
+			.map((t: string) => t.toLowerCase().replace(/[^\w]/g, '')) // Remove punctuation
+			.filter((t: string) => t.length > 1 && !this.stopwords.has(t)); // Filter short words and stopwords
+	}
+
+	private calculateJaccardSimilarity(lemmas1: string[], lemmas2: string[]): number {
+		if (lemmas1.length === 0 && lemmas2.length === 0) return 1.0;
+		if (lemmas1.length === 0 || lemmas2.length === 0) return 0.0;
+
+		const setA = new Set(lemmas1);
+		const setB = new Set(lemmas2);
+		const intersection = [...setA].filter(x => setB.has(x));
+		const union = new Set([...setA, ...setB]);
+		return intersection.length / union.size;
+	}
+
+	// TODO: Add variant comparison if they exist
+	// In future, we could also compare card.variants front-to-front and back-to-back
+
+
+	public isPolyglotCard(card: Flashcard): boolean {
+		return card.polyglot?.isPolyglot === true;
+	}
+
+	public getDeckPathForNote(notePath: string): string {
+		const folderPath = notePath.split('/').slice(0, -1).join('/');
+		return folderPath ? `${folderPath}/${DECK_FILE_NAME}` : DECK_FILE_NAME;
 	}
 
 	private async bulkCreateVariants(file: TFile): Promise<void> {
@@ -4876,6 +5427,48 @@ Return ONLY valid JSON of this shape: [{"front":"...","back":"..."}] or [] if no
 		}
 	}
 
+	/**
+	 * Show the LLM-assisted note editing modal
+	 */
+	private async showLlmEditModal(file: TFile): Promise<void> {
+		try {
+			const content = await this.app.vault.read(file);
+
+			// Check if note is finalized (contains gn-para class)
+			if (content.includes(PARA_CLASS)) {
+				new Notice("❌ Note must be unfinalized before LLM editing. Use 'Unfinalize note' command first.");
+				return;
+			}
+
+			// Check for existing flashcards
+			const folderPath = file.parent?.path || "";
+			const deckPath = folderPath ? `${folderPath}/${DECK_FILE_NAME}` : DECK_FILE_NAME;
+
+			let hasFlashcards = false;
+			let flashcardTags: string[] = [];
+
+			try {
+				const deck = await this.readDeck(deckPath);
+				const noteCards = Object.values(deck).filter(card => card.chapter === file.path);
+				hasFlashcards = noteCards.length > 0;
+
+				if (hasFlashcards) {
+					// Get unique tags for highlighting
+					flashcardTags = [...new Set(noteCards.map(card => card.tag).filter(tag => tag))];
+				}
+			} catch (error) {
+				// No deck file exists, continue without warning
+			}
+
+			// Show the LLM edit modal
+			new LlmEditModal(this.app, file, content, flashcardTags, this).open();
+
+		} catch (error) {
+			new Notice("❌ Failed to read note content");
+			console.error("LLM edit error:", error);
+		}
+	}
+
 	private registerEvents(): void {
 		this.registerEvent(
 			this.app.vault.on("modify", () => this.decorateExplorer())
@@ -4895,6 +5488,73 @@ Return ONLY valid JSON of this shape: [{"front":"...","back":"..."}] or [] if no
 		this.registerEvent(this.app.vault.on("modify", refreshOnDeckChange));
 		this.registerEvent(this.app.vault.on("rename", refreshOnDeckChange));
 		this.registerEvent(this.app.vault.on("delete", refreshOnDeckChange));
+
+		// Scroll position memory
+		this.registerEvent(this.app.workspace.on("file-open", this.handleFileOpen.bind(this)));
+	}
+
+	/**
+	 * Handles file-open events to save/restore scroll positions
+	 */
+	private async handleFileOpen(file: TFile | null): Promise<void> {
+		try {
+			// Save scroll position of the previous file
+			if (this.currentFilePath) {
+				await this.saveScrollPosition(this.currentFilePath);
+			}
+
+			// Update current file path
+			this.currentFilePath = file?.path || null;
+
+			// Restore scroll position for the new file (with a small delay to ensure rendering)
+			if (file) {
+				setTimeout(() => {
+					this.restoreScrollPosition(file.path);
+				}, 100);
+			}
+		} catch (error) {
+			this.logger(LogLevel.VERBOSE, "Error handling file open for scroll position:", error);
+		}
+	}
+
+	/**
+	 * Saves the current scroll position for a file
+	 */
+	private async saveScrollPosition(filePath: string): Promise<void> {
+		try {
+			const activeView = this.app.workspace.getActiveViewOfType(MarkdownView);
+			if (!activeView) return;
+
+			const state = activeView.getEphemeralState();
+			const scrollPosition = typeof state?.scroll === 'number' ? state.scroll : 0;
+
+			// Only save if there's a meaningful scroll position
+			if (scrollPosition > 0) {
+				this.settings.scrollPositions[filePath] = scrollPosition;
+				await this.saveSettings();
+				this.logger(LogLevel.VERBOSE, `Saved scroll position ${scrollPosition} for ${filePath}`);
+			}
+		} catch (error) {
+			this.logger(LogLevel.VERBOSE, "Error saving scroll position:", error);
+		}
+	}
+
+	/**
+	 * Restores the scroll position for a file
+	 */
+	private restoreScrollPosition(filePath: string): void {
+		try {
+			const savedPosition = this.settings.scrollPositions[filePath];
+			if (savedPosition === undefined) return;
+
+			const activeView = this.app.workspace.getActiveViewOfType(MarkdownView);
+			if (!activeView) return;
+
+			activeView.setEphemeralState({ scroll: savedPosition });
+			this.logger(LogLevel.VERBOSE, `Restored scroll position ${savedPosition} for ${filePath}`);
+		} catch (error) {
+			this.logger(LogLevel.VERBOSE, "Error restoring scroll position:", error);
+		}
 	}
 
 	private registerContextMenus(): void {
@@ -5027,6 +5687,9 @@ Return ONLY valid JSON of this shape: [{"front":"...","back":"..."}] or [] if no
 	}
 
 	private async reviewDue(): Promise<void> {
+		// Refresh all card statuses to ensure we have current due dates and states
+		await this.refreshAllStatuses();
+
 		const activeFile = this.app.workspace.getActiveFile();
 		if (!activeFile) {
 			new Notice("No active file to review.");
@@ -5369,6 +6032,7 @@ Return ONLY valid JSON of this shape: [{"front":"...","back":"..."}] or [] if no
 		let allCards: Flashcard[] = [];
 		let relevantDeckFiles: TFile[] = [];
 
+
 		switch (this.studyMode) {
 			case StudyMode.NOTE:
 				const noteDeckPath = getDeckPathForChapter(activePath);
@@ -5429,11 +6093,23 @@ Return ONLY valid JSON of this shape: [{"front":"...","back":"..."}] or [] if no
 			}
 		}
 
+		let suspendedCount = 0, notDueCount = 0, reviewUnseenCount = 0, blockedCount = 0, passedCount = 0;
+
 		for (const card of allCards) {
-			if (card.suspended) continue;
-			if (card.due > dueThreshold) continue;
+			const cardId = card.id.slice(-8);
+
+			if (card.suspended) {
+				suspendedCount++;
+				continue;
+			}
+
+			if (card.due > dueThreshold) {
+				notDueCount++;
+				continue;
+			}
 
 			if (this.studyMode === StudyMode.REVIEW && isUnseen(card)) {
+				reviewUnseenCount++;
 				continue;
 			}
 
@@ -5444,6 +6120,7 @@ Return ONLY valid JSON of this shape: [{"front":"...","back":"..."}] or [] if no
 					card.blocked && card.due <= dueThreshold && !isNew;
 
 				if (cardParaIdx > firstBlockedParaIdx && !isBlockedAndDue) {
+					blockedCount++;
 					continue;
 				}
 			}
@@ -5460,8 +6137,10 @@ Return ONLY valid JSON of this shape: [{"front":"...","back":"..."}] or [] if no
 				continue;
 			}
 
+			passedCount++;
 			reviewPool.push({ card, deck: deckFile });
 		}
+
 
 		if (this.studyMode === StudyMode.NOTE && reviewPool.length === 0) {
 			this.logger(
@@ -6575,9 +7254,7 @@ ${selection}
 					const graph = await this.readDeck(deckPath);
 
 					const blockedCards = Object.values(graph).filter((c) => {
-						if (c.chapter === chapterPath && isBuried(c)) {
-							console.log(c);
-						}
+
 						return c.chapter === chapterPath && isBlockingGating(c);
 					});
 					const firstBlockedParaIdx =
@@ -6695,7 +7372,6 @@ ${selection}
 		mdView: MarkdownView,
 		highlightColor: string
 	): Promise<void> {
-		console.log("[Polyglot] jumpToPolyglotTermInView called", { card, mdView });
 
 		const applyHighlight = (el: HTMLElement) => {
 			el.style.setProperty("--highlight-color", highlightColor);
@@ -6715,20 +7391,11 @@ ${selection}
 		const frontTerm = card.front ? extractTerm(card.front) : "";
 		const backTerm = card.back ? extractTerm(card.back) : "";
 
-		console.log("[Polyglot] Extracted terms:", {
-			front: card.front,
-			back: card.back,
-			frontTerm,
-			backTerm
-		});
 
 		const searchTerms = [frontTerm, backTerm].filter(term => term.length > 0);
-		console.log("[Polyglot] Search terms:", searchTerms);
 
 		// Search in the entire preview container
 		const previewContainer = mdView.previewMode.containerEl;
-		console.log("[Polyglot] Preview container:", previewContainer);
-		console.log("[Polyglot] Preview content:", previewContainer.textContent);
 
 		// Find the cluster containing our terms and highlight front green, back red
 		let found = false;
@@ -6746,7 +7413,6 @@ ${selection}
 			const containsBack = backTerm && textContent.includes(backTerm);
 
 			if (containsFront || containsBack) {
-				console.log("[Polyglot] Found cluster with terms in text node:", textContent);
 
 				// Find the parent element (likely a <p> containing the cluster)
 				let clusterElement = textNode.parentElement;
@@ -6755,7 +7421,6 @@ ${selection}
 				}
 
 				if (clusterElement) {
-					console.log("[Polyglot] Found cluster element:", clusterElement);
 					clusterElement.scrollIntoView({ behavior: "smooth" });
 
 					// Now highlight individual terms within this cluster
@@ -6767,7 +7432,6 @@ ${selection}
 		}
 
 		if (!found) {
-			console.log("[Polyglot] No term found, highlighting preview container");
 			previewContainer.scrollIntoView({ behavior: "smooth" });
 			applyHighlight(previewContainer);
 		}
@@ -6781,7 +7445,6 @@ ${selection}
 		frontTerm: string,
 		backTerm: string
 	): void {
-		console.log("[Polyglot] Highlighting terms in cluster:", { frontTerm, backTerm });
 
 		const walker = document.createTreeWalker(
 			clusterElement,
@@ -6802,7 +7465,6 @@ ${selection}
 
 			// Highlight front term in green
 			if (frontTerm && textContent.includes(frontTerm)) {
-				console.log("[Polyglot] Highlighting front term in green:", frontTerm);
 				modifiedContent = modifiedContent.replace(
 					frontTerm,
 					`<mark style="background-color: ${HIGHLIGHT_COLORS.unlocked};">${frontTerm}</mark>`
@@ -6812,7 +7474,6 @@ ${selection}
 
 			// Highlight back term in red
 			if (backTerm && textContent.includes(backTerm)) {
-				console.log("[Polyglot] Highlighting back term in red:", backTerm);
 				modifiedContent = modifiedContent.replace(
 					backTerm,
 					`<mark style="background-color: ${HIGHLIGHT_COLORS.failed};">${backTerm}</mark>`
@@ -6822,7 +7483,6 @@ ${selection}
 
 			// Replace the text node with highlighted HTML if changes were made
 			if (hasChanges && node.parentNode) {
-				console.log("[Polyglot] Applying highlighted content:", modifiedContent);
 				const span = document.createElement('span');
 				span.innerHTML = modifiedContent;
 				node.parentNode.replaceChild(span, node);
@@ -6845,7 +7505,6 @@ ${selection}
 		wrapper: HTMLElement,
 		highlightColor: string
 	): Promise<void> {
-		console.log("[Polyglot] jumpToPolyglotTerm called", { card, wrapper });
 
 		const applyHighlight = (el: HTMLElement) => {
 			el.style.setProperty("--highlight-color", highlightColor);
@@ -6866,24 +7525,15 @@ ${selection}
 		const frontTerm = card.front ? extractTerm(card.front) : "";
 		const backTerm = card.back ? extractTerm(card.back) : "";
 
-		console.log("[Polyglot] Extracted terms:", {
-			front: card.front,
-			back: card.back,
-			frontTerm,
-			backTerm
-		});
 
 		// Try to find either term in the content using simple text search
 		const searchTerms = [frontTerm, backTerm].filter(
 			(term) => term.length > 0
 		);
 
-		console.log("[Polyglot] Search terms:", searchTerms);
-		console.log("[Polyglot] Wrapper content:", wrapper.textContent);
 
 		let found = false;
 		for (const term of searchTerms) {
-			console.log("[Polyglot] Searching for term:", term);
 
 			// Simple approach: find elements containing the term text
 			const walker = document.createTreeWalker(
@@ -6895,11 +7545,9 @@ ${selection}
 			while (textNode = walker.nextNode()) {
 				const textContent = textNode.textContent || "";
 				if (textContent.includes(term)) {
-					console.log("[Polyglot] Found term in text node:", textContent);
 					// Found the term! Highlight its parent element
 					const parentElement = textNode.parentElement;
 					if (parentElement) {
-						console.log("[Polyglot] Highlighting parent element:", parentElement);
 						parentElement.scrollIntoView({ behavior: "smooth" });
 						applyHighlight(parentElement);
 						found = true;
@@ -6913,7 +7561,6 @@ ${selection}
 
 		// Fallback: just highlight the whole wrapper if no term found
 		if (!found) {
-			console.log("[Polyglot] No term found, highlighting wrapper");
 			wrapper.scrollIntoView({ behavior: "smooth" });
 			applyHighlight(wrapper);
 		}
@@ -6973,7 +7620,6 @@ ${selection}
 
 		// Handle polyglot cards differently - they don't have paragraph structure
 		if (card.polyglot?.isPolyglot) {
-			console.log("[Jump] Polyglot card detected, using simple search");
 			await this.jumpToPolyglotTermInView(card, mdView, highlightColor);
 			return;
 		}
@@ -7036,14 +7682,8 @@ ${selection}
 						applyHighlight(wrapper);
 					}
 				} else {
-					// Branch logic for polyglot vs regular cards
-					console.log("[Jump] Checking card type:", {
-						isPolyglot: card.polyglot?.isPolyglot,
-						polyglot: card.polyglot
-					});
 
 					if (card.polyglot?.isPolyglot) {
-						console.log("[Jump] Taking polyglot branch");
 						// Polyglot cards: Search for actual terms in markdown
 						await this.jumpToPolyglotTerm(
 							card,
@@ -7051,7 +7691,6 @@ ${selection}
 							highlightColor
 						);
 					} else {
-						console.log("[Jump] Taking regular card branch");
 						// Regular cards: Use existing complex finalized note logic
 						try {
 							const range = findTextRange(card.tag, wrapper);
@@ -9305,6 +9944,158 @@ ${selection}
 		return bestMatch.score >= FINAL_SCORE_THRESHOLD
 			? bestMatch.paraId
 			: undefined;
+	}
+
+	/**
+	 * Find all locations where flashcard tags appear in text for highlighting
+	 */
+	private findTagLocationsInText(
+		text: string,
+		tags: string[]
+	): Array<{ start: number; end: number; tag: string }> {
+		const TAG_SCORE_THRESHOLD = 0.5;
+		const locations: Array<{ start: number; end: number; tag: string }> = [];
+
+		const normalize = (s: string) =>
+			s
+				.toLowerCase()
+				.replace(/[^\w\s]/g, "")
+				.replace(/\s+/g, " ")
+				.trim();
+
+		const normalizedText = normalize(text);
+
+		for (const tag of tags) {
+			if (!tag) continue;
+
+			const normalizedTag = normalize(tag);
+			const tagWords = normalizedTag.split(" ");
+			const uniqueTagWords = new Set(tagWords);
+
+			if (uniqueTagWords.size === 0) continue;
+
+			// Look for the best contiguous match in the text
+			let bestMatch = { score: 0, start: -1, end: -1 };
+
+			// Try different starting positions in the text
+			const textWords = normalizedText.split(" ");
+			for (let startIdx = 0; startIdx <= textWords.length - tagWords.length; startIdx++) {
+				// Try different lengths from this position
+				for (let len = Math.min(tagWords.length, textWords.length - startIdx); len >= 1; len--) {
+					const textSegment = textWords.slice(startIdx, startIdx + len).join(" ");
+
+					// Calculate similarity score for this segment
+					const segmentWords = new Set(textSegment.split(" "));
+					const wordsFound = [...uniqueTagWords].filter(word => segmentWords.has(word)).length;
+					const scoreBoW = wordsFound / uniqueTagWords.size;
+
+					// Check for contiguous match
+					let longestMatch = 0;
+					for (let i = 0; i < tagWords.length; i++) {
+						for (let j = i + 1; j <= tagWords.length; j++) {
+							const subArray = tagWords.slice(i, j);
+							const subString = subArray.join(" ");
+							if (
+								subArray.length > longestMatch &&
+								textSegment.includes(subString)
+							) {
+								longestMatch = subArray.length;
+							}
+						}
+					}
+					const scoreLCS = longestMatch / tagWords.length;
+
+					const finalScore = scoreBoW * 0.3 + scoreLCS * 0.7;
+
+					if (finalScore > bestMatch.score && finalScore >= TAG_SCORE_THRESHOLD) {
+						// Find actual character positions in original text
+						const segmentInOriginal = textWords.slice(startIdx, startIdx + len).join(" ");
+						const originalStart = this.findSubstringInOriginal(text, segmentInOriginal);
+						if (originalStart !== -1) {
+							bestMatch = {
+								score: finalScore,
+								start: originalStart,
+								end: originalStart + segmentInOriginal.length
+							};
+						}
+					}
+				}
+			}
+
+			if (bestMatch.start !== -1) {
+				locations.push({
+					start: bestMatch.start,
+					end: bestMatch.end,
+					tag: tag
+				});
+			}
+		}
+
+		// Sort by start position and remove overlaps
+		locations.sort((a, b) => a.start - b.start);
+		return this.removeOverlappingRanges(locations);
+	}
+
+	/**
+	 * Find a normalized substring in the original text (accounting for case/punctuation differences)
+	 */
+	private findSubstringInOriginal(originalText: string, normalizedSubstring: string): number {
+		const normalize = (s: string) =>
+			s
+				.toLowerCase()
+				.replace(/[^\w\s]/g, "")
+				.replace(/\s+/g, " ")
+				.trim();
+
+		const normalizedOriginal = normalize(originalText);
+		const normalizedIndex = normalizedOriginal.indexOf(normalizedSubstring);
+
+		if (normalizedIndex === -1) return -1;
+
+		// Map back to original text position
+		let originalIndex = 0;
+		let normalizedIndex2 = 0;
+
+		while (normalizedIndex2 < normalizedIndex && originalIndex < originalText.length) {
+			const origChar = originalText[originalIndex];
+			const normChar = normalize(origChar);
+
+			if (normChar) {
+				normalizedIndex2++;
+			}
+			originalIndex++;
+		}
+
+		return originalIndex;
+	}
+
+	/**
+	 * Remove overlapping ranges, keeping the longer ones
+	 */
+	private removeOverlappingRanges(
+		ranges: Array<{ start: number; end: number; tag: string }>
+	): Array<{ start: number; end: number; tag: string }> {
+		if (ranges.length <= 1) return ranges;
+
+		const result = [ranges[0]];
+
+		for (let i = 1; i < ranges.length; i++) {
+			const current = ranges[i];
+			const lastAdded = result[result.length - 1];
+
+			// Check for overlap
+			if (current.start < lastAdded.end) {
+				// Keep the longer range
+				if ((current.end - current.start) > (lastAdded.end - lastAdded.start)) {
+					result[result.length - 1] = current;
+				}
+				// Otherwise skip current (keep the previous one)
+			} else {
+				result.push(current);
+			}
+		}
+
+		return result;
 	}
 
 	private async removeUnusedImages(): Promise<void> {
@@ -17405,7 +18196,7 @@ class CardBrowser extends NavigationAwareModal {
 
 		this.searchInput = searchContainer.createEl("input", {
 			type: "text",
-			placeholder: 'Search cards (front, back, or tag:"exact-tag")',
+			placeholder: 'Search cards (or front:"text", back:"text", tag:"exact-tag")',
 		}) as HTMLInputElement;
 		this.searchInput.style.flex = "1";
 		this.searchInput.style.padding = "4px 8px";
@@ -17476,7 +18267,9 @@ class CardBrowser extends NavigationAwareModal {
 			"aria-label",
 			"Start custom study session with selected/filtered cards"
 		);
-		customStudyBtn.onclick = () => this.startCustomStudy();
+		customStudyBtn.onclick = () => {
+			this.startCustomStudy();
+		};
 
 		const body = this.contentEl.createDiv({ cls: "gn-body" });
 		this.treePane = body.createDiv({ cls: "gn-tree" });
@@ -17662,16 +18455,46 @@ class CardBrowser extends NavigationAwareModal {
 
 		const query = this.searchQuery.toLowerCase();
 
+		// Exact tag search with quotes
 		const tagMatch = query.match(/tag:"(.+)"$/);
 		if (tagMatch) {
 			const tagQuery = tagMatch[1];
 			return card.tag.toLowerCase() === tagQuery.toLowerCase();
 		}
 
+		// Exact front search with quotes
+		const frontMatch = query.match(/front:"(.+)"$/);
+		if (frontMatch) {
+			const frontQuery = frontMatch[1];
+			return (card.front || "").toLowerCase() === frontQuery.toLowerCase();
+		}
+
+		// Exact back search with quotes
+		const backMatch = query.match(/back:"(.+)"$/);
+		if (backMatch) {
+			const backQuery = backMatch[1];
+			return (card.back || "").toLowerCase() === backQuery.toLowerCase();
+		}
+
+		// Partial tag search without quotes
 		const simpleTagMatch = query.match(/tag:(\S+)/);
 		if (simpleTagMatch) {
 			const tagQuery = simpleTagMatch[1];
 			return card.tag.toLowerCase().includes(tagQuery.toLowerCase());
+		}
+
+		// Partial front search without quotes
+		const simpleFrontMatch = query.match(/front:(\S+)/);
+		if (simpleFrontMatch) {
+			const frontQuery = simpleFrontMatch[1];
+			return (card.front || "").toLowerCase().includes(frontQuery.toLowerCase());
+		}
+
+		// Partial back search without quotes
+		const simpleBackMatch = query.match(/back:(\S+)/);
+		if (simpleBackMatch) {
+			const backQuery = simpleBackMatch[1];
+			return (card.back || "").toLowerCase().includes(backQuery.toLowerCase());
 		}
 
 		const searchFields = [
@@ -17938,135 +18761,21 @@ class CardBrowser extends NavigationAwareModal {
 	}
 
 	private async startCustomStudy() {
-		const cardsToStudy = await this.getCardsForCustomStudy();
+		const selectedPathsArray = Array.from(this.selectedPaths);
 
-		if (cardsToStudy.length === 0) {
-			new Notice(
-				"No cards available for custom study. Try adjusting your selection or filters."
-			);
-			return;
-		}
+		const pathDisplay = this.selectedPaths.size === 0
+			? "search results"
+			: this.selectedPaths.size === 1
+			? selectedPathsArray[0]
+			: `${this.selectedPaths.size} selected items`;
 
-		const now = Date.now();
-		const dueCards = cardsToStudy.filter(
-			(card) =>
-				!card.suspended &&
-				card.due <= now &&
-				!isBuried(card) &&
-				!isUnseen(card)
-		);
+		new Notice(`🎯 Custom study: ${pathDisplay} (using working ribbon path)`);
 
-		if (dueCards.length === 0) {
-			const studyAhead = confirm(
-				`No cards are currently due in your selection (${cardsToStudy.length} total cards). Would you like to study ahead?`
-			);
-
-			if (!studyAhead) return;
-
-			this.startCustomReviewSession(cardsToStudy);
-		} else {
-			const pathDisplay =
-				this.selectedPaths.size === 0
-					? "search results"
-					: this.selectedPaths.size === 1
-					? Array.from(this.selectedPaths)[0]
-					: `${this.selectedPaths.size} selected items`;
-
-			new Notice(
-				`🎯 Custom study: ${dueCards.length} due cards from ${pathDisplay}`
-			);
-			this.startCustomReviewSession(dueCards);
-		}
+		// Close browser and start review using the working ribbon logic
+		this.close();
+		this.plugin.startCustomSessionFromPaths(selectedPathsArray, true);
 	}
 
-	private async getCardsForCustomStudy(): Promise<Flashcard[]> {
-		if (this.selectedPaths.size > 0) {
-			const allSelectedCards: Flashcard[] = [];
-
-			for (const selectedPath of this.selectedPaths) {
-				const isFolder = !selectedPath.includes(".md");
-
-				if (isFolder) {
-					const decks = this.app.vault
-						.getFiles()
-						.filter(
-							(f) =>
-								f.name.endsWith(DECK_FILE_NAME) &&
-								f.path.startsWith(selectedPath)
-						);
-
-					for (const deck of decks) {
-						const graph = await this.plugin.readDeck(deck.path);
-						const cardsInDeck = Object.values(graph) as Flashcard[];
-						allSelectedCards.push(...cardsInDeck);
-					}
-				} else {
-					const deckPath = getDeckPathForChapter(selectedPath);
-					try {
-						const graph = await this.plugin.readDeck(deckPath);
-						const cardsInDeck = Object.values(graph).filter(
-							(card: Flashcard) => card.chapter === selectedPath
-						) as Flashcard[];
-						allSelectedCards.push(...cardsInDeck);
-					} catch (error) {
-						console.warn(
-							`Could not read deck for ${selectedPath}:`,
-							error
-						);
-					}
-				}
-			}
-
-			const searchFiltered = this.searchQuery
-				? allSelectedCards.filter((card) => this.matchesSearch(card))
-				: allSelectedCards;
-
-			return this.applyFiltersToCards(searchFiltered);
-		} else if (this.searchQuery) {
-			const allDeckFiles = this.app.vault
-				.getFiles()
-				.filter((f) => f.name === DECK_FILE_NAME);
-
-			const allCards: Flashcard[] = [];
-			for (const deckFile of allDeckFiles) {
-				try {
-					const content = await this.app.vault.read(deckFile);
-					const deckCards = JSON.parse(content);
-					allCards.push(...(Object.values(deckCards) as Flashcard[]));
-				} catch (error) {
-					console.warn(
-						`Could not read deck ${deckFile.path}:`,
-						error
-					);
-				}
-			}
-
-			const searchFiltered = allCards.filter((card) =>
-				this.matchesSearch(card)
-			);
-			return this.applyFiltersToCards(searchFiltered);
-		} else {
-			const allDeckFiles = this.app.vault
-				.getFiles()
-				.filter((f) => f.name === DECK_FILE_NAME);
-
-			const allCards: Flashcard[] = [];
-			for (const deckFile of allDeckFiles) {
-				try {
-					const content = await this.app.vault.read(deckFile);
-					const deckCards = JSON.parse(content);
-					allCards.push(...(Object.values(deckCards) as Flashcard[]));
-				} catch (error) {
-					console.warn(
-						`Could not read deck ${deckFile.path}:`,
-						error
-					);
-				}
-			}
-
-			return this.applyFiltersToCards(allCards);
-		}
-	}
 
 	private cycleFilterState(currentState: FilterState): FilterState {
 		switch (currentState) {
@@ -21520,6 +22229,709 @@ class BulkRefocusConfirmModal extends Modal {
 	}
 }
 
+class BulkRefocusReviewModal extends Modal {
+	constructor(
+		private plugin: GatedNotesPlugin,
+		private refocusResults: BulkRefocusResult[],
+		private onDecision: (approved: boolean) => void
+	) {
+		super(plugin.app);
+	}
+
+	onOpen() {
+		this.titleEl.setText("Review Refocused Cards");
+		makeModalDraggable(this, this.plugin);
+
+		// Calculate totals
+		const totalOriginal = this.refocusResults.length;
+		const totalNew = this.refocusResults.reduce((sum, result) => sum + result.refocusedCards.length, 0);
+
+		this.contentEl.createEl("p", {
+			text: `${totalNew} new cards generated from ${totalOriginal} original cards. Review the results below:`,
+		});
+
+		// Create scrollable container for the cards
+		const scrollContainer = this.contentEl.createDiv();
+		scrollContainer.style.maxHeight = "400px";
+		scrollContainer.style.overflowY = "auto";
+		scrollContainer.style.border = "1px solid var(--background-modifier-border)";
+		scrollContainer.style.borderRadius = "8px";
+		scrollContainer.style.padding = "16px";
+		scrollContainer.style.marginBottom = "20px";
+
+		// Display each result
+		this.refocusResults.forEach((result, index) => {
+			if (index > 0) {
+				scrollContainer.createEl("hr", {
+					attr: { style: "margin: 20px 0; border-color: var(--background-modifier-border);" }
+				});
+			}
+
+			// Original card
+			const originalSection = scrollContainer.createDiv();
+			originalSection.style.marginBottom = "12px";
+
+			originalSection.createEl("h4", { text: `Original Card:` });
+			const originalCard = originalSection.createDiv();
+			originalCard.style.backgroundColor = "var(--background-secondary)";
+			originalCard.style.padding = "8px";
+			originalCard.style.borderRadius = "4px";
+			originalCard.style.fontSize = "0.9em";
+
+			const frontDiv = originalCard.createDiv();
+			frontDiv.style.marginBottom = "4px";
+			frontDiv.createEl("strong", { text: "Q: " });
+			frontDiv.createSpan({ text: result.originalCard.front });
+
+			const backDiv = originalCard.createDiv();
+			backDiv.createEl("strong", { text: "A: " });
+			backDiv.createSpan({ text: result.originalCard.back });
+
+			// New cards
+			const newSection = scrollContainer.createDiv();
+			newSection.createEl("h4", { text: `New Cards (${result.refocusedCards.length}):` });
+
+			result.refocusedCards.forEach((newCard, cardIndex) => {
+				const newCardDiv = newSection.createDiv();
+				newCardDiv.style.backgroundColor = "var(--background-primary-alt)";
+				newCardDiv.style.padding = "8px";
+				newCardDiv.style.borderRadius = "4px";
+				newCardDiv.style.fontSize = "0.9em";
+				newCardDiv.style.marginBottom = "8px";
+				newCardDiv.style.border = "1px solid var(--color-accent)";
+
+				const newFrontDiv = newCardDiv.createDiv();
+				newFrontDiv.style.marginBottom = "4px";
+				newFrontDiv.createEl("strong", { text: "Q: " });
+				newFrontDiv.createSpan({ text: newCard.front });
+
+				const newBackDiv = newCardDiv.createDiv();
+				newBackDiv.createEl("strong", { text: "A: " });
+				newBackDiv.createSpan({ text: newCard.back });
+			});
+		});
+
+		// Action buttons
+		const buttonContainer = this.contentEl.createDiv();
+		buttonContainer.style.display = "flex";
+		buttonContainer.style.gap = "10px";
+		buttonContainer.style.justifyContent = "flex-end";
+
+		new ButtonComponent(buttonContainer)
+			.setButtonText("Cancel")
+			.onClick(() => {
+				this.onDecision(false);
+				this.close();
+			});
+
+		new ButtonComponent(buttonContainer)
+			.setButtonText(`Accept All ${totalNew} Cards`)
+			.setCta()
+			.onClick(() => {
+				this.onDecision(true);
+				this.close();
+			});
+	}
+
+	onClose() {
+		this.contentEl.empty();
+	}
+}
+
+class DuplicateCardsModal extends Modal {
+	private deletedCards = new Map<string, { card: Flashcard; deckPath: string }>(); // For undo functionality
+
+	constructor(
+		private plugin: GatedNotesPlugin,
+		private duplicateGroups: DuplicateGroup[]
+	) {
+		super(plugin.app);
+	}
+
+	onOpen() {
+		this.titleEl.setText("Duplicate Cards Found");
+		makeModalDraggable(this, this.plugin);
+
+		const totalGroups = this.duplicateGroups.length;
+		const totalDuplicates = this.duplicateGroups.reduce((sum, group) => sum + group.cards.length, 0);
+
+		this.contentEl.createEl("p", {
+			text: `Found ${totalGroups} groups containing ${totalDuplicates} potentially duplicate cards. Review and delete unwanted duplicates:`,
+		});
+
+		// Create scrollable container
+		const scrollContainer = this.contentEl.createDiv();
+		scrollContainer.style.maxHeight = "500px";
+		scrollContainer.style.overflowY = "auto";
+		scrollContainer.style.border = "1px solid var(--background-modifier-border)";
+		scrollContainer.style.borderRadius = "8px";
+		scrollContainer.style.padding = "16px";
+		scrollContainer.style.marginBottom = "20px";
+
+		// Display each duplicate group
+		this.duplicateGroups.forEach((group, groupIndex) => {
+			if (groupIndex > 0) {
+				scrollContainer.createEl("hr", {
+					attr: { style: "margin: 24px 0; border-color: var(--background-modifier-border);" }
+				});
+			}
+
+			const groupHeader = scrollContainer.createDiv();
+			groupHeader.style.marginBottom = "16px";
+			groupHeader.createEl("h3", { text: `Duplicate Group ${groupIndex + 1}` });
+
+			group.cards.forEach((cardInfo, cardIndex) => {
+				const cardDiv = scrollContainer.createDiv();
+				cardDiv.style.backgroundColor = "var(--background-secondary)";
+				cardDiv.style.padding = "12px";
+				cardDiv.style.borderRadius = "6px";
+				cardDiv.style.marginBottom = "12px";
+
+				// Card content
+				const contentDiv = cardDiv.createDiv();
+				contentDiv.style.marginBottom = "8px";
+
+				const frontDiv = contentDiv.createDiv();
+				frontDiv.style.marginBottom = "6px";
+				frontDiv.createEl("strong", { text: "Q: " });
+				frontDiv.createSpan({ text: cardInfo.card.front });
+
+				const backDiv = contentDiv.createDiv();
+				backDiv.style.marginBottom = "6px";
+				backDiv.createEl("strong", { text: "A: " });
+				backDiv.createSpan({ text: cardInfo.card.back });
+
+				// Metadata
+				const metaDiv = contentDiv.createDiv();
+				metaDiv.style.fontSize = "0.8em";
+				metaDiv.style.color = "var(--text-muted)";
+				metaDiv.style.marginBottom = "8px";
+
+				const locationText = cardInfo.card.chapter.split('/').pop()?.replace('.md', '') || 'Unknown';
+				metaDiv.createSpan({ text: `Location: ${locationText}` });
+
+				if (cardInfo.similarity < 1.0) {
+					metaDiv.createSpan({ text: ` • Similarity: ${Math.round(cardInfo.similarity * 100)}%` });
+				}
+
+				// Action button container (below metadata)
+				const buttonDiv = cardDiv.createDiv();
+				buttonDiv.style.display = "flex";
+				buttonDiv.style.gap = "8px";
+				buttonDiv.style.justifyContent = "flex-end";
+				buttonDiv.style.marginTop = "8px";
+
+				const cardId = cardInfo.card.id;
+				const isDeleted = this.deletedCards.has(cardId);
+
+				// Suspend button
+				const suspendButton = buttonDiv.createEl("button");
+				suspendButton.textContent = cardInfo.card.suspended ? "↻ Unsuspend" : "⏸️ Suspend";
+				suspendButton.style.padding = "4px 8px";
+				suspendButton.style.fontSize = "0.8em";
+				suspendButton.style.backgroundColor = cardInfo.card.suspended ? "var(--interactive-success)" : "var(--interactive-normal)";
+				suspendButton.style.color = "var(--text-on-accent)";
+				suspendButton.style.border = "none";
+				suspendButton.style.borderRadius = "4px";
+				suspendButton.style.cursor = "pointer";
+
+				if (isDeleted) {
+					suspendButton.disabled = true;
+					suspendButton.style.opacity = "0.5";
+				}
+
+				suspendButton.onclick = async () => {
+					try {
+						await this.toggleSuspendCard(cardInfo.card);
+						suspendButton.textContent = cardInfo.card.suspended ? "↻ Unsuspend" : "⏸️ Suspend";
+						suspendButton.style.backgroundColor = cardInfo.card.suspended ? "var(--interactive-success)" : "var(--interactive-normal)";
+						new Notice(cardInfo.card.suspended ? "Card suspended" : "Card unsuspended");
+					} catch (error) {
+						new Notice("❌ Failed to toggle suspend");
+						console.error("Suspend toggle error:", error);
+					}
+				};
+
+				// Flag button
+				const flagButton = buttonDiv.createEl("button");
+				flagButton.textContent = cardInfo.card.flagged ? "🏴 Unflag" : "🏁 Flag";
+				flagButton.style.padding = "4px 8px";
+				flagButton.style.fontSize = "0.8em";
+				flagButton.style.backgroundColor = cardInfo.card.flagged ? "var(--interactive-accent)" : "var(--interactive-normal)";
+				flagButton.style.color = "var(--text-on-accent)";
+				flagButton.style.border = "none";
+				flagButton.style.borderRadius = "4px";
+				flagButton.style.cursor = "pointer";
+
+				if (isDeleted) {
+					flagButton.disabled = true;
+					flagButton.style.opacity = "0.5";
+				}
+
+				flagButton.onclick = async () => {
+					try {
+						await this.toggleFlagCard(cardInfo.card);
+						flagButton.textContent = cardInfo.card.flagged ? "🏴 Unflag" : "🏁 Flag";
+						flagButton.style.backgroundColor = cardInfo.card.flagged ? "var(--interactive-accent)" : "var(--interactive-normal)";
+						new Notice(cardInfo.card.flagged ? "Card flagged" : "Card unflagged");
+					} catch (error) {
+						new Notice("❌ Failed to toggle flag");
+						console.error("Flag toggle error:", error);
+					}
+				};
+
+				// Delete/Undo button
+				const deleteButton = buttonDiv.createEl("button");
+				deleteButton.textContent = "🗑️ Delete";
+				deleteButton.style.padding = "4px 8px";
+				deleteButton.style.fontSize = "0.8em";
+				deleteButton.style.backgroundColor = "var(--interactive-accent)";
+				deleteButton.style.color = "var(--text-on-accent)";
+				deleteButton.style.border = "none";
+				deleteButton.style.borderRadius = "4px";
+				deleteButton.style.cursor = "pointer";
+
+				// Set initial state based on whether card is already deleted
+				if (isDeleted) {
+					cardDiv.style.opacity = "0.5";
+					deleteButton.textContent = "↶ Undo";
+					deleteButton.style.backgroundColor = "var(--interactive-normal)";
+				}
+
+				deleteButton.onclick = async () => {
+					try {
+						if (this.deletedCards.has(cardId)) {
+							// Undo delete
+							await this.undoDelete(cardInfo.card);
+							this.deletedCards.delete(cardId);
+							cardDiv.style.opacity = "1";
+							deleteButton.textContent = "🗑️ Delete";
+							deleteButton.style.backgroundColor = "var(--interactive-accent)";
+							deleteButton.disabled = false;
+							// Re-enable other buttons
+							suspendButton.disabled = false;
+							suspendButton.style.opacity = "1";
+							flagButton.disabled = false;
+							flagButton.style.opacity = "1";
+						} else {
+							// Delete card (no confirmation for better UX since undo is available)
+							await this.deleteCardWithUndo(cardInfo.card);
+							this.deletedCards.set(cardId, {
+								card: cardInfo.card,
+								deckPath: this.getDeckPath(cardInfo.card)
+							});
+							cardDiv.style.opacity = "0.5";
+							deleteButton.textContent = "↶ Undo";
+							deleteButton.style.backgroundColor = "var(--interactive-normal)";
+							// Disable other buttons when deleted
+							suspendButton.disabled = true;
+							suspendButton.style.opacity = "0.5";
+							flagButton.disabled = true;
+							flagButton.style.opacity = "0.5";
+						}
+					} catch (error) {
+						new Notice("❌ Failed to process card action");
+						console.error("Card action error:", error);
+					}
+				};
+			});
+		});
+
+		// Close button
+		const buttonContainer = this.contentEl.createDiv();
+		buttonContainer.style.display = "flex";
+		buttonContainer.style.justifyContent = "flex-end";
+
+		new ButtonComponent(buttonContainer)
+			.setButtonText("Close")
+			.setCta()
+			.onClick(() => {
+				this.close();
+			});
+	}
+
+	private getDeckPath(card: Flashcard): string {
+		const folderPath = card.chapter.split('/').slice(0, -1).join('/');
+		return folderPath ? `${folderPath}/${DECK_FILE_NAME}` : DECK_FILE_NAME;
+	}
+
+	private async deleteCardWithUndo(card: Flashcard): Promise<void> {
+		const deckPath = this.getDeckPath(card);
+		const deck = await this.plugin.readDeck(deckPath);
+		delete deck[card.id];
+		await this.plugin.writeDeck(deckPath, deck);
+	}
+
+	private async undoDelete(card: Flashcard): Promise<void> {
+		const deckPath = this.getDeckPath(card);
+		const deck = await this.plugin.readDeck(deckPath);
+		deck[card.id] = card; // Restore the card
+		await this.plugin.writeDeck(deckPath, deck);
+	}
+
+	private async toggleSuspendCard(card: Flashcard): Promise<void> {
+		const deckPath = this.getDeckPath(card);
+		const deck = await this.plugin.readDeck(deckPath);
+
+		// Toggle suspend state
+		card.suspended = !card.suspended;
+		deck[card.id] = card;
+
+		await this.plugin.writeDeck(deckPath, deck);
+	}
+
+	private async toggleFlagCard(card: Flashcard): Promise<void> {
+		const deckPath = this.getDeckPath(card);
+		const deck = await this.plugin.readDeck(deckPath);
+
+		// Toggle flag state
+		card.flagged = !card.flagged;
+		deck[card.id] = card;
+
+		await this.plugin.writeDeck(deckPath, deck);
+	}
+
+	onClose() {
+		this.contentEl.empty();
+	}
+}
+
+class DuplicateDetectionConfirmModal extends Modal {
+	private selectedScope: string;
+	private excludeSuspended: boolean = true;  // Default to excluding suspended cards
+	private excludeFlagged: boolean = false;   // Default to including flagged cards
+	private comparisonMode: ComparisonMode = ComparisonMode.FRONT_PLUS_BACK;  // Default to front+back
+	private scopeStats: { [key: string]: { cards: number; comparisons: number } } = {};
+	private statsEl!: HTMLElement; // Will be initialized in onOpen
+
+	constructor(
+		private plugin: GatedNotesPlugin,
+		private currentFile: TFile,
+		private noteTypeText: string,
+		private cardTypeText: string,
+		private isPolyglotMode: boolean,
+		private onConfirm: (result: { confirmed: boolean; selectedScope: string; excludeSuspended: boolean; excludeFlagged: boolean; comparisonMode: ComparisonMode } | null) => void
+	) {
+		super(plugin.app);
+		this.selectedScope = "/"; // Default to vault-wide
+	}
+
+	async onOpen() {
+		this.titleEl.setText("Find Duplicate Flashcards");
+		makeModalDraggable(this, this.plugin);
+
+		this.contentEl.createEl("p", {
+			text: `The current note "${this.currentFile.name}" ${this.noteTypeText} a polyglot-style note.`,
+		});
+
+		this.contentEl.createEl("p", {
+			text: `Only ${this.cardTypeText} cards will be checked for duplicates.`,
+		});
+
+		// Scope selection section
+		const scopeSection = this.contentEl.createDiv();
+		scopeSection.style.marginBottom = "16px";
+		scopeSection.createEl("h3", { text: "Select search scope:" });
+
+		// Build hierarchical path options
+		const pathParts = this.currentFile.path.split('/');
+		const scopeOptions = this.buildScopeOptions(pathParts);
+
+		// Create radio buttons for scope selection
+		for (const option of scopeOptions) {
+			const optionDiv = scopeSection.createDiv();
+			optionDiv.style.marginBottom = "8px";
+			optionDiv.style.display = "flex";
+			optionDiv.style.alignItems = "center";
+			optionDiv.style.gap = "8px";
+
+			const radio = optionDiv.createEl("input", {
+				type: "radio",
+				attr: { name: "scope-selection", value: option.value }
+			});
+
+			if (option.value === this.selectedScope) {
+				radio.checked = true;
+			}
+
+			radio.onchange = async () => {
+				if (radio.checked) {
+					this.selectedScope = option.value;
+					await this.updateStats();
+				}
+			};
+
+			const label = optionDiv.createEl("label");
+			label.textContent = option.label;
+			label.style.cursor = "pointer";
+			label.onclick = () => {
+				radio.checked = true;
+				radio.onchange?.(new Event('change'));
+			};
+		}
+
+		// Filtering options section
+		const filterSection = this.contentEl.createDiv();
+		filterSection.style.marginBottom = "16px";
+		filterSection.createEl("h3", { text: "Exclude from analysis:" });
+
+		// Suspended cards option
+		const suspendedDiv = filterSection.createDiv();
+		suspendedDiv.style.marginBottom = "8px";
+		suspendedDiv.style.display = "flex";
+		suspendedDiv.style.alignItems = "center";
+		suspendedDiv.style.gap = "8px";
+
+		const suspendedCheckbox = suspendedDiv.createEl("input", {
+			type: "checkbox",
+			attr: { id: "exclude-suspended" }
+		});
+		suspendedCheckbox.checked = this.excludeSuspended;
+		suspendedCheckbox.onchange = async () => {
+			this.excludeSuspended = suspendedCheckbox.checked;
+			await this.updateStats();
+		};
+
+		const suspendedLabel = suspendedDiv.createEl("label");
+		suspendedLabel.textContent = "⏸️ Exclude suspended cards";
+		suspendedLabel.style.cursor = "pointer";
+		suspendedLabel.onclick = async () => {
+			suspendedCheckbox.checked = !suspendedCheckbox.checked;
+			if (suspendedCheckbox.onchange) {
+				await (suspendedCheckbox.onchange as () => Promise<void>)();
+			}
+		};
+
+		// Flagged cards option
+		const flaggedDiv = filterSection.createDiv();
+		flaggedDiv.style.marginBottom = "8px";
+		flaggedDiv.style.display = "flex";
+		flaggedDiv.style.alignItems = "center";
+		flaggedDiv.style.gap = "8px";
+
+		const flaggedCheckbox = flaggedDiv.createEl("input", {
+			type: "checkbox",
+			attr: { id: "exclude-flagged" }
+		});
+		flaggedCheckbox.checked = this.excludeFlagged;
+		flaggedCheckbox.onchange = async () => {
+			this.excludeFlagged = flaggedCheckbox.checked;
+			await this.updateStats();
+		};
+
+		const flaggedLabel = flaggedDiv.createEl("label");
+		flaggedLabel.textContent = "🏁 Exclude flagged cards";
+		flaggedLabel.style.cursor = "pointer";
+		flaggedLabel.onclick = async () => {
+			flaggedCheckbox.checked = !flaggedCheckbox.checked;
+			if (flaggedCheckbox.onchange) {
+				await (flaggedCheckbox.onchange as () => Promise<void>)();
+			}
+		};
+
+		// Comparison mode section
+		const comparisonSection = this.contentEl.createDiv();
+		comparisonSection.style.marginBottom = "16px";
+		comparisonSection.createEl("h3", { text: "Comparison method:" });
+
+		const comparisonDiv = comparisonSection.createDiv();
+		comparisonDiv.style.marginBottom = "8px";
+		comparisonDiv.style.display = "flex";
+		comparisonDiv.style.alignItems = "center";
+		comparisonDiv.style.gap = "8px";
+
+		const comparisonLabel = comparisonDiv.createEl("label");
+		comparisonLabel.textContent = "Compare:";
+		comparisonLabel.style.minWidth = "60px";
+
+		const comparisonSelect = comparisonDiv.createEl("select") as HTMLSelectElement;
+		comparisonSelect.style.flex = "1";
+		comparisonSelect.style.padding = "4px 8px";
+		comparisonSelect.style.border = "1px solid var(--interactive-normal)";
+		comparisonSelect.style.borderRadius = "4px";
+
+		// Add comparison mode options
+		const comparisonOptions = [
+			{ value: ComparisonMode.FRONT, label: "Front only (front-to-front)" },
+			{ value: ComparisonMode.BACK, label: "Back only (back-to-back)" },
+			{ value: ComparisonMode.FRONT_OR_BACK, label: "Front OR Back (max of both)" },
+			{ value: ComparisonMode.FRONT_AND_BACK, label: "Front AND Back (probabilistic)" },
+			{ value: ComparisonMode.FRONT_PLUS_BACK, label: "Front+Back (concatenated)" }
+		];
+
+		for (const option of comparisonOptions) {
+			const optionEl = comparisonSelect.createEl("option", {
+				value: option.value,
+				text: option.label
+			});
+			if (option.value === this.comparisonMode) {
+				optionEl.selected = true;
+			}
+		}
+
+		comparisonSelect.onchange = async () => {
+			this.comparisonMode = comparisonSelect.value as ComparisonMode;
+			await this.updateStats();
+		};
+
+		// Stats display area
+		this.statsEl = this.contentEl.createDiv();
+		this.statsEl.style.marginBottom = "16px";
+		this.statsEl.style.padding = "12px";
+		this.statsEl.style.backgroundColor = "var(--background-secondary)";
+		this.statsEl.style.borderRadius = "6px";
+
+		// Pre-calculate stats for initial state
+		await this.updateStatsForCurrentOptions();
+		this.updateStats();
+
+		const buttonContainer = this.contentEl.createDiv();
+		buttonContainer.style.display = "flex";
+		buttonContainer.style.gap = "10px";
+		buttonContainer.style.justifyContent = "flex-end";
+		buttonContainer.style.marginTop = "20px";
+
+		new ButtonComponent(buttonContainer)
+			.setButtonText("Cancel")
+			.onClick(() => {
+				this.onConfirm(null);
+				this.close();
+			});
+
+		new ButtonComponent(buttonContainer)
+			.setButtonText("Start Analysis")
+			.setCta()
+			.onClick(() => {
+				this.onConfirm({
+					confirmed: true,
+					selectedScope: this.selectedScope,
+					excludeSuspended: this.excludeSuspended,
+					excludeFlagged: this.excludeFlagged,
+					comparisonMode: this.comparisonMode
+				});
+				this.close();
+			});
+	}
+
+	private buildScopeOptions(pathParts: string[]): Array<{ label: string; value: string }> {
+		const options: Array<{ label: string; value: string }> = [];
+
+		// Current note only
+		options.push({
+			label: `📄 Current note only (${this.currentFile.name})`,
+			value: this.currentFile.path
+		});
+
+		// Build folder hierarchy
+		let currentPath = "";
+		for (let i = 0; i < pathParts.length - 1; i++) {
+			currentPath = currentPath ? `${currentPath}/${pathParts[i]}` : pathParts[i];
+			const folderName = pathParts[i];
+			const indent = "  ".repeat(i + 1);
+			options.push({
+				label: `📁 ${indent}${folderName}/ folder`,
+				value: currentPath
+			});
+		}
+
+		// Vault-wide (root)
+		options.push({
+			label: `🏛️ Entire vault`,
+			value: "/"
+		});
+
+		return options;
+	}
+
+	private getCacheKey(scope: string): string {
+		return `${scope}_${this.excludeSuspended}_${this.excludeFlagged}_${this.comparisonMode}`;
+	}
+
+	private async updateStatsForCurrentOptions(): Promise<void> {
+		const cacheKey = this.getCacheKey(this.selectedScope);
+		if (!this.scopeStats[cacheKey]) {
+			await this.calculateStatsForScope(this.selectedScope);
+		}
+	}
+
+	private async calculateStatsForScope(scope: string): Promise<void> {
+		const allDeckFiles = this.plugin.app.vault
+			.getFiles()
+			.filter((f) => f.name === DECK_FILE_NAME);
+
+		let totalCards = 0;
+		let totalComparisons = 0;
+
+		const filteredDeckFiles = allDeckFiles.filter(deckFile => {
+			if (scope === this.currentFile.path) {
+				return deckFile.path === this.plugin.getDeckPathForNote(this.currentFile.path);
+			} else if (scope === "/") {
+				return true;
+			} else {
+				return deckFile.path.startsWith(scope);
+			}
+		});
+
+		for (const deckFile of filteredDeckFiles) {
+			try {
+				const deck = await this.plugin.readDeck(deckFile.path);
+				const allDeckCards = Object.values(deck);
+
+				// Apply polyglot filtering
+				let targetCards = this.isPolyglotMode
+					? allDeckCards.filter(card => this.plugin.isPolyglotCard(card))
+					: allDeckCards.filter(card => !this.plugin.isPolyglotCard(card));
+
+				// Apply suspended/flagged filtering
+				targetCards = targetCards.filter(card => {
+					if (card.suspended && this.excludeSuspended) return false;
+					if (card.flagged && this.excludeFlagged) return false;
+					return true;
+				});
+
+				if (targetCards.length >= 2) {
+					const deckComparisons = (targetCards.length * (targetCards.length - 1)) / 2;
+					totalComparisons += deckComparisons;
+					totalCards += targetCards.length;
+				}
+			} catch (error) {
+				continue;
+			}
+		}
+
+		const cacheKey = this.getCacheKey(scope);
+		this.scopeStats[cacheKey] = { cards: totalCards, comparisons: totalComparisons };
+	}
+
+	private async updateStats(): Promise<void> {
+		// Ensure stats are calculated for current options
+		await this.updateStatsForCurrentOptions();
+
+		const cacheKey = this.getCacheKey(this.selectedScope);
+		const stats = this.scopeStats[cacheKey] || { cards: 0, comparisons: 0 };
+
+		this.statsEl.empty();
+		this.statsEl.createEl("strong", { text: "Analysis scope:" });
+		this.statsEl.createEl("br");
+		this.statsEl.createSpan({ text: `• ${stats.cards.toLocaleString()} ${this.cardTypeText} cards found` });
+		this.statsEl.createEl("br");
+		this.statsEl.createSpan({ text: `• ${stats.comparisons.toLocaleString()} total comparisons needed` });
+
+		if (stats.comparisons > 1000000) {
+			const warningEl = this.statsEl.createEl("p");
+			warningEl.style.color = "var(--text-warning)";
+			warningEl.style.marginTop = "8px";
+			warningEl.createEl("strong", { text: "⚠️ Large dataset detected" });
+			warningEl.createEl("br");
+			warningEl.createSpan({ text: "This analysis may take several minutes to complete." });
+		}
+	}
+
+	onClose() {
+		this.contentEl.empty();
+	}
+}
+
 class BulkVariantsConfirmModal extends Modal {
 	constructor(
 		private plugin: GatedNotesPlugin,
@@ -21562,6 +22974,235 @@ class BulkVariantsConfirmModal extends Modal {
 				this.onConfirm(true);
 				this.close();
 			});
+	}
+
+	onClose() {
+		this.contentEl.empty();
+	}
+}
+
+class LlmEditModal extends Modal {
+	private editRequest: string = "";
+	private originalText: string = "";
+	private file: TFile;
+	private tags: string[];
+	private plugin: GatedNotesPlugin;
+
+	constructor(app: App, file: TFile, originalText: string, tags: string[], plugin: GatedNotesPlugin) {
+		super(app);
+		this.file = file;
+		this.originalText = originalText;
+		this.tags = tags;
+		this.plugin = plugin;
+	}
+
+	onOpen() {
+		const { contentEl } = this;
+		contentEl.createEl("h2", { text: "LLM-Assisted Note Editing" });
+
+		// Warning about flashcard tags if they exist
+		if (this.tags.length > 0) {
+			const warningEl = contentEl.createDiv("gn-llm-edit-warning");
+			warningEl.innerHTML = `
+				<strong>⚠️ Warning:</strong> This note contains ${this.tags.length} flashcard tag(s).
+				LLM edits may break flashcard functionality. Review changes carefully before accepting.
+			`;
+			warningEl.style.cssText = `
+				background: #fef7cd;
+				border: 1px solid #f59e0b;
+				border-radius: 6px;
+				padding: 12px;
+				margin: 16px 0;
+				color: #92400e;
+			`;
+		}
+
+		// Edit request input
+		contentEl.createEl("h3", { text: "Describe your desired changes:" });
+		const textareaEl = contentEl.createEl("textarea", {
+			placeholder: "Example: Add footnotes parenthetically, improve clarity, fix grammar..."
+		});
+		textareaEl.style.cssText = `
+			width: 100%;
+			height: 100px;
+			margin-bottom: 16px;
+			padding: 8px;
+			border: 1px solid var(--background-modifier-border);
+			border-radius: 4px;
+			resize: vertical;
+		`;
+		textareaEl.addEventListener("input", (e) => {
+			this.editRequest = (e.target as HTMLTextAreaElement).value;
+		});
+
+		// Buttons
+		const buttonContainer = contentEl.createDiv();
+		buttonContainer.style.cssText = `
+			display: flex;
+			gap: 8px;
+			justify-content: flex-end;
+			margin-top: 16px;
+		`;
+
+		new ButtonComponent(buttonContainer)
+			.setButtonText("Cancel")
+			.onClick(() => this.close());
+
+		const generateButton = new ButtonComponent(buttonContainer)
+			.setButtonText("Generate Edit")
+			.setCta()
+			.setDisabled(true)
+			.onClick(() => this.generateEdit());
+
+		// Enable/disable generate button based on input
+		textareaEl.addEventListener("input", () => {
+			this.editRequest = textareaEl.value;
+			const shouldEnable = !!this.editRequest.trim();
+			generateButton.setDisabled(!shouldEnable);
+		});
+	}
+
+	private async generateEdit() {
+
+		if (!this.editRequest.trim()) {
+			new Notice("Please describe the changes you want to make.");
+			return;
+		}
+
+		const loadingNotice = new Notice("Generating edit with LLM...", 0);
+
+		try {
+			// Prepare LLM prompt
+			const prompt = `Please edit the following text based on this request: "${this.editRequest}"
+
+Original text:
+${this.originalText}
+
+Return only the edited text, maintaining the original structure and formatting as much as possible.`;
+
+			// Make LLM call
+			const response = await this.plugin.sendToLlm(prompt);
+
+			const editedText = response.content.trim();
+			loadingNotice.hide();
+
+			// Show diff view
+			this.showDiffView(editedText);
+
+		} catch (error) {
+			loadingNotice.hide();
+			new Notice(`Error generating edit: ${error instanceof Error ? error.message : String(error)}`);
+			console.error("LLM edit error:", error);
+		}
+	}
+
+	private showDiffView(editedText: string) {
+		const { contentEl } = this;
+		contentEl.empty();
+
+		contentEl.createEl("h2", { text: "Review Changes" });
+
+		// Create diff using jsdiff
+		const diff = diffWordsWithSpace(this.originalText, editedText);
+
+		const diffContainer = contentEl.createDiv("gn-diff-container");
+		diffContainer.style.cssText = `
+			font-family: monospace;
+			white-space: pre-wrap;
+			border: 1px solid var(--background-modifier-border);
+			border-radius: 4px;
+			padding: 16px;
+			max-height: 400px;
+			overflow-y: auto;
+			background: var(--background-primary-alt);
+			margin: 16px 0;
+			line-height: 1.5;
+		`;
+
+		// Render diff with syntax highlighting
+		diff.forEach((part: Change) => {
+			const span = diffContainer.createSpan();
+			span.textContent = part.value;
+
+			if (part.added) {
+				span.style.cssText = "background-color: #dcfce7; color: #166534;";
+			} else if (part.removed) {
+				span.style.cssText = "background-color: #fef2f2; color: #dc2626; text-decoration: line-through;";
+			}
+		});
+
+		// Highlight existing flashcard tags in the edited text
+		if (this.tags.length > 0) {
+			this.highlightTagsInDiff(diffContainer, editedText);
+		}
+
+		// Show stats
+		const statsEl = contentEl.createDiv("gn-diff-stats");
+		const addedCount = diff.filter((p: Change) => p.added).reduce((acc: number, p: Change) => acc + p.value.length, 0);
+		const removedCount = diff.filter((p: Change) => p.removed).reduce((acc: number, p: Change) => acc + p.value.length, 0);
+
+		statsEl.innerHTML = `
+			<div style="margin: 8px 0; font-size: 0.9em; color: var(--text-muted);">
+				<span style="color: #166534;">+${addedCount} characters</span> |
+				<span style="color: #dc2626;">-${removedCount} characters</span>
+			</div>
+		`;
+
+		// Buttons
+		const buttonContainer = contentEl.createDiv();
+		buttonContainer.style.cssText = `
+			display: flex;
+			gap: 8px;
+			justify-content: flex-end;
+			margin-top: 16px;
+		`;
+
+		new ButtonComponent(buttonContainer)
+			.setButtonText("Reject")
+			.onClick(() => this.close());
+
+		new ButtonComponent(buttonContainer)
+			.setButtonText("Accept Changes")
+			.setCta()
+			.onClick(() => this.acceptChanges(editedText));
+	}
+
+	private highlightTagsInDiff(diffContainer: HTMLElement, editedText: string) {
+		// Simple tag detection - count how many of our tags are still present in the text
+		const tagsFound = this.tags.filter(tag => {
+			const normalizedText = editedText.toLowerCase();
+			const normalizedTag = tag.toLowerCase();
+			return normalizedText.includes(normalizedTag);
+		});
+
+		// Add tag detection summary
+		const tagSummary = diffContainer.parentElement!.createDiv("gn-tag-summary");
+		tagSummary.innerHTML = `
+			<div style="margin: 8px 0; padding: 8px; background: rgba(255, 235, 59, 0.1); border-radius: 4px; font-size: 0.9em;">
+				📍 Found ${tagsFound.length}/${this.tags.length} flashcard tags in edited text
+			</div>
+		`;
+	}
+
+	private async acceptChanges(editedText: string) {
+		try {
+			// Write the edited text to the file
+			await this.app.vault.modify(this.file, editedText);
+
+			// Recalculate paragraph IDs if flashcards exist
+			if (this.tags.length > 0) {
+				new Notice("Changes applied. Recalculating flashcard paragraph IDs...");
+				await this.plugin.recalculateParaIdx(this.file, false);
+				new Notice("Changes applied and flashcard paragraphs updated successfully!");
+			} else {
+				new Notice("Changes applied successfully!");
+			}
+
+			this.close();
+		} catch (error) {
+			new Notice(`Error applying changes: ${error instanceof Error ? error.message : String(error)}`);
+			console.error("Error applying LLM edit:", error);
+		}
 	}
 
 	onClose() {

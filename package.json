@@ -28,6 +28,8 @@
 	"dependencies": {
 		"@types/jszip": "^3.4.1",
 		"aicost": "^0.1.5",
+		"compromise": "^14.14.4",
+		"diff": "^5.2.0",
 		"gpt-tokenizer": "^3.0.1",
 		"jszip": "^3.10.1",
 		"openai": "^5.13.1",
