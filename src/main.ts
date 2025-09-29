@@ -5574,6 +5574,18 @@ Return ONLY valid JSON of this shape: [{"front":"...","back":"..."}] or [] if no
 							)
 						)
 				);
+
+				menu.addItem((item) =>
+					item
+						.setTitle("Create verbatim flashcards")
+						.setIcon("layers")
+						.onClick(() =>
+							this.createVerbatimFlashcards(
+								selection,
+								view.file!
+							)
+						)
+				);
 			})
 		);
 
@@ -5635,6 +5647,19 @@ Return ONLY valid JSON of this shape: [{"front":"...","back":"..."}] or [] if no
 						)
 					)
 			);
+
+			menu.addItem((item) =>
+				item
+					.setTitle("Create verbatim flashcards")
+					.setIcon("layers")
+					.onClick(() =>
+						this.createVerbatimFlashcards(
+							selection,
+							view.file!
+						)
+					)
+			);
+
 			menu.showAtMouseEvent(evt);
 		});
 	}
@@ -8201,6 +8226,300 @@ ${selection}
 		);
 	}
 
+	private async createVerbatimFlashcards(
+		selectedText: string,
+		mdFile: TFile
+	): Promise<void> {
+		// Show modal to select split type
+		const splitType = await this.showVerbatimSplitModal();
+		if (!splitType) return; // User cancelled
+
+		try {
+			const cards = this.generateVerbatimFlashcards(
+				selectedText,
+				splitType.mode,
+				splitType.delimiter,
+				splitType.name
+			);
+
+			if (cards.length === 0) {
+				new Notice("No cards generated from selection.");
+				return;
+			}
+
+			// Add all cards to the deck
+			const deckPath = getDeckPathForChapter(mdFile.path);
+			const graph = await this.readDeck(deckPath);
+
+			for (const cardData of cards) {
+				const card = this.createCardObject({
+					front: cardData.front,
+					back: cardData.back,
+					tag: cardData.metadata.anchor,
+					chapter: mdFile.path,
+					// Store verbatim metadata in the card
+					...cardData.metadata
+				});
+				graph[card.id] = card;
+			}
+
+			await this.writeDeck(deckPath, graph);
+
+			new Notice(`✅ Created ${cards.length} verbatim flashcards.`);
+			this.refreshAllStatuses();
+
+		} catch (error) {
+			this.logger(LogLevel.NORMAL, "Error creating verbatim flashcards:", error);
+			new Notice("❌ Failed to create verbatim flashcards.");
+		}
+	}
+
+	private async showVerbatimSplitModal(): Promise<{mode: "word" | "line" | "sentence" | "custom", delimiter?: string, name?: string} | null> {
+		return new Promise((resolve) => {
+			const modal = new Modal(this.app);
+			modal.titleEl.textContent = "Verbatim Flashcards - Choose Split Type";
+
+			let selectedMode: "word" | "line" | "sentence" | "custom" = "word";
+			let customDelimiter = "|";
+			let verbatimName = "";
+
+			const content = modal.contentEl;
+
+			// Optional name field
+			const nameSection = content.createDiv({ cls: "verbatim-name-section" });
+			nameSection.style.marginBottom = "20px";
+
+			const nameLabel = nameSection.createEl("label", {
+				text: "Name (optional):",
+				cls: "verbatim-name-label"
+			});
+			nameLabel.style.display = "block";
+			nameLabel.style.marginBottom = "5px";
+			nameLabel.style.fontWeight = "bold";
+
+			const nameInput = nameSection.createEl("input", {
+				type: "text",
+				placeholder: "e.g., Psalm 23, Ozymandias, Introduction, etc.",
+				value: verbatimName
+			});
+			nameInput.style.width = "100%";
+			nameInput.style.marginBottom = "5px";
+			nameInput.addEventListener("input", () => {
+				verbatimName = nameInput.value;
+			});
+
+			const nameDesc = nameSection.createDiv({
+				text: "Give this text a name to help identify it during review",
+				cls: "verbatim-name-description"
+			});
+			nameDesc.style.fontSize = "0.9em";
+			nameDesc.style.color = "var(--text-muted)";
+			nameDesc.style.fontStyle = "italic";
+
+			// Split type radio buttons
+			const radioGroup = content.createDiv({ cls: "verbatim-split-options" });
+
+			const modes = [
+				{ value: "word", label: "Word by word", description: "Each word becomes a separate card" },
+				{ value: "line", label: "Line by line", description: "Each line becomes a separate card" },
+				{ value: "sentence", label: "Sentence by sentence", description: "Each sentence becomes a separate card" },
+				{ value: "custom", label: "Custom delimiter", description: "Split using a custom character or string" }
+			] as const;
+
+			modes.forEach(mode => {
+				const option = radioGroup.createDiv({ cls: "verbatim-option" });
+
+				const radio = option.createEl("input", {
+					type: "radio",
+					attr: { name: "split-mode", value: mode.value }
+				});
+				if (mode.value === "word") radio.checked = true;
+
+				radio.addEventListener("change", () => {
+					if (radio.checked) {
+						selectedMode = mode.value;
+						delimiterInput.style.display = mode.value === "custom" ? "block" : "none";
+					}
+				});
+
+				const label = option.createEl("label");
+				label.appendChild(radio);
+				label.appendText(` ${mode.label}`);
+
+				const desc = option.createDiv({ cls: "verbatim-description", text: mode.description });
+			});
+
+			// Custom delimiter input (initially hidden)
+			const delimiterInput = content.createEl("input", {
+				type: "text",
+				placeholder: "Enter delimiter (e.g., |, ;;, --)",
+				value: customDelimiter
+			});
+			delimiterInput.style.display = "none";
+			delimiterInput.style.marginTop = "10px";
+			delimiterInput.addEventListener("input", () => {
+				customDelimiter = delimiterInput.value;
+			});
+
+			// Buttons
+			const buttonContainer = content.createDiv({ cls: "modal-button-container" });
+			buttonContainer.style.cssText = "display: flex; gap: 10px; justify-content: flex-end; margin-top: 20px;";
+
+			const cancelBtn = buttonContainer.createEl("button", { text: "Cancel" });
+			cancelBtn.addEventListener("click", () => {
+				modal.close();
+				resolve(null);
+			});
+
+			const createBtn = buttonContainer.createEl("button", { text: "Create Flashcards", cls: "mod-cta" });
+			createBtn.addEventListener("click", () => {
+				modal.close();
+				resolve({
+					mode: selectedMode,
+					delimiter: selectedMode === "custom" ? customDelimiter : undefined,
+					name: verbatimName.trim() || undefined
+				});
+			});
+
+			modal.open();
+		});
+	}
+
+	private generateVerbatimFlashcards(
+		selectedText: string,
+		mode: "word" | "line" | "sentence" | "custom",
+		delimiter?: string,
+		name?: string
+	): Array<{
+		front: string;
+		back: string;
+		metadata: {
+			cardType: "verbatim";
+			unitIndex: number;
+			totalUnits: number;
+			anchor: string;
+		};
+	}> {
+		let units: string[] = [];
+		let allLines: string[] = []; // Keep original structure for line mode
+
+		// Split the text based on the mode
+		switch (mode) {
+			case "word":
+				units = selectedText.split(/\s+/).filter(unit => unit.trim().length > 0);
+				break;
+			case "line":
+				// Split by lines but keep track of original structure for context
+				allLines = selectedText.split(/\r?\n/);
+				// Only create cards for non-empty lines, but preserve empty lines for context
+				units = allLines.filter(line => line.trim().length > 0);
+				break;
+			case "sentence":
+				// Simple sentence splitting - could be enhanced with better regex
+				units = selectedText.split(/[.!?]+/).filter(unit => unit.trim().length > 0);
+				break;
+			case "custom":
+				if (delimiter) {
+					units = selectedText.split(delimiter).filter(unit => unit.trim().length > 0);
+				} else {
+					units = [selectedText]; // Fallback if no delimiter provided
+				}
+				break;
+		}
+
+		// Helper function to generate cues with progress indicators
+		const makeCue = (mode: string, index: number, total: number): string => {
+			const position = index + 1;
+			switch (mode) {
+				case "word":
+					return index === 0
+						? `Word ${position} of ${total} — First word?`
+						: `Word ${position} of ${total} — Next word?`;
+				case "line":
+					return index === 0
+						? `Line ${position} of ${total} — First line?`
+						: `Line ${position} of ${total} — Next line?`;
+				case "sentence":
+					return index === 0
+						? `Sentence ${position} of ${total} — First sentence?`
+						: `Sentence ${position} of ${total} — Next sentence?`;
+				case "custom":
+					return index === 0
+						? `Chunk ${position} of ${total} — First chunk?`
+						: `Chunk ${position} of ${total} — Next chunk?`;
+				default:
+					return `Item ${position} of ${total} — Continue?`;
+			}
+		};
+
+		// Generate progressive flashcards with consistent cueing
+		const cards = units.map((_, index) => {
+			let front: string;
+
+			// Build the front with optional name header
+			const nameHeader = name ? `**${name}**\n\n` : "";
+
+			if (index === 0) {
+				// First card gets initial cue
+				const cue = makeCue(mode, index, units.length);
+				front = `${nameHeader}${cue}`;
+			} else {
+				// Subsequent cards show previous context + cue
+				let context: string;
+				if (mode === "line") {
+					// For line mode, use original structure to preserve stanza breaks
+					// Find how many non-empty lines we've processed so far
+					let nonEmptyCount = 0;
+					let contextLines: string[] = [];
+
+					for (const line of allLines) {
+						if (line.trim().length > 0) {
+							nonEmptyCount++;
+							if (nonEmptyCount <= index) {
+								contextLines.push(line);
+							} else {
+								break;
+							}
+						} else {
+							// Include empty lines in context if we haven't reached our target count
+							if (nonEmptyCount < index) {
+								contextLines.push(line);
+							}
+						}
+					}
+					context = contextLines.join("\n");
+				} else {
+					// For other modes, use the simple approach
+					const frontUnits = units.slice(0, index);
+					const separator = mode === "sentence" ? ". " : mode === "word" ? " " : (delimiter || " ");
+					context = frontUnits.join(separator);
+				}
+
+				const cue = makeCue(mode, index, units.length);
+				front = `${nameHeader}${context}\n\n${cue}`;
+			}
+
+			// Back contains only the current unit
+			const back = units[index].trim();
+
+			// Create unique anchor for this card
+			const anchor = `verbatim_${mode}_${index + 1}_of_${units.length}`;
+
+			return {
+				front: front,
+				back: back,
+				metadata: {
+					cardType: "verbatim" as const,
+					unitIndex: index,
+					totalUnits: units.length,
+					anchor: anchor
+				}
+			};
+		});
+
+		return cards;
+	}
+
 	/**
 	 * Creates a new flashcard object with default values for spaced repetition.
 	 * @param data The core data for the flashcard (front, back, tag, chapter).
@@ -8803,6 +9122,89 @@ ${selection}
 			const modal = new Modal(this.app);
 			makeModalDraggable(modal, this);
 
+			// Add keyboard event listener for review shortcuts
+			let easeButtons: { [key: string]: ButtonComponent } = {};
+			let revealButton: ButtonComponent | null = null;
+
+			const handleKeyPress = (event: KeyboardEvent) => {
+				// Only handle keystrokes if the modal is open and no input elements are active
+				const activeElement = document.activeElement;
+				if (activeElement && (activeElement.tagName === 'INPUT' || activeElement.tagName === 'TEXTAREA')) {
+					return;
+				}
+
+				// Check if the modal is still open and visible
+				if (!modal.modalEl || !modal.modalEl.isConnected || modal.modalEl.style.display === 'none') {
+					return;
+				}
+
+				switch (event.key) {
+					case '0':
+						event.preventDefault();
+						event.stopPropagation();
+						if (easeButtons['Again']) {
+							easeButtons['Again'].buttonEl.click();
+						}
+						break;
+					case '1':
+						event.preventDefault();
+						event.stopPropagation();
+						if (easeButtons['Hard']) {
+							easeButtons['Hard'].buttonEl.click();
+						}
+						break;
+					case '2':
+						event.preventDefault();
+						event.stopPropagation();
+						if (easeButtons['Good']) {
+							easeButtons['Good'].buttonEl.click();
+						}
+						break;
+					case '3':
+						event.preventDefault();
+						event.stopPropagation();
+						if (easeButtons['Easy']) {
+							easeButtons['Easy'].buttonEl.click();
+						}
+						break;
+					case 'Enter':
+						// Only handle Enter for reveal button, not for focused ease buttons
+						if (document.activeElement && document.activeElement.classList.contains('mod-cta')) {
+							// This is likely the reveal/show answer button
+							event.preventDefault();
+							event.stopPropagation();
+							if (revealButton) {
+								revealButton.buttonEl.click();
+							}
+						}
+						break;
+				}
+			};
+
+			// Add the event listener to the document
+			document.addEventListener('keydown', handleKeyPress);
+
+			// Clean up event listener when modal closes
+			let isModalClosed = false;
+			const originalOnClose = modal.onClose;
+			modal.onClose = () => {
+				if (!isModalClosed) {
+					isModalClosed = true;
+					document.removeEventListener('keydown', handleKeyPress);
+					if (originalOnClose) originalOnClose();
+				}
+			};
+
+			// Also clean up if modal is somehow destroyed without calling onClose
+			const observer = new MutationObserver(() => {
+				if (!modal.modalEl.isConnected && !isModalClosed) {
+					isModalClosed = true;
+					document.removeEventListener('keydown', handleKeyPress);
+					observer.disconnect();
+				}
+			});
+			observer.observe(document.body, { childList: true, subtree: true });
+
 			const pathParts = card.chapter.split("/");
 			const subject = pathParts.length > 1 ? pathParts[0] : "Vault";
 			const chapterName = (pathParts.pop() || card.chapter).replace(
@@ -8843,6 +9245,9 @@ ${selection}
 				.setButtonText("Show Answer")
 				.setCta();
 
+			// Store reference for keyboard shortcuts
+			revealButton = revealBtn;
+
 			const mnemonicBtn = new ButtonComponent(bottomBar)
 				.setIcon("brain")
 				.setTooltip("View mnemonics")
@@ -8869,62 +9274,78 @@ ${selection}
 
 				(["Again", "Hard", "Good", "Easy"] as const).forEach(
 					(lbl: CardRating) => {
-						new ButtonComponent(easeButtonContainer)
+						let isProcessing = false;
+						const easeBtn = new ButtonComponent(easeButtonContainer)
 							.setButtonText(lbl)
 							.onClick(async () => {
-								const deckPath = getDeckPathForChapter(
-									card.chapter
-								);
-								const graph = await this.readDeck(deckPath);
-								const cardInGraph = graph[card.id];
-
-								if (!cardInGraph) {
-									modal.close();
+								// Prevent multiple simultaneous executions
+								if (isProcessing) {
 									return;
 								}
+								isProcessing = true;
 
-								const gateBefore =
-									await this.getFirstBlockedParaIndex(
-										card.chapter,
-										graph
+								try {
+									const deckPath = getDeckPathForChapter(
+										card.chapter
+									);
+									const graph = await this.readDeck(deckPath);
+									const cardInGraph = graph[card.id];
+
+									if (!cardInGraph) {
+										modal.close();
+										return;
+									}
+
+									const gateBefore =
+										await this.getFirstBlockedParaIndex(
+											card.chapter,
+											graph
+										);
+
+									this.applySm2(cardInGraph, lbl);
+
+									const dueTimeText = this.formatDueTime(
+										cardInGraph.due,
+										Date.now(),
+										cardInGraph.status
+									);
+									new Notice(
+										`Card will be due again in ${dueTimeText}`,
+										3000
 									);
 
-								this.applySm2(cardInGraph, lbl);
+									const gateAfter =
+										await this.getFirstBlockedParaIndex(
+											card.chapter,
+											graph
+										);
 
-								const dueTimeText = this.formatDueTime(
-									cardInGraph.due,
-									Date.now(),
-									cardInGraph.status
-								);
-								new Notice(
-									`Card will be due again in ${dueTimeText}`,
-									3000
-								);
+									await this.writeDeck(deckPath, graph);
 
-								const gateAfter =
-									await this.getFirstBlockedParaIndex(
-										card.chapter,
-										graph
-									);
+									if (gateBefore !== gateAfter) {
+										this.logger(
+											LogLevel.VERBOSE,
+											`Gate moved from ${gateBefore} to ${gateAfter}. Refreshing view.`
+										);
+										await this.refreshReadingAndPreserveScroll();
+									} else {
+										this.logger(
+											LogLevel.VERBOSE,
+											`Gate unchanged at ${gateBefore}. Skipping view refresh.`
+										);
+									}
 
-								await this.writeDeck(deckPath, graph);
-
-								if (gateBefore !== gateAfter) {
-									this.logger(
-										LogLevel.VERBOSE,
-										`Gate moved from ${gateBefore} to ${gateAfter}. Refreshing view.`
-									);
-									await this.refreshReadingAndPreserveScroll();
-								} else {
-									this.logger(
-										LogLevel.VERBOSE,
-										`Gate unchanged at ${gateBefore}. Skipping view refresh.`
-									);
+									state = lbl === "Again" ? "again" : "answered";
+									modal.close();
+								} catch (error) {
+									console.error('Error processing card rating:', error);
+								} finally {
+									isProcessing = false;
 								}
-
-								state = lbl === "Again" ? "again" : "answered";
-								modal.close();
 							});
+
+						// Store reference for keyboard shortcuts
+						easeButtons[lbl] = easeBtn;
 					}
 				);
 				modal.contentEl.insertBefore(easeButtonContainer, bottomBar);
@@ -20476,6 +20897,9 @@ const isBuried = (card: Flashcard): boolean => {
  */
 const isBlockingGating = (card: Flashcard): boolean => {
 	if (!card.blocked || card.suspended) return false;
+
+	// Verbatim cards never block content gating
+	if (card.tag && card.tag.includes("verbatim_")) return false;
 
 	// If card is buried but due time hasn't passed yet, don't block
 	if (card.buried && card.due > Date.now()) return false;
