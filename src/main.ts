@@ -188,17 +188,33 @@ interface FlashcardGraph {
  * Defines the settings for the Gated Notes plugin.
  */
 interface Settings {
+	// Flashcard Generation (Primary)
 	openaiApiKey: string;
 	openaiModel: string;
 	openaiTemperature: number;
-	availableModels: string[];
+	availableOpenaiModels: string[];
+	availableLmStudioModels: string[];
+	apiProvider: "openai" | "lmstudio";
+	lmStudioUrl: string;
+	lmStudioModel: string;
+
+	// Refocus/Split Operations
+	refocusApiProvider: "match" | "openai" | "lmstudio";
+	refocusOpenaiModel: string;
+	refocusLmStudioUrl: string;
+	refocusLmStudioModel: string;
+
+	// Variant Generation
+	variantApiProvider: "match" | "openai" | "lmstudio";
+	variantOpenaiModel: string;
+	variantLmStudioUrl: string;
+	variantLmStudioModel: string;
+
+	// Other settings
 	learningSteps: number[];
 	relearnSteps: number[];
 	buryDelayHours: number;
 	gatingEnabled: boolean;
-	apiProvider: "openai" | "lmstudio";
-	lmStudioUrl: string;
-	lmStudioModel: string;
 	logLevel: LogLevel;
 	autoCorrectTags: boolean;
 	maxTagCorrectionRetries: number;
@@ -231,17 +247,33 @@ interface Settings {
 }
 
 const DEFAULT_SETTINGS: Settings = {
+	// Flashcard Generation (Primary)
 	openaiApiKey: "",
 	openaiModel: "gpt-4o",
 	openaiTemperature: 0,
-	availableModels: [],
+	availableOpenaiModels: [],
+	availableLmStudioModels: [],
+	apiProvider: "openai",
+	lmStudioUrl: "http://localhost:1234",
+	lmStudioModel: "",
+
+	// Refocus/Split Operations
+	refocusApiProvider: "match",
+	refocusOpenaiModel: "gpt-4o",
+	refocusLmStudioUrl: "http://localhost:1234",
+	refocusLmStudioModel: "",
+
+	// Variant Generation
+	variantApiProvider: "match",
+	variantOpenaiModel: "gpt-4o",
+	variantLmStudioUrl: "http://localhost:1234",
+	variantLmStudioModel: "",
+
+	// Other settings
 	learningSteps: [1, 10],
 	relearnSteps: [10],
 	buryDelayHours: 24,
 	gatingEnabled: true,
-	apiProvider: "openai",
-	lmStudioUrl: "http://localhost:1234",
-	lmStudioModel: "",
 	logLevel: LogLevel.NORMAL,
 	autoCorrectTags: true,
 	maxTagCorrectionRetries: 2,
@@ -4790,7 +4822,7 @@ fetchImages: true
 **Cards to Refocus:**
 ${JSON.stringify(cardsForLlm, null, 2)}`;
 
-		const { content: response, usage } = await this.sendToLlm(basePrompt);
+		const { content: response, usage } = await this.sendToLlm(basePrompt, [], {}, "refocus");
 
 		if (!response) {
 			throw new Error("LLM returned an empty response.");
@@ -4895,7 +4927,7 @@ ${promptVariants}
 
 Return ONLY valid JSON of this shape: [{"front":"...","back":"..."}] or [] if no good variants possible`;
 
-		const { content: response, usage } = await this.sendToLlm(prompt);
+		const { content: response, usage } = await this.sendToLlm(prompt, [], {}, "variant");
 
 		if (!response) {
 			throw new Error("LLM returned an empty response.");
@@ -4954,7 +4986,8 @@ Return ONLY valid JSON of this shape: [{"front":"...","back":"..."}] or [] if no
 			if (!confirmed) return;
 
 			// Execute bulk refocus with single LLM call
-			const notice = new Notice(`🔄 Refocusing ${noteCards.length} cards...`, 0);
+			const providerModelDesc = this.getProviderModelDescription("refocus");
+			const notice = new Notice(`🔄 Refocusing ${noteCards.length} cards using ${providerModelDesc}...`, 0);
 
 			try {
 				const refocusResults = await this.executeBulkRefocus(noteCards);
@@ -4992,7 +5025,8 @@ Return ONLY valid JSON of this shape: [{"front":"...","back":"..."}] or [] if no
 				}
 
 				await this.writeDeck(deckPath, deck);
-				new Notice(`✅ Bulk refocus complete: ${totalAdded} new cards created`);
+				const providerModelDesc = this.getProviderModelDescription("refocus");
+				new Notice(`✅ Bulk refocus complete: ${totalAdded} new cards created using ${providerModelDesc}`);
 
 			} catch (error) {
 				notice.hide();
@@ -6768,7 +6802,8 @@ Generate Anki-style flashcards based on the following content, targeting approxi
 ${contextPrompt}Content:
 ${plainTextForLlm}`;
 
-		notice.setMessage(`🤖 Generating ${count} flashcard(s)...`);
+		const providerDesc = this.getProviderModelDescription("flashcard");
+		notice.setMessage(`🤖 Generating ${count} flashcard(s) using ${providerDesc}...`);
 		const { content: response, usage } = await this.sendToLlm(
 			initialPrompt
 		);
@@ -6964,7 +6999,8 @@ ${JSON.stringify(sourceText)}
 		file: TFile,
 		paraIdx: number
 	): Promise<void> {
-		new Notice("🤖 Generating card with AI...");
+		const providerDesc = this.getProviderModelDescription("flashcard");
+		new Notice(`🤖 Generating card with AI using ${providerDesc}...`);
 
 		const prompt = `Based on the following content, create a single, concise flashcard. The card should be self-contained and not reference "the text" or "this content".
 **Formatting Rule:** Preserve all Markdown formatting, especially LaTeX math expressions (e.g., \`$ ... $\` and \`$$ ... $$\`), in the "front" and "back" fields.
@@ -6976,7 +7012,7 @@ ${selection}
 """`;
 
 		try {
-			const { content: response, usage } = await this.sendToLlm(prompt);
+			const { content: response, usage } = await this.sendToLlm(prompt, [], {}, "flashcard");
 			if (!response) throw new Error("AI returned an empty response.");
 
 			const jsonMatch = response.match(/\{[\s\S]*\}/);
@@ -7039,8 +7075,9 @@ ${selection}
 	): Promise<void> {
 		new CountModal(this, 1, selection, file.path, async (count) => {
 			if (count <= 0) return;
+			const providerDesc = this.getProviderModelDescription("flashcard");
 			const notice = new Notice(
-				`🤖 Generating ${count} card(s) from selection...`,
+				`🤖 Generating ${count} card(s) from selection using ${providerDesc}...`,
 				0
 			);
 
@@ -9943,6 +9980,7 @@ ${selection}
 	 * @param prompt The text prompt to send.
 	 * @param imageUrl Optional base64-encoded image URL for multimodal requests.
 	 * @param options Optional settings to override the default model, temperature, etc.
+	 * @param operationType The type of operation to determine which provider settings to use.
 	 * @returns A promise that resolves to an object containing the LLM's response content and usage statistics.
 	 */
 	public async sendToLlm(
@@ -9952,16 +9990,20 @@ ${selection}
 			maxTokens?: number;
 			temperature?: number;
 			model?: string;
-		} = {}
+		} = {},
+		operationType: "flashcard" | "refocus" | "variant" = "flashcard"
 	): Promise<{ content: string; usage?: OpenAI.CompletionUsage }> {
-		if (!this.openai) {
+		// Get the appropriate OpenAI client and provider settings for this operation type
+		const openaiClient = this.getOpenAIClientForOperation(operationType);
+		if (!openaiClient) {
 			new Notice("AI client is not configured. Check plugin settings.");
 			return { content: "" };
 		}
 
-		const { apiProvider, lmStudioModel, openaiTemperature } = this.settings;
+		const providerSettings = this.getProviderSettings(operationType);
+		const { provider, openaiModel, lmStudioModel } = providerSettings;
 
-		if (apiProvider === "lmstudio" && imageUrl) {
+		if (provider === "lmstudio" && imageUrl) {
 			new Notice("Image analysis is not supported with LM Studio.");
 			return { content: "" };
 		}
@@ -9972,10 +10014,15 @@ ${selection}
 		} else if (imageUrl) {
 			model = this.settings.openaiMultimodalModel;
 		} else {
-			model =
-				apiProvider === "openai"
-					? this.settings.openaiModel
-					: lmStudioModel;
+			model = provider === "openai" ? openaiModel : lmStudioModel;
+		}
+
+		// Check if model is empty/not selected
+		if (!model || model.trim() === "") {
+			const operationName = operationType === "flashcard" ? "flashcard generation" :
+								  operationType === "refocus" ? "refocus/split operations" : "variant generation";
+			new Notice(`No ${provider} model selected for ${operationName}. Please select a model in the plugin settings.`);
+			return { content: "" };
 		}
 
 		try {
@@ -10000,7 +10047,7 @@ ${selection}
 			const payload: OpenAI.Chat.Completions.ChatCompletionCreateParams =
 				{
 					model,
-					temperature: options.temperature ?? openaiTemperature,
+					temperature: options.temperature ?? this.settings.openaiTemperature,
 					messages: [{ role: "user", content: messageContent }],
 				};
 
@@ -10010,7 +10057,7 @@ ${selection}
 
 			this.logger(LogLevel.VERBOSE, "Sending payload to LLM:", payload);
 
-			const response = await this.openai.chat.completions.create(payload);
+			const response = await openaiClient.chat.completions.create(payload);
 
 			this.logger(
 				LogLevel.VERBOSE,
@@ -10030,30 +10077,157 @@ ${selection}
 				usage: response.usage,
 			};
 		} catch (e: unknown) {
-			this.logger(LogLevel.NORMAL, `API Error for ${apiProvider}:`, e);
-			new Notice(`${apiProvider} API error – see developer console.`);
+			this.logger(LogLevel.NORMAL, `API Error for ${provider}:`, e);
+			new Notice(`${provider} API error – see developer console.`);
 			return { content: "" };
 		}
 	}
 
 	/**
-	 * Fetches the list of available models from the configured AI provider.
+	 * Gets the appropriate OpenAI client for a specific operation type.
+	 * @param operationType The type of operation (flashcard, refocus, variant)
+	 * @returns An OpenAI client instance configured for this operation
+	 */
+	private getOpenAIClientForOperation(operationType: "flashcard" | "refocus" | "variant"): OpenAI | null {
+		const providerSettings = this.getProviderSettings(operationType);
+		const { provider, openaiApiKey, lmStudioUrl } = providerSettings;
+
+		if (provider === "openai") {
+			if (!openaiApiKey) {
+				return null;
+			}
+
+			const customFetch = async (
+				url: RequestInfo | URL,
+				init?: RequestInit
+			): Promise<Response> => {
+				const headers: Record<string, string> = {};
+				if (init?.headers) {
+					new Headers(init.headers).forEach((value, key) => {
+						headers[key] = value;
+					});
+				}
+
+				const requestParams: RequestUrlParam = {
+					url: url.toString(),
+					method: init?.method ?? "GET",
+					headers: headers,
+					body: init?.body as string | ArrayBuffer,
+					throw: false,
+				};
+				const obsidianResponse = await requestUrl(requestParams);
+				return new Response(obsidianResponse.arrayBuffer, {
+					status: obsidianResponse.status,
+					headers: new Headers(obsidianResponse.headers),
+				});
+			};
+
+			return new OpenAI({
+				apiKey: openaiApiKey,
+				dangerouslyAllowBrowser: true,
+				fetch: customFetch,
+			});
+		} else {
+			return new OpenAI({
+				baseURL: `${lmStudioUrl.replace(/\/$/, "")}/v1`,
+				apiKey: "lm-studio",
+				dangerouslyAllowBrowser: true,
+			});
+		}
+	}
+
+	/**
+	 * Gets the appropriate provider settings for a specific operation type.
+	 * @param operationType The type of operation (flashcard, refocus, variant)
+	 * @returns The provider settings to use for this operation
+	 */
+	private getProviderSettings(operationType: "flashcard" | "refocus" | "variant"): {
+		provider: "openai" | "lmstudio";
+		openaiModel: string;
+		openaiApiKey: string;
+		lmStudioUrl: string;
+		lmStudioModel: string;
+	} {
+		switch (operationType) {
+			case "flashcard":
+				return {
+					provider: this.settings.apiProvider,
+					openaiModel: this.settings.openaiModel,
+					openaiApiKey: this.settings.openaiApiKey,
+					lmStudioUrl: this.settings.lmStudioUrl,
+					lmStudioModel: this.settings.lmStudioModel,
+				};
+
+			case "refocus":
+				if (this.settings.refocusApiProvider === "match") {
+					return {
+						provider: this.settings.apiProvider,
+						openaiModel: this.settings.openaiModel,
+						openaiApiKey: this.settings.openaiApiKey,
+						lmStudioUrl: this.settings.lmStudioUrl,
+						lmStudioModel: this.settings.lmStudioModel,
+					};
+				} else {
+					return {
+						provider: this.settings.refocusApiProvider,
+						openaiModel: this.settings.refocusOpenaiModel,
+						openaiApiKey: this.settings.openaiApiKey, // Always use the same API key
+						lmStudioUrl: this.settings.refocusLmStudioUrl,
+						lmStudioModel: this.settings.refocusLmStudioModel,
+					};
+				}
+
+			case "variant":
+				if (this.settings.variantApiProvider === "match") {
+					return {
+						provider: this.settings.apiProvider,
+						openaiModel: this.settings.openaiModel,
+						openaiApiKey: this.settings.openaiApiKey,
+						lmStudioUrl: this.settings.lmStudioUrl,
+						lmStudioModel: this.settings.lmStudioModel,
+					};
+				} else {
+					return {
+						provider: this.settings.variantApiProvider,
+						openaiModel: this.settings.variantOpenaiModel,
+						openaiApiKey: this.settings.openaiApiKey, // Always use the same API key
+						lmStudioUrl: this.settings.variantLmStudioUrl,
+						lmStudioModel: this.settings.variantLmStudioModel,
+					};
+				}
+
+			default:
+				// Fallback to flashcard settings
+				return {
+					provider: this.settings.apiProvider,
+					openaiModel: this.settings.openaiModel,
+					openaiApiKey: this.settings.openaiApiKey,
+					lmStudioUrl: this.settings.lmStudioUrl,
+					lmStudioModel: this.settings.lmStudioModel,
+				};
+		}
+	}
+
+	/**
+	 * Fetches the list of available models from a specific AI provider.
+	 * @param provider The provider to fetch models from ("openai" | "lmstudio")
+	 * @param lmStudioUrl The LM Studio URL to use (only needed for lmstudio provider)
 	 * @returns A promise that resolves to an array of model ID strings.
 	 */
-	public async fetchAvailableModels(): Promise<string[]> {
-		const { apiProvider, lmStudioUrl, openaiApiKey } = this.settings;
+	public async fetchAvailableModels(provider: "openai" | "lmstudio", lmStudioUrl?: string): Promise<string[]> {
 		let apiUrl: string;
 		const headers: Record<string, string> = {};
 
-		if (apiProvider === "lmstudio") {
-			apiUrl = `${lmStudioUrl.replace(/\/$/, "")}/v1/models`;
+		if (provider === "lmstudio") {
+			const url = lmStudioUrl || this.settings.lmStudioUrl;
+			apiUrl = `${url.replace(/\/$/, "")}/v1/models`;
 		} else {
-			if (!openaiApiKey) {
+			if (!this.settings.openaiApiKey) {
 				new Notice("OpenAI API key is not set in plugin settings.");
 				return [];
 			}
 			apiUrl = API_URL_MODELS;
-			headers["Authorization"] = `Bearer ${openaiApiKey}`;
+			headers["Authorization"] = `Bearer ${this.settings.openaiApiKey}`;
 		}
 
 		try {
@@ -10065,20 +10239,100 @@ ${selection}
 			const modelIds = response.json.data.map(
 				(m: { id: string }) => m.id
 			) as string[];
-			this.settings.availableModels = modelIds;
+
+			// Update the appropriate model list in settings
+			if (provider === "openai") {
+				this.settings.availableOpenaiModels = modelIds;
+				// Validate and fix selected OpenAI models across all operations
+				this.validateSelectedModels("openai", modelIds);
+			} else {
+				this.settings.availableLmStudioModels = modelIds;
+				// Validate and fix selected LM Studio models across all operations
+				this.validateSelectedModels("lmstudio", modelIds);
+			}
 			await this.saveSettings();
 			return modelIds;
 		} catch (e: unknown) {
 			this.logger(
 				LogLevel.NORMAL,
-				`Error fetching models from ${apiProvider}:`,
+				`Error fetching models from ${provider}:`,
 				e
 			);
 			new Notice(
-				`Could not fetch models from ${apiProvider}. Check settings and console.`
+				`Could not fetch models from ${provider}. Check settings and console.`
 			);
 			return [];
 		}
+	}
+
+	/**
+	 * Validates that all selected models for a provider are still available in the fetched list.
+	 * If a selected model is missing, resets it to empty (requiring user to manually select).
+	 * @param provider The provider whose models were updated
+	 * @param availableModels The new list of available models
+	 */
+	private validateSelectedModels(provider: "openai" | "lmstudio", availableModels: string[]): void {
+		if (provider === "openai") {
+			// Check flashcard generation OpenAI model
+			if (this.settings.openaiModel && !availableModels.includes(this.settings.openaiModel)) {
+				this.settings.openaiModel = "";
+				new Notice(`OpenAI model for flashcard generation was reset (previous model no longer available). Please select a new model in settings.`);
+			}
+
+			// Check refocus OpenAI model
+			if (this.settings.refocusOpenaiModel && !availableModels.includes(this.settings.refocusOpenaiModel)) {
+				this.settings.refocusOpenaiModel = "";
+				new Notice(`OpenAI model for refocus operations was reset (previous model no longer available). Please select a new model in settings.`);
+			}
+
+			// Check variant OpenAI model
+			if (this.settings.variantOpenaiModel && !availableModels.includes(this.settings.variantOpenaiModel)) {
+				this.settings.variantOpenaiModel = "";
+				new Notice(`OpenAI model for variant generation was reset (previous model no longer available). Please select a new model in settings.`);
+			}
+		} else {
+			// Check flashcard generation LM Studio model
+			if (this.settings.lmStudioModel && !availableModels.includes(this.settings.lmStudioModel)) {
+				this.settings.lmStudioModel = "";
+				new Notice(`LM Studio model for flashcard generation was reset (previous model no longer available). Please select a new model in settings.`);
+			}
+
+			// Check refocus LM Studio model
+			if (this.settings.refocusLmStudioModel && !availableModels.includes(this.settings.refocusLmStudioModel)) {
+				this.settings.refocusLmStudioModel = "";
+				new Notice(`LM Studio model for refocus operations was reset (previous model no longer available). Please select a new model in settings.`);
+			}
+
+			// Check variant LM Studio model
+			if (this.settings.variantLmStudioModel && !availableModels.includes(this.settings.variantLmStudioModel)) {
+				this.settings.variantLmStudioModel = "";
+				new Notice(`LM Studio model for variant generation was reset (previous model no longer available). Please select a new model in settings.`);
+			}
+		}
+	}
+
+	/**
+	 * Gets a human-readable description of the provider and model for a given operation type.
+	 * @param operationType The type of operation
+	 * @returns A string like "OpenAI (gpt-4o)" or "LM Studio (local-model)"
+	 */
+	public getProviderModelDescription(operationType: "flashcard" | "refocus" | "variant"): string {
+		const providerSettings = this.getProviderSettings(operationType);
+		const { provider, openaiModel, lmStudioModel } = providerSettings;
+
+		if (provider === "openai") {
+			return `OpenAI (${openaiModel || "no model selected"})`;
+		} else {
+			return `LM Studio (${lmStudioModel || "no model selected"})`;
+		}
+	}
+
+	/**
+	 * Legacy method for backward compatibility - fetches models for the primary flashcard generation provider.
+	 * @returns A promise that resolves to an array of model ID strings.
+	 */
+	public async fetchAvailableModelsLegacy(): Promise<string[]> {
+		return this.fetchAvailableModels(this.settings.apiProvider, this.settings.lmStudioUrl);
 	}
 
 	private async getFirstBlockedParaIndex(
@@ -10109,6 +10363,42 @@ ${selection}
 			DEFAULT_SETTINGS,
 			await this.loadData()
 		);
+
+		// Migrate old availableModels setting to new provider-specific lists
+		await this.migrateSettings();
+	}
+
+	/**
+	 * Migrates old settings structure to new hierarchical provider system.
+	 */
+	private async migrateSettings(): Promise<void> {
+		let needsMigration = false;
+		const data = await this.loadData();
+
+		// Check if we have the old availableModels field
+		if (data && data.availableModels && Array.isArray(data.availableModels)) {
+			// Migrate based on the current API provider
+			if (this.settings.apiProvider === "openai") {
+				this.settings.availableOpenaiModels = data.availableModels;
+			} else {
+				this.settings.availableLmStudioModels = data.availableModels;
+			}
+			needsMigration = true;
+		}
+
+		// Ensure new fields exist even if they weren't in saved data
+		if (!this.settings.availableOpenaiModels) {
+			this.settings.availableOpenaiModels = [];
+			needsMigration = true;
+		}
+		if (!this.settings.availableLmStudioModels) {
+			this.settings.availableLmStudioModels = [];
+			needsMigration = true;
+		}
+
+		if (needsMigration) {
+			await this.saveSettings();
+		}
 	}
 
 	/**
@@ -16801,28 +17091,37 @@ ${Array.from(
   ]
 }`;
 
-		const response = await this.plugin.sendToLlm(prompt, [], {});
+		const providerModelDesc = this.plugin.getProviderModelDescription("variant");
+		const notice = new Notice(`🎲 Generating variants using ${providerModelDesc}...`, 0);
+		try {
+			const response = await this.plugin.sendToLlm(prompt, [], {}, "variant");
+			notice.hide();
 
-		const variants = this.parseVariantResponse(response.content);
+			const variants = this.parseVariantResponse(response.content);
 
-		if (variants && variants.length > 0) {
-			if (!this.card.variants) {
-				this.card.variants = [];
-			}
+			if (variants && variants.length > 0) {
+				if (!this.card.variants) {
+					this.card.variants = [];
+				}
 
-			variants.forEach((variant) => {
-				this.card.variants!.push({
-					front: variant.front.trim(),
-					back: variant.back.trim(),
+				variants.forEach((variant) => {
+					this.card.variants!.push({
+						front: variant.front.trim(),
+						back: variant.back.trim(),
+					});
 				});
-			});
 
-			this.refreshVariantDropdown();
-			this.syncFrontBackWithFirstVariant();
+				this.refreshVariantDropdown();
+				this.syncFrontBackWithFirstVariant();
 
-			new Notice(`✅ Generated ${variants.length} new variants!`);
-		} else {
-			throw new Error("No valid variants were generated");
+				const providerModelDesc = this.plugin.getProviderModelDescription("variant");
+				new Notice(`✅ Generated ${variants.length} new variants using ${providerModelDesc}!`);
+			} else {
+				throw new Error("No valid variants were generated");
+			}
+		} catch (error) {
+			notice.hide();
+			throw error;
 		}
 	}
 
@@ -18043,7 +18342,7 @@ BACK: ${back}${majorSystemContext}${existingMnemonicsContext}
 
 Return only the vivid mental image. Do not explain or label the card type. Do not describe your reasoning. Just output the memory image.`;
 
-			const response = await this.plugin.sendToLlm(prompt);
+			const response = await this.plugin.sendToLlm(prompt, [], {}, "flashcard");
 
 			if (response.content.trim()) {
 				if (existingContentForDisplay) {
@@ -18191,7 +18490,7 @@ If Major System words are available above, feel free to incorporate any that cre
 
 Provide only the emoji sequence, no additional explanation.`;
 
-			const response = await this.plugin.sendToLlm(prompt);
+			const response = await this.plugin.sendToLlm(prompt, [], {}, "flashcard");
 
 			if (response.content.trim()) {
 				if (existingContentForDisplay) {
@@ -20561,18 +20860,22 @@ class GNSettingsTab extends PluginSettingTab {
 		containerEl.empty();
 		containerEl.createEl("h2", { text: "Gated Notes Settings" });
 
+		// --- API PROVIDERS SECTION ---
+		containerEl.createEl("h3", { text: "API Providers" });
+
+		// FLASHCARD GENERATION SUBSECTION
+		containerEl.createEl("h4", { text: "Flashcard Generation" });
+
 		new Setting(containerEl)
 			.setName("API Provider")
-			.setDesc("Choose the AI provider for text-based card generation.")
+			.setDesc("Choose the AI provider for flashcard generation.")
 			.addDropdown((dropdown) =>
 				dropdown
 					.addOption("openai", "OpenAI")
 					.addOption("lmstudio", "LM Studio")
 					.setValue(this.plugin.settings.apiProvider)
 					.onChange(async (value) => {
-						this.plugin.settings.apiProvider = value as
-							| "openai"
-							| "lmstudio";
+						this.plugin.settings.apiProvider = value as "openai" | "lmstudio";
 						await this.plugin.saveSettings();
 						this.display();
 					})
@@ -20584,9 +20887,7 @@ class GNSettingsTab extends PluginSettingTab {
 		) {
 			new Setting(containerEl)
 				.setName("OpenAI API key")
-				.setDesc(
-					"Required for OpenAI text generation and/or image analysis."
-				)
+				.setDesc("Required for OpenAI text generation and/or image analysis.")
 				.addText((text) =>
 					text
 						.setPlaceholder("sk-…")
@@ -20602,7 +20903,8 @@ class GNSettingsTab extends PluginSettingTab {
 			new Setting(containerEl)
 				.setName("OpenAI Text Model")
 				.addDropdown((dropdown) => {
-					this.plugin.settings.availableModels.forEach((model) =>
+					dropdown.addOption("", "-- Select a model --");
+					this.plugin.settings.availableOpenaiModels.forEach((model) =>
 						dropdown.addOption(model, model)
 					);
 					dropdown
@@ -20627,7 +20929,8 @@ class GNSettingsTab extends PluginSettingTab {
 			new Setting(containerEl)
 				.setName("LM Studio Model")
 				.addDropdown((dropdown) => {
-					this.plugin.settings.availableModels.forEach((model) =>
+					dropdown.addOption("", "-- Select a model --");
+					this.plugin.settings.availableLmStudioModels.forEach((model) =>
 						dropdown.addOption(model, model)
 					);
 					dropdown
@@ -20646,7 +20949,7 @@ class GNSettingsTab extends PluginSettingTab {
 				button.setButtonText("Fetch").onClick(async () => {
 					button.setDisabled(true).setButtonText("Fetching...");
 					try {
-						await this.plugin.fetchAvailableModels();
+						await this.plugin.fetchAvailableModels(this.plugin.settings.apiProvider, this.plugin.settings.lmStudioUrl);
 						new Notice("Fetched models.");
 					} finally {
 						this.display();
@@ -20656,9 +20959,7 @@ class GNSettingsTab extends PluginSettingTab {
 
 		new Setting(containerEl)
 			.setName("Temperature")
-			.setDesc(
-				"Controls randomness. 0 is deterministic, 1 is max creativity."
-			)
+			.setDesc("Controls randomness. 0 is deterministic, 1 is max creativity.")
 			.addSlider((slider) =>
 				slider
 					.setLimits(0, 1, 0.01)
@@ -20670,11 +20971,212 @@ class GNSettingsTab extends PluginSettingTab {
 					})
 			);
 
+		// REFOCUS/SPLIT SUBSECTION
+		containerEl.createEl("h4", { text: "Refocus/Split Operations" });
+
+		new Setting(containerEl)
+			.setName("API Provider")
+			.setDesc("Choose the AI provider for refocus and split operations.")
+			.addDropdown((dropdown) =>
+				dropdown
+					.addOption("match", "Match Flashcard Generation")
+					.addOption("openai", "OpenAI")
+					.addOption("lmstudio", "LM Studio")
+					.setValue(this.plugin.settings.refocusApiProvider)
+					.onChange(async (value) => {
+						this.plugin.settings.refocusApiProvider = value as "match" | "openai" | "lmstudio";
+						await this.plugin.saveSettings();
+						this.display();
+					})
+			);
+
+		if (this.plugin.settings.refocusApiProvider === "openai") {
+			new Setting(containerEl)
+				.setName("OpenAI Model")
+				.addDropdown((dropdown) => {
+					dropdown.addOption("", "-- Select a model --");
+					this.plugin.settings.availableOpenaiModels.forEach((model) =>
+						dropdown.addOption(model, model)
+					);
+					dropdown
+						.setValue(this.plugin.settings.refocusOpenaiModel)
+						.onChange(async (value) => {
+							this.plugin.settings.refocusOpenaiModel = value;
+							await this.plugin.saveSettings();
+						});
+				});
+
+			new Setting(containerEl)
+				.setName("Fetch OpenAI models")
+				.setDesc("Update the OpenAI model list.")
+				.addButton((button) =>
+					button.setButtonText("Fetch").onClick(async () => {
+						button.setDisabled(true).setButtonText("Fetching...");
+						try {
+							await this.plugin.fetchAvailableModels("openai");
+							new Notice("Fetched OpenAI models.");
+						} finally {
+							this.display();
+						}
+					})
+				);
+		} else if (this.plugin.settings.refocusApiProvider === "lmstudio") {
+			new Setting(containerEl)
+				.setName("LM Studio Server URL")
+				.addText((text) =>
+					text
+						.setPlaceholder("http://localhost:1234")
+						.setValue(this.plugin.settings.refocusLmStudioUrl)
+						.onChange(async (value) => {
+							this.plugin.settings.refocusLmStudioUrl = value;
+							await this.plugin.saveSettings();
+						})
+				);
+			new Setting(containerEl)
+				.setName("LM Studio Model")
+				.addDropdown((dropdown) => {
+					dropdown.addOption("", "-- Select a model --");
+					this.plugin.settings.availableLmStudioModels.forEach((model) =>
+						dropdown.addOption(model, model)
+					);
+					dropdown
+						.setValue(this.plugin.settings.refocusLmStudioModel)
+						.onChange(async (value) => {
+							this.plugin.settings.refocusLmStudioModel = value;
+							await this.plugin.saveSettings();
+						});
+				});
+
+			new Setting(containerEl)
+				.setName("Fetch LM Studio models")
+				.setDesc("Update the LM Studio model list.")
+				.addButton((button) =>
+					button.setButtonText("Fetch").onClick(async () => {
+						button.setDisabled(true).setButtonText("Fetching...");
+						try {
+							await this.plugin.fetchAvailableModels("lmstudio", this.plugin.settings.refocusLmStudioUrl);
+							new Notice("Fetched LM Studio models.");
+						} finally {
+							this.display();
+						}
+					})
+				);
+		} else {
+			// Match mode - show current flashcard generation settings for reference
+			const desc = this.plugin.settings.apiProvider === "openai"
+				? `Using: OpenAI (${this.plugin.settings.openaiModel})`
+				: `Using: LM Studio (${this.plugin.settings.lmStudioModel})`;
+
+			new Setting(containerEl)
+				.setName("Current Configuration")
+				.setDesc(desc);
+		}
+
+		// VARIANT GENERATION SUBSECTION
+		containerEl.createEl("h4", { text: "Variant Generation" });
+
+		new Setting(containerEl)
+			.setName("API Provider")
+			.setDesc("Choose the AI provider for variant generation.")
+			.addDropdown((dropdown) =>
+				dropdown
+					.addOption("match", "Match Flashcard Generation")
+					.addOption("openai", "OpenAI")
+					.addOption("lmstudio", "LM Studio")
+					.setValue(this.plugin.settings.variantApiProvider)
+					.onChange(async (value) => {
+						this.plugin.settings.variantApiProvider = value as "match" | "openai" | "lmstudio";
+						await this.plugin.saveSettings();
+						this.display();
+					})
+			);
+
+		if (this.plugin.settings.variantApiProvider === "openai") {
+			new Setting(containerEl)
+				.setName("OpenAI Model")
+				.addDropdown((dropdown) => {
+					dropdown.addOption("", "-- Select a model --");
+					this.plugin.settings.availableOpenaiModels.forEach((model) =>
+						dropdown.addOption(model, model)
+					);
+					dropdown
+						.setValue(this.plugin.settings.variantOpenaiModel)
+						.onChange(async (value) => {
+							this.plugin.settings.variantOpenaiModel = value;
+							await this.plugin.saveSettings();
+						});
+				});
+
+			new Setting(containerEl)
+				.setName("Fetch OpenAI models")
+				.setDesc("Update the OpenAI model list.")
+				.addButton((button) =>
+					button.setButtonText("Fetch").onClick(async () => {
+						button.setDisabled(true).setButtonText("Fetching...");
+						try {
+							await this.plugin.fetchAvailableModels("openai");
+							new Notice("Fetched OpenAI models.");
+						} finally {
+							this.display();
+						}
+					})
+				);
+		} else if (this.plugin.settings.variantApiProvider === "lmstudio") {
+			new Setting(containerEl)
+				.setName("LM Studio Server URL")
+				.addText((text) =>
+					text
+						.setPlaceholder("http://localhost:1234")
+						.setValue(this.plugin.settings.variantLmStudioUrl)
+						.onChange(async (value) => {
+							this.plugin.settings.variantLmStudioUrl = value;
+							await this.plugin.saveSettings();
+						})
+				);
+			new Setting(containerEl)
+				.setName("LM Studio Model")
+				.addDropdown((dropdown) => {
+					dropdown.addOption("", "-- Select a model --");
+					this.plugin.settings.availableLmStudioModels.forEach((model) =>
+						dropdown.addOption(model, model)
+					);
+					dropdown
+						.setValue(this.plugin.settings.variantLmStudioModel)
+						.onChange(async (value) => {
+							this.plugin.settings.variantLmStudioModel = value;
+							await this.plugin.saveSettings();
+						});
+				});
+
+			new Setting(containerEl)
+				.setName("Fetch LM Studio models")
+				.setDesc("Update the LM Studio model list.")
+				.addButton((button) =>
+					button.setButtonText("Fetch").onClick(async () => {
+						button.setDisabled(true).setButtonText("Fetching...");
+						try {
+							await this.plugin.fetchAvailableModels("lmstudio", this.plugin.settings.variantLmStudioUrl);
+							new Notice("Fetched LM Studio models.");
+						} finally {
+							this.display();
+						}
+					})
+				);
+		} else {
+			// Match mode - show current flashcard generation settings for reference
+			const desc = this.plugin.settings.apiProvider === "openai"
+				? `Using: OpenAI (${this.plugin.settings.openaiModel})`
+				: `Using: LM Studio (${this.plugin.settings.lmStudioModel})`;
+
+			new Setting(containerEl)
+				.setName("Current Configuration")
+				.setDesc(desc);
+		}
+
+		// IMAGE ANALYSIS SECTION
 		new Setting(containerEl)
 			.setName("Analyze images on generate (Experimental)")
-			.setDesc(
-				"Analyze images using an OpenAI vision model. This feature requires an OpenAI API key regardless of the main provider setting."
-			)
+			.setDesc("Analyze images using an OpenAI vision model. This feature requires an OpenAI API key regardless of the main provider setting.")
 			.addToggle((toggle) =>
 				toggle
 					.setValue(this.plugin.settings.analyzeImagesOnGenerate)
@@ -20688,9 +21190,7 @@ class GNSettingsTab extends PluginSettingTab {
 		if (this.plugin.settings.analyzeImagesOnGenerate) {
 			new Setting(containerEl)
 				.setName("OpenAI Multimodal Model")
-				.setDesc(
-					"Model for image analysis (e.g., gpt-4o, gpt-4o-mini)."
-				)
+				.setDesc("Model for image analysis (e.g., gpt-4o, gpt-4o-mini).")
 				.addDropdown((dropdown) => {
 					dropdown.addOption("gpt-4o", "gpt-4o");
 					dropdown.addOption("gpt-4o-mini", "gpt-4o-mini");
@@ -23505,7 +24005,7 @@ ${this.originalText}
 Return only the edited text, maintaining the original structure and formatting as much as possible.`;
 
 			// Make LLM call
-			const response = await this.plugin.sendToLlm(prompt);
+			const response = await this.plugin.sendToLlm(prompt, [], {}, "flashcard");
 
 			const editedText = response.content.trim();
 			loadingNotice.hide();
