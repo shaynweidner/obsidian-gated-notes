@@ -244,6 +244,31 @@ interface Settings {
 	guidanceSnippetOrder: string[];
 	/** Stored scroll positions for notes, keyed by note path. */
 	scrollPositions: { [notePath: string]: number };
+
+	// Card Appearance Randomization
+	/** Enable randomization of card appearance during review. */
+	randomizeCardAppearance: boolean;
+	/** Randomize font size. */
+	randomizeFontSize: boolean;
+	randomizeFontSizeMin: number;
+	randomizeFontSizeMax: number;
+	/** Randomize font family. */
+	randomizeFontFamily: boolean;
+	randomizeFontFamilies: string[];
+	/** Randomize text color. */
+	randomizeTextColor: boolean;
+	randomizeTextColors: string[];
+	/** Randomize text alignment. */
+	randomizeTextAlignment: boolean;
+	randomizeTextAlignments: string[];
+	/** Randomize line height. */
+	randomizeLineHeight: boolean;
+	randomizeLineHeightMin: number;
+	randomizeLineHeightMax: number;
+	/** Randomize letter spacing. */
+	randomizeLetterSpacing: boolean;
+	randomizeLetterSpacingMin: number;
+	randomizeLetterSpacingMax: number;
 }
 
 const DEFAULT_SETTINGS: Settings = {
@@ -310,6 +335,24 @@ const DEFAULT_SETTINGS: Settings = {
 		"Comprehensive Additional Cards",
 	],
 	scrollPositions: {},
+
+	// Card Appearance Randomization
+	randomizeCardAppearance: false,
+	randomizeFontSize: true,
+	randomizeFontSizeMin: 14,
+	randomizeFontSizeMax: 20,
+	randomizeFontFamily: true,
+	randomizeFontFamilies: ["Arial", "Helvetica", "Georgia", "Verdana"],
+	randomizeTextColor: true,
+	randomizeTextColors: ["#000000", "#1a1a1a", "#333333", "#0066cc"],
+	randomizeTextAlignment: true,
+	randomizeTextAlignments: ["left", "center"],
+	randomizeLineHeight: false,
+	randomizeLineHeightMin: 1.4,
+	randomizeLineHeightMax: 1.8,
+	randomizeLetterSpacing: false,
+	randomizeLetterSpacingMin: 0,
+	randomizeLetterSpacingMax: 1,
 };
 
 interface ImageAnalysis {
@@ -6282,6 +6325,76 @@ Return ONLY valid JSON of this shape: [{"front":"...","back":"..."}] or [] if no
 		}
 	}
 
+	/**
+	 * Applies randomized visual styles to a card container based on settings.
+	 * @param container The HTML element to apply styles to
+	 */
+	private applyRandomizedCardStyles(container: HTMLElement): void {
+		if (!this.settings.randomizeCardAppearance) {
+			return;
+		}
+
+		const randomBetween = (min: number, max: number): number => {
+			return Math.random() * (max - min) + min;
+		};
+
+		const randomFromArray = <T>(arr: T[]): T | undefined => {
+			if (arr.length === 0) return undefined;
+			return arr[Math.floor(Math.random() * arr.length)];
+		};
+
+		// Font Size
+		if (this.settings.randomizeFontSize) {
+			const fontSize = Math.round(randomBetween(
+				this.settings.randomizeFontSizeMin,
+				this.settings.randomizeFontSizeMax
+			));
+			container.style.fontSize = `${fontSize}px`;
+		}
+
+		// Font Family
+		if (this.settings.randomizeFontFamily && this.settings.randomizeFontFamilies.length > 0) {
+			const fontFamily = randomFromArray(this.settings.randomizeFontFamilies);
+			if (fontFamily) {
+				container.style.fontFamily = fontFamily;
+			}
+		}
+
+		// Text Color
+		if (this.settings.randomizeTextColor && this.settings.randomizeTextColors.length > 0) {
+			const color = randomFromArray(this.settings.randomizeTextColors);
+			if (color) {
+				container.style.color = color;
+			}
+		}
+
+		// Text Alignment
+		if (this.settings.randomizeTextAlignment && this.settings.randomizeTextAlignments.length > 0) {
+			const alignment = randomFromArray(this.settings.randomizeTextAlignments);
+			if (alignment) {
+				container.style.textAlign = alignment;
+			}
+		}
+
+		// Line Height
+		if (this.settings.randomizeLineHeight) {
+			const lineHeight = randomBetween(
+				this.settings.randomizeLineHeightMin,
+				this.settings.randomizeLineHeightMax
+			);
+			container.style.lineHeight = String(lineHeight);
+		}
+
+		// Letter Spacing
+		if (this.settings.randomizeLetterSpacing) {
+			const letterSpacing = randomBetween(
+				this.settings.randomizeLetterSpacingMin,
+				this.settings.randomizeLetterSpacingMax
+			);
+			container.style.letterSpacing = `${letterSpacing}px`;
+		}
+	}
+
 	private formatDueTime(
 		dueTimestamp: number,
 		currentTime: number,
@@ -9278,6 +9391,9 @@ ${selection}
 				frontContainer,
 				card.chapter
 			);
+
+			// Apply randomized styles to the front container
+			this.applyRandomizedCardStyles(frontContainer);
 
 			const bottomBar = modal.contentEl.createDiv({
 				cls: "gn-action-bar",
@@ -21348,6 +21464,292 @@ class GNSettingsTab extends PluginSettingTab {
 						await this.plugin.saveSettings();
 					})
 			);
+
+		// --- CARD APPEARANCE RANDOMIZATION SECTION ---
+		containerEl.createEl("h3", { text: "Card Appearance Randomization" });
+
+		new Setting(containerEl)
+			.setName("Enable card appearance randomization")
+			.setDesc("Randomize visual properties of flashcard fronts during review")
+			.addToggle((toggle) =>
+				toggle
+					.setValue(this.plugin.settings.randomizeCardAppearance)
+					.onChange(async (value) => {
+						this.plugin.settings.randomizeCardAppearance = value;
+						await this.plugin.saveSettings();
+						this.display();
+					})
+			);
+
+		if (this.plugin.settings.randomizeCardAppearance) {
+			// Font Size
+			new Setting(containerEl)
+				.setName("Font size")
+				.addToggle((toggle) =>
+					toggle
+						.setValue(this.plugin.settings.randomizeFontSize)
+						.onChange(async (value) => {
+							this.plugin.settings.randomizeFontSize = value;
+							await this.plugin.saveSettings();
+							this.display();
+						})
+				);
+
+			if (this.plugin.settings.randomizeFontSize) {
+				new Setting(containerEl)
+					.setName("Font size range (px)")
+					.addText((text) =>
+						text
+							.setPlaceholder("Min")
+							.setValue(String(this.plugin.settings.randomizeFontSizeMin))
+							.onChange(async (value) => {
+								const num = parseInt(value);
+								if (!isNaN(num) && num > 0) {
+									this.plugin.settings.randomizeFontSizeMin = num;
+									await this.plugin.saveSettings();
+								}
+							})
+					)
+					.addText((text) =>
+						text
+							.setPlaceholder("Max")
+							.setValue(String(this.plugin.settings.randomizeFontSizeMax))
+							.onChange(async (value) => {
+								const num = parseInt(value);
+								if (!isNaN(num) && num > 0) {
+									this.plugin.settings.randomizeFontSizeMax = num;
+									await this.plugin.saveSettings();
+								}
+							})
+					);
+			}
+
+			// Font Family
+			new Setting(containerEl)
+				.setName("Font family")
+				.addToggle((toggle) =>
+					toggle
+						.setValue(this.plugin.settings.randomizeFontFamily)
+						.onChange(async (value) => {
+							this.plugin.settings.randomizeFontFamily = value;
+							await this.plugin.saveSettings();
+							this.display();
+						})
+				);
+
+			if (this.plugin.settings.randomizeFontFamily) {
+				const availableFonts = [
+					"Arial", "Helvetica", "Times New Roman", "Georgia",
+					"Courier New", "Verdana", "Trebuchet MS", "Impact"
+				];
+
+				const fontsContainer = containerEl.createDiv();
+				fontsContainer.style.marginLeft = "30px";
+				fontsContainer.style.marginBottom = "15px";
+
+				for (const font of availableFonts) {
+					const label = fontsContainer.createEl("label");
+					label.style.display = "inline-block";
+					label.style.marginRight = "15px";
+					label.style.marginBottom = "5px";
+					const checkbox = label.createEl("input", { type: "checkbox" });
+					checkbox.checked = this.plugin.settings.randomizeFontFamilies.includes(font);
+					checkbox.addEventListener("change", async () => {
+						if (checkbox.checked) {
+							if (!this.plugin.settings.randomizeFontFamilies.includes(font)) {
+								this.plugin.settings.randomizeFontFamilies.push(font);
+							}
+						} else {
+							this.plugin.settings.randomizeFontFamilies = this.plugin.settings.randomizeFontFamilies.filter(f => f !== font);
+						}
+						await this.plugin.saveSettings();
+					});
+					label.appendChild(document.createTextNode(` ${font}`));
+				}
+			}
+
+			// Text Color
+			new Setting(containerEl)
+				.setName("Text color")
+				.addToggle((toggle) =>
+					toggle
+						.setValue(this.plugin.settings.randomizeTextColor)
+						.onChange(async (value) => {
+							this.plugin.settings.randomizeTextColor = value;
+							await this.plugin.saveSettings();
+							this.display();
+						})
+				);
+
+			if (this.plugin.settings.randomizeTextColor) {
+				const availableColors = [
+					{ name: "Black", hex: "#000000" },
+					{ name: "V. Dark Gray", hex: "#1a1a1a" },
+					{ name: "Dark Gray", hex: "#333333" },
+					{ name: "Blue", hex: "#0066cc" },
+					{ name: "Dk Green", hex: "#006600" },
+					{ name: "Purple", hex: "#660066" },
+					{ name: "Red", hex: "#cc0000" },
+					{ name: "Orange", hex: "#cc6600" }
+				];
+
+				const colorsContainer = containerEl.createDiv();
+				colorsContainer.style.marginLeft = "30px";
+				colorsContainer.style.marginBottom = "15px";
+
+				for (const color of availableColors) {
+					const label = colorsContainer.createEl("label");
+					label.style.display = "inline-block";
+					label.style.marginRight = "15px";
+					label.style.marginBottom = "5px";
+					const checkbox = label.createEl("input", { type: "checkbox" });
+					checkbox.checked = this.plugin.settings.randomizeTextColors.includes(color.hex);
+					checkbox.addEventListener("change", async () => {
+						if (checkbox.checked) {
+							if (!this.plugin.settings.randomizeTextColors.includes(color.hex)) {
+								this.plugin.settings.randomizeTextColors.push(color.hex);
+							}
+						} else {
+							this.plugin.settings.randomizeTextColors = this.plugin.settings.randomizeTextColors.filter(c => c !== color.hex);
+						}
+						await this.plugin.saveSettings();
+					});
+					const colorSwatch = label.createEl("span");
+					colorSwatch.style.display = "inline-block";
+					colorSwatch.style.width = "12px";
+					colorSwatch.style.height = "12px";
+					colorSwatch.style.backgroundColor = color.hex;
+					colorSwatch.style.marginRight = "3px";
+					colorSwatch.style.border = "1px solid var(--background-modifier-border)";
+					label.appendChild(document.createTextNode(` ${color.name}`));
+				}
+			}
+
+			// Text Alignment
+			new Setting(containerEl)
+				.setName("Text alignment")
+				.addToggle((toggle) =>
+					toggle
+						.setValue(this.plugin.settings.randomizeTextAlignment)
+						.onChange(async (value) => {
+							this.plugin.settings.randomizeTextAlignment = value;
+							await this.plugin.saveSettings();
+							this.display();
+						})
+				);
+
+			if (this.plugin.settings.randomizeTextAlignment) {
+				const availableAlignments = ["left", "center", "right", "justify"];
+
+				const alignContainer = containerEl.createDiv();
+				alignContainer.style.marginLeft = "30px";
+				alignContainer.style.marginBottom = "15px";
+
+				for (const alignment of availableAlignments) {
+					const label = alignContainer.createEl("label");
+					label.style.display = "inline-block";
+					label.style.marginRight = "15px";
+					label.style.marginBottom = "5px";
+					const checkbox = label.createEl("input", { type: "checkbox" });
+					checkbox.checked = this.plugin.settings.randomizeTextAlignments.includes(alignment);
+					checkbox.addEventListener("change", async () => {
+						if (checkbox.checked) {
+							if (!this.plugin.settings.randomizeTextAlignments.includes(alignment)) {
+								this.plugin.settings.randomizeTextAlignments.push(alignment);
+							}
+						} else {
+							this.plugin.settings.randomizeTextAlignments = this.plugin.settings.randomizeTextAlignments.filter(a => a !== alignment);
+						}
+						await this.plugin.saveSettings();
+					});
+					label.appendChild(document.createTextNode(` ${alignment.charAt(0).toUpperCase() + alignment.slice(1)}`));
+				}
+			}
+
+			// Line Height
+			new Setting(containerEl)
+				.setName("Line height")
+				.addToggle((toggle) =>
+					toggle
+						.setValue(this.plugin.settings.randomizeLineHeight)
+						.onChange(async (value) => {
+							this.plugin.settings.randomizeLineHeight = value;
+							await this.plugin.saveSettings();
+							this.display();
+						})
+				);
+
+			if (this.plugin.settings.randomizeLineHeight) {
+				new Setting(containerEl)
+					.setName("Line height range")
+					.addText((text) =>
+						text
+							.setPlaceholder("Min")
+							.setValue(String(this.plugin.settings.randomizeLineHeightMin))
+							.onChange(async (value) => {
+								const num = parseFloat(value);
+								if (!isNaN(num) && num > 0) {
+									this.plugin.settings.randomizeLineHeightMin = num;
+									await this.plugin.saveSettings();
+								}
+							})
+					)
+					.addText((text) =>
+						text
+							.setPlaceholder("Max")
+							.setValue(String(this.plugin.settings.randomizeLineHeightMax))
+							.onChange(async (value) => {
+								const num = parseFloat(value);
+								if (!isNaN(num) && num > 0) {
+									this.plugin.settings.randomizeLineHeightMax = num;
+									await this.plugin.saveSettings();
+								}
+							})
+					);
+			}
+
+			// Letter Spacing
+			new Setting(containerEl)
+				.setName("Letter spacing")
+				.addToggle((toggle) =>
+					toggle
+						.setValue(this.plugin.settings.randomizeLetterSpacing)
+						.onChange(async (value) => {
+							this.plugin.settings.randomizeLetterSpacing = value;
+							await this.plugin.saveSettings();
+							this.display();
+						})
+				);
+
+			if (this.plugin.settings.randomizeLetterSpacing) {
+				new Setting(containerEl)
+					.setName("Letter spacing range (px)")
+					.addText((text) =>
+						text
+							.setPlaceholder("Min")
+							.setValue(String(this.plugin.settings.randomizeLetterSpacingMin))
+							.onChange(async (value) => {
+								const num = parseFloat(value);
+								if (!isNaN(num)) {
+									this.plugin.settings.randomizeLetterSpacingMin = num;
+									await this.plugin.saveSettings();
+								}
+							})
+					)
+					.addText((text) =>
+						text
+							.setPlaceholder("Max")
+							.setValue(String(this.plugin.settings.randomizeLetterSpacingMax))
+							.onChange(async (value) => {
+								const num = parseFloat(value);
+								if (!isNaN(num)) {
+									this.plugin.settings.randomizeLetterSpacingMax = num;
+									await this.plugin.saveSettings();
+								}
+							})
+					);
+			}
+		}
 	}
 
 	private createNumericArraySetting(
