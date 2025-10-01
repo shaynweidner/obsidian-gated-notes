@@ -5127,10 +5127,12 @@ Return ONLY valid JSON of this shape: [{"front":"...","back":"..."}] or [] if no
 						? allDeckCards.filter(card => this.isPolyglotCard(card))  // Only polyglot cards
 						: allDeckCards.filter(card => !this.isPolyglotCard(card)); // Only non-polyglot cards
 
-					// Apply suspended/flagged filtering
+					// Apply suspended/flagged/verbatim filtering
 					deckCards = deckCards.filter(card => {
 						if (card.suspended && excludeSuspended) return false;
 						if (card.flagged && excludeFlagged) return false;
+						// Always exclude verbatim cards from duplicate detection
+						if (card.tag && card.tag.includes("verbatim_")) return false;
 						return true;
 					});
 
@@ -5371,7 +5373,10 @@ Return ONLY valid JSON of this shape: [{"front":"...","back":"..."}] or [] if no
 	private lemmatize(text: string): string[] {
 		if (!text || text.trim() === '') return [];
 
-		let doc = nlp(text);
+		// Strip possessive 's before processing to avoid "John's" becoming "johns" instead of "john"
+		const textWithoutPossessives = text.replace(/([a-zA-Z])'s\b/g, '$1');
+
+		let doc = nlp(textWithoutPossessives);
 		doc.verbs().toInfinitive();
 		doc.nouns().toSingular();
 		return doc.terms().out('array')
