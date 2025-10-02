@@ -269,6 +269,20 @@ interface Settings {
 	randomizeLetterSpacing: boolean;
 	randomizeLetterSpacingMin: number;
 	randomizeLetterSpacingMax: number;
+	/** Randomize text transform (case). */
+	randomizeTextTransform: boolean;
+	randomizeTextTransforms: string[];
+	/** Randomize rotation. */
+	randomizeRotation: boolean;
+	randomizeRotationMin: number;
+	randomizeRotationMax: number;
+	/** Randomize blur filter. */
+	randomizeBlur: boolean;
+	randomizeBlurMin: number;
+	randomizeBlurMax: number;
+	/** Randomize background color. */
+	randomizeBackgroundColor: boolean;
+	randomizeBackgroundColors: string[];
 }
 
 const DEFAULT_SETTINGS: Settings = {
@@ -353,6 +367,16 @@ const DEFAULT_SETTINGS: Settings = {
 	randomizeLetterSpacing: false,
 	randomizeLetterSpacingMin: 0,
 	randomizeLetterSpacingMax: 1,
+	randomizeTextTransform: false,
+	randomizeTextTransforms: ["none", "capitalize"],
+	randomizeRotation: false,
+	randomizeRotationMin: -3,
+	randomizeRotationMax: 3,
+	randomizeBlur: false,
+	randomizeBlurMin: 0,
+	randomizeBlurMax: 1,
+	randomizeBackgroundColor: false,
+	randomizeBackgroundColors: ["#ffffff", "#f5f5f5", "#fffef0", "#f0f8ff"],
 };
 
 interface ImageAnalysis {
@@ -6393,6 +6417,55 @@ Return ONLY valid JSON of this shape: [{"front":"...","back":"..."}] or [] if no
 			);
 			container.style.letterSpacing = `${letterSpacing}px`;
 		}
+
+		// Text Transform
+		if (this.settings.randomizeTextTransform && this.settings.randomizeTextTransforms.length > 0) {
+			const transform = randomFromArray(this.settings.randomizeTextTransforms);
+			if (transform) {
+				container.style.textTransform = transform;
+			}
+		}
+
+		// Background Color
+		if (this.settings.randomizeBackgroundColor && this.settings.randomizeBackgroundColors.length > 0) {
+			const bgColor = randomFromArray(this.settings.randomizeBackgroundColors);
+			if (bgColor) {
+				container.style.backgroundColor = bgColor;
+			}
+		}
+
+		// Build transform string (for rotation and skew)
+		const transforms: string[] = [];
+
+		if (this.settings.randomizeRotation) {
+			const rotation = randomBetween(
+				this.settings.randomizeRotationMin,
+				this.settings.randomizeRotationMax
+			);
+			transforms.push(`rotate(${rotation}deg)`);
+		}
+
+		if (transforms.length > 0) {
+			container.style.transform = transforms.join(' ');
+			// Add padding to prevent overlap with buttons when rotated
+			container.style.padding = "20px";
+			container.style.marginBottom = "10px";
+		}
+
+		// CSS Filters
+		const filters: string[] = [];
+
+		if (this.settings.randomizeBlur) {
+			const blur = randomBetween(
+				this.settings.randomizeBlurMin,
+				this.settings.randomizeBlurMax
+			);
+			filters.push(`blur(${blur}px)`);
+		}
+
+		if (filters.length > 0) {
+			container.style.filter = filters.join(' ');
+		}
 	}
 
 	private formatDueTime(
@@ -9986,28 +10059,167 @@ ${selection}
 
 		setTimeout(async () => {
 			this.statusRefreshQueued = false;
-			let learningDue = 0,
-				reviewDue = 0;
 			const now = Date.now();
 			const allDeckFiles = this.app.vault
 				.getFiles()
 				.filter((f) => f.name.endsWith(DECK_FILE_NAME));
 
+			// Collect ALL cards (for vault totals) and DUE cards separately
+			const vaultStats = {
+				regular: { new: 0, learning: 0, review: 0, relearn: 0 },
+				polyglot: { new: 0, learning: 0, review: 0, relearn: 0 },
+				verbatim: { new: 0, learning: 0, review: 0, relearn: 0 }
+			};
+
+			const dueStats = {
+				regular: { learning: 0, review: 0, relearn: 0 },
+				polyglot: { learning: 0, review: 0, relearn: 0 },
+				verbatim: { learning: 0, review: 0, relearn: 0 }
+			};
+
+			const currentNoteStats = {
+				regular: { new: 0, learning: 0, review: 0, relearn: 0 },
+				polyglot: { new: 0, learning: 0, review: 0, relearn: 0 },
+				verbatim: { new: 0, learning: 0, review: 0, relearn: 0 }
+			};
+
+			const currentNoteDueStats = {
+				regular: { learning: 0, review: 0, relearn: 0 },
+				polyglot: { learning: 0, review: 0, relearn: 0 },
+				verbatim: { learning: 0, review: 0, relearn: 0 }
+			};
+
+			// Get current note path (if any)
+			const activeFile = this.app.workspace.getActiveFile();
+			const currentNotePath = activeFile?.parent?.path;
+
 			for (const deck of allDeckFiles) {
 				const graph = await this.readDeck(deck.path);
+				const isCurrentNote = currentNotePath && deck.path.startsWith(currentNotePath + "/");
+
 				for (const c of Object.values(graph)) {
-					if (c.due > now) continue;
-					if (c.suspended) continue;
-					if (["new", "learning", "relearn"].includes(c.status)) {
-						learningDue++;
-					} else {
-						reviewDue++;
+					// Determine card type
+					let cardType: 'regular' | 'polyglot' | 'verbatim' = 'regular';
+					if (c.polyglot?.isPolyglot) {
+						cardType = 'polyglot';
+					} else if (c.tag && c.tag.includes("verbatim_")) {
+						cardType = 'verbatim';
+					}
+
+					// Count ALL cards by status (for vault totals)
+					if (c.status === "new") vaultStats[cardType].new++;
+					else if (c.status === "learning") vaultStats[cardType].learning++;
+					else if (c.status === "review") vaultStats[cardType].review++;
+					else if (c.status === "relearn") vaultStats[cardType].relearn++;
+
+					// Count current note cards
+					if (isCurrentNote) {
+						if (c.status === "new") currentNoteStats[cardType].new++;
+						else if (c.status === "learning") currentNoteStats[cardType].learning++;
+						else if (c.status === "review") currentNoteStats[cardType].review++;
+						else if (c.status === "relearn") currentNoteStats[cardType].relearn++;
+					}
+
+					// Check if card is DUE
+					const isDue = c.due <= now && !c.suspended && !c.blocked &&
+								  !(c.polyglot?.isPolyglot && c.status === "new");
+
+					if (isDue) {
+						// Count due cards (excluding "new" since they're never really "due")
+						if (c.status === "learning") dueStats[cardType].learning++;
+						else if (c.status === "review") dueStats[cardType].review++;
+						else if (c.status === "relearn") dueStats[cardType].relearn++;
+
+						if (isCurrentNote) {
+							if (c.status === "learning") currentNoteDueStats[cardType].learning++;
+							else if (c.status === "review") currentNoteDueStats[cardType].review++;
+							else if (c.status === "relearn") currentNoteDueStats[cardType].relearn++;
+						}
 					}
 				}
 			}
-			this.statusBar.setText(
-				`GN: ${learningDue} learning, ${reviewDue} review`
-			);
+
+			// Calculate totals for display
+			const vaultDueTotal =
+				dueStats.regular.learning + dueStats.regular.review + dueStats.regular.relearn +
+				dueStats.polyglot.learning + dueStats.polyglot.review + dueStats.polyglot.relearn +
+				dueStats.verbatim.learning + dueStats.verbatim.review + dueStats.verbatim.relearn;
+
+			const currentNoteDueTotal =
+				currentNoteDueStats.regular.learning + currentNoteDueStats.regular.review + currentNoteDueStats.regular.relearn +
+				currentNoteDueStats.polyglot.learning + currentNoteDueStats.polyglot.review + currentNoteDueStats.polyglot.relearn +
+				currentNoteDueStats.verbatim.learning + currentNoteDueStats.verbatim.review + currentNoteDueStats.verbatim.relearn;
+
+			// Build status text
+			let statusText = `GN: ${vaultDueTotal} due`;
+			if (currentNoteDueTotal > 0) {
+				statusText += ` (${currentNoteDueTotal} in note)`;
+			}
+
+			this.statusBar.setText(statusText);
+
+			// Build detailed tooltip
+			const vaultTotalCards =
+				vaultStats.regular.new + vaultStats.regular.learning + vaultStats.regular.review + vaultStats.regular.relearn +
+				vaultStats.polyglot.new + vaultStats.polyglot.learning + vaultStats.polyglot.review + vaultStats.polyglot.relearn +
+				vaultStats.verbatim.new + vaultStats.verbatim.learning + vaultStats.verbatim.review + vaultStats.verbatim.relearn;
+
+			const regularTotal = vaultStats.regular.new + vaultStats.regular.learning + vaultStats.regular.review + vaultStats.regular.relearn;
+			const polyglotTotal = vaultStats.polyglot.new + vaultStats.polyglot.learning + vaultStats.polyglot.review + vaultStats.polyglot.relearn;
+			const verbatimTotal = vaultStats.verbatim.new + vaultStats.verbatim.learning + vaultStats.verbatim.review + vaultStats.verbatim.relearn;
+
+			const currentNoteTotalCards =
+				currentNoteStats.regular.new + currentNoteStats.regular.learning + currentNoteStats.regular.review + currentNoteStats.regular.relearn +
+				currentNoteStats.polyglot.new + currentNoteStats.polyglot.learning + currentNoteStats.polyglot.review + currentNoteStats.polyglot.relearn +
+				currentNoteStats.verbatim.new + currentNoteStats.verbatim.learning + currentNoteStats.verbatim.review + currentNoteStats.verbatim.relearn;
+
+			const currentNoteRegularTotal = currentNoteStats.regular.new + currentNoteStats.regular.learning + currentNoteStats.regular.review + currentNoteStats.regular.relearn;
+			const currentNotePolyglotTotal = currentNoteStats.polyglot.new + currentNoteStats.polyglot.learning + currentNoteStats.polyglot.review + currentNoteStats.polyglot.relearn;
+			const currentNoteVerbatimTotal = currentNoteStats.verbatim.new + currentNoteStats.verbatim.learning + currentNoteStats.verbatim.review + currentNoteStats.verbatim.relearn;
+
+			const tooltip = [
+				"## VAULT ##",
+				`Total: ${vaultTotalCards}`,
+				`  New: ${vaultStats.regular.new + vaultStats.polyglot.new + vaultStats.verbatim.new}`,
+				`  Learning: ${vaultStats.regular.learning + vaultStats.polyglot.learning + vaultStats.verbatim.learning}`,
+				`  Review: ${vaultStats.regular.review + vaultStats.polyglot.review + vaultStats.verbatim.review}`,
+				`  Relearn: ${vaultStats.regular.relearn + vaultStats.polyglot.relearn + vaultStats.verbatim.relearn}`,
+				"",
+				"### Regular ###",
+				`Total: ${regularTotal}`,
+				`  New: ${vaultStats.regular.new}`,
+				`  Learning: ${vaultStats.regular.learning}`,
+				`  Review: ${vaultStats.regular.review}`,
+				`  Relearn: ${vaultStats.regular.relearn}`,
+				"",
+				"### Polyglot ###",
+				`Total: ${polyglotTotal}`,
+				`  New: ${vaultStats.polyglot.new}`,
+				`  Learning: ${vaultStats.polyglot.learning}`,
+				`  Review: ${vaultStats.polyglot.review}`,
+				`  Relearn: ${vaultStats.polyglot.relearn}`,
+				"",
+				"### Verbatim ###",
+				`Total: ${verbatimTotal}`,
+				`  New: ${vaultStats.verbatim.new}`,
+				`  Learning: ${vaultStats.verbatim.learning}`,
+				`  Review: ${vaultStats.verbatim.review}`,
+				`  Relearn: ${vaultStats.verbatim.relearn}`,
+				"",
+				"## DUE ##",
+				`Total: ${vaultDueTotal}`,
+				`  Regular (Learning): ${dueStats.regular.learning}`,
+				`  Regular (Review): ${dueStats.regular.review}`,
+				`  Regular (Relearn): ${dueStats.regular.relearn}`,
+				`  Polyglot (Learning): ${dueStats.polyglot.learning}`,
+				`  Polyglot (Review): ${dueStats.polyglot.review}`,
+				`  Polyglot (Relearn): ${dueStats.polyglot.relearn}`,
+				`  Verbatim (Learning): ${dueStats.verbatim.learning}`,
+				`  Verbatim (Review): ${dueStats.verbatim.review}`,
+				`  Verbatim (Relearn): ${dueStats.verbatim.relearn}`
+			];
+
+			this.statusBar.setAttribute("aria-label", tooltip.join("\n"));
 		}, 150);
 	}
 
@@ -10023,8 +10235,13 @@ ${selection}
 		for (const deck of allDeckFiles) {
 			const graph = await this.readDeck(deck.path);
 			for (const card of Object.values(graph)) {
-				// Only count missing paraIdx for non-polyglot cards (polyglot cards don't need paraIdx)
-				if ((card.paraIdx === undefined || card.paraIdx === null) && !card.polyglot?.isPolyglot) {
+				// Skip polyglot cards (they don't need paraIdx)
+				if (card.polyglot?.isPolyglot) continue;
+				// Skip verbatim cards (they don't need paraIdx)
+				if (card.tag && card.tag.includes("verbatim_")) continue;
+
+				// Count regular cards missing paraIdx
+				if (card.paraIdx === undefined || card.paraIdx === null) {
 					count++;
 				}
 			}
@@ -10036,13 +10253,13 @@ ${selection}
 			);
 			this.cardsMissingParaIdxStatus.setAttribute(
 				"aria-label",
-				`${count} cards are missing a paragraph index. Click to view.`
+				`${count} regular cards are missing a paragraph index. Click to view.`
 			);
 		} else {
 			this.cardsMissingParaIdxStatus.setText("");
 			this.cardsMissingParaIdxStatus.setAttribute(
 				"aria-label",
-				"All cards have a paragraph index."
+				"All regular cards have a paragraph index."
 			);
 		}
 	}
@@ -21584,6 +21801,7 @@ class GNSettingsTab extends PluginSettingTab {
 			if (this.plugin.settings.randomizeTextColor) {
 				const availableColors = [
 					{ name: "Black", hex: "#000000" },
+					{ name: "White", hex: "#ffffff" },
 					{ name: "V. Dark Gray", hex: "#1a1a1a" },
 					{ name: "Dark Gray", hex: "#333333" },
 					{ name: "Blue", hex: "#0066cc" },
@@ -21748,6 +21966,188 @@ class GNSettingsTab extends PluginSettingTab {
 								}
 							})
 					);
+			}
+
+			// Text Transform
+			new Setting(containerEl)
+				.setName("Text transform")
+				.addToggle((toggle) =>
+					toggle
+						.setValue(this.plugin.settings.randomizeTextTransform)
+						.onChange(async (value) => {
+							this.plugin.settings.randomizeTextTransform = value;
+							await this.plugin.saveSettings();
+							this.display();
+						})
+				);
+
+			if (this.plugin.settings.randomizeTextTransform) {
+				const availableTransforms = ["Normal", "UPPERCASE", "lowercase", "Capitalize"];
+
+				const transformContainer = containerEl.createDiv();
+				transformContainer.style.marginLeft = "30px";
+				transformContainer.style.marginBottom = "15px";
+
+				for (const transform of availableTransforms) {
+					const label = transformContainer.createEl("label");
+					label.style.display = "inline-block";
+					label.style.marginRight = "15px";
+					label.style.marginBottom = "5px";
+					const checkbox = label.createEl("input", { type: "checkbox" });
+					checkbox.checked = this.plugin.settings.randomizeTextTransforms.includes(transform);
+					checkbox.addEventListener("change", async () => {
+						if (checkbox.checked) {
+							if (!this.plugin.settings.randomizeTextTransforms.includes(transform)) {
+								this.plugin.settings.randomizeTextTransforms.push(transform);
+							}
+						} else {
+							this.plugin.settings.randomizeTextTransforms = this.plugin.settings.randomizeTextTransforms.filter(t => t !== transform);
+						}
+						await this.plugin.saveSettings();
+					});
+					label.appendChild(document.createTextNode(` ${transform}`));
+				}
+			}
+
+			// Rotation
+			new Setting(containerEl)
+				.setName("Rotation")
+				.addToggle((toggle) =>
+					toggle
+						.setValue(this.plugin.settings.randomizeRotation)
+						.onChange(async (value) => {
+							this.plugin.settings.randomizeRotation = value;
+							await this.plugin.saveSettings();
+							this.display();
+						})
+				);
+
+			if (this.plugin.settings.randomizeRotation) {
+				new Setting(containerEl)
+					.setName("Rotation range (degrees)")
+					.addText((text) =>
+						text
+							.setPlaceholder("Min")
+							.setValue(String(this.plugin.settings.randomizeRotationMin))
+							.onChange(async (value) => {
+								const num = parseFloat(value);
+								if (!isNaN(num)) {
+									this.plugin.settings.randomizeRotationMin = num;
+									await this.plugin.saveSettings();
+								}
+							})
+					)
+					.addText((text) =>
+						text
+							.setPlaceholder("Max")
+							.setValue(String(this.plugin.settings.randomizeRotationMax))
+							.onChange(async (value) => {
+								const num = parseFloat(value);
+								if (!isNaN(num)) {
+									this.plugin.settings.randomizeRotationMax = num;
+									await this.plugin.saveSettings();
+								}
+							})
+					);
+			}
+
+			// Blur
+			new Setting(containerEl)
+				.setName("Blur")
+				.addToggle((toggle) =>
+					toggle
+						.setValue(this.plugin.settings.randomizeBlur)
+						.onChange(async (value) => {
+							this.plugin.settings.randomizeBlur = value;
+							await this.plugin.saveSettings();
+							this.display();
+						})
+				);
+
+			if (this.plugin.settings.randomizeBlur) {
+				new Setting(containerEl)
+					.setName("Blur range (pixels)")
+					.setDesc("0-2px recommended")
+					.addText((text) =>
+						text
+							.setPlaceholder("Min")
+							.setValue(String(this.plugin.settings.randomizeBlurMin))
+							.onChange(async (value) => {
+								const num = parseFloat(value);
+								if (!isNaN(num) && num >= 0) {
+									this.plugin.settings.randomizeBlurMin = num;
+									await this.plugin.saveSettings();
+								}
+							})
+					)
+					.addText((text) =>
+						text
+							.setPlaceholder("Max")
+							.setValue(String(this.plugin.settings.randomizeBlurMax))
+							.onChange(async (value) => {
+								const num = parseFloat(value);
+								if (!isNaN(num) && num >= 0) {
+									this.plugin.settings.randomizeBlurMax = num;
+									await this.plugin.saveSettings();
+								}
+							})
+					);
+			}
+
+			// Background Color
+			new Setting(containerEl)
+				.setName("Background color")
+				.addToggle((toggle) =>
+					toggle
+						.setValue(this.plugin.settings.randomizeBackgroundColor)
+						.onChange(async (value) => {
+							this.plugin.settings.randomizeBackgroundColor = value;
+							await this.plugin.saveSettings();
+							this.display();
+						})
+				);
+
+			if (this.plugin.settings.randomizeBackgroundColor) {
+				const availableBackgroundColors = [
+					{ name: "White", hex: "#ffffff" },
+					{ name: "Lt Gray", hex: "#f5f5f5" },
+					{ name: "Cream", hex: "#fffef0" },
+					{ name: "Lt Blue", hex: "#e6f2ff" },
+					{ name: "Lt Pink", hex: "#ffe6f0" },
+					{ name: "Lt Yellow", hex: "#fffacd" },
+					{ name: "Lt Green", hex: "#e6ffe6" }
+				];
+
+				const bgColorsContainer = containerEl.createDiv();
+				bgColorsContainer.style.marginLeft = "30px";
+				bgColorsContainer.style.marginBottom = "15px";
+
+				for (const color of availableBackgroundColors) {
+					const label = bgColorsContainer.createEl("label");
+					label.style.display = "inline-block";
+					label.style.marginRight = "15px";
+					label.style.marginBottom = "5px";
+					const checkbox = label.createEl("input", { type: "checkbox" });
+					checkbox.checked = this.plugin.settings.randomizeBackgroundColors.includes(color.hex);
+					checkbox.addEventListener("change", async () => {
+						if (checkbox.checked) {
+							if (!this.plugin.settings.randomizeBackgroundColors.includes(color.hex)) {
+								this.plugin.settings.randomizeBackgroundColors.push(color.hex);
+							}
+						} else {
+							this.plugin.settings.randomizeBackgroundColors = this.plugin.settings.randomizeBackgroundColors.filter(c => c !== color.hex);
+						}
+						await this.plugin.saveSettings();
+					});
+					const colorSwatch = label.createEl("span");
+					colorSwatch.style.display = "inline-block";
+					colorSwatch.style.width = "12px";
+					colorSwatch.style.height = "12px";
+					colorSwatch.style.backgroundColor = color.hex;
+					colorSwatch.style.marginRight = "3px";
+					colorSwatch.style.border = "1px solid var(--background-modifier-border)";
+					label.appendChild(document.createTextNode(` ${color.name}`));
+				}
 			}
 		}
 	}
