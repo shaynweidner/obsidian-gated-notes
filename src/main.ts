@@ -283,6 +283,18 @@ interface Settings {
 	/** Randomize background color. */
 	randomizeBackgroundColor: boolean;
 	randomizeBackgroundColors: string[];
+
+	// Mnemonic Systems
+	/** User-defined peg systems for mnemonic generation. */
+	pegSystems: Array<{
+		name: string;
+		pegs: Array<{ number: number; word: string }>;
+	}>;
+	/** User-defined memory palaces for mnemonic generation. */
+	memoryPalaces: Array<{
+		name: string;
+		locations: Array<{ order: number; location: string }>;
+	}>;
 }
 
 const DEFAULT_SETTINGS: Settings = {
@@ -377,6 +389,52 @@ const DEFAULT_SETTINGS: Settings = {
 	randomizeBlurMax: 1,
 	randomizeBackgroundColor: false,
 	randomizeBackgroundColors: ["#ffffff", "#f5f5f5", "#fffef0", "#f0f8ff"],
+
+	// Mnemonic Systems
+	pegSystems: [
+		{
+			name: "Rhyming 1-10",
+			pegs: [
+				{ number: 1, word: "bun" },
+				{ number: 2, word: "shoe" },
+				{ number: 3, word: "tree" },
+				{ number: 4, word: "door" },
+				{ number: 5, word: "hive" },
+				{ number: 6, word: "sticks" },
+				{ number: 7, word: "heaven" },
+				{ number: 8, word: "gate" },
+				{ number: 9, word: "vine" },
+				{ number: 10, word: "hen" },
+			],
+		},
+		{
+			name: "Body (Major System)",
+			pegs: [
+				{ number: 1, word: "Top (head)" },
+				{ number: 2, word: "Nose" },
+				{ number: 3, word: "Mouth" },
+				{ number: 4, word: "Ribs" },
+				{ number: 5, word: "Liver" },
+				{ number: 6, word: "Joint (hip)" },
+				{ number: 7, word: "Cap (knee)" },
+				{ number: 8, word: "Fibula" },
+				{ number: 9, word: "Ball (of foot)" },
+				{ number: 10, word: "Sand (ground)" },
+			],
+		},
+	],
+	memoryPalaces: [
+		{
+			name: "Generic House",
+			locations: [
+				{ order: 1, location: "Front door" },
+				{ order: 2, location: "Hallway" },
+				{ order: 3, location: "Living room" },
+				{ order: 4, location: "Kitchen" },
+				{ order: 5, location: "Bedroom" },
+			],
+		},
+	],
 };
 
 interface ImageAnalysis {
@@ -18083,6 +18141,9 @@ class MnemonicsModal extends Modal {
 	private freeformNotesTextarea!: HTMLTextAreaElement;
 	private selectedStyle: string = "default";
 	private cardTypeOverride: string | null = null;
+	private generateMultiple: boolean = false;
+	private selectedPegSystem: string | null = null;
+	private selectedMemoryPalace: string | null = null;
 
 	constructor(
 		private plugin: GatedNotesPlugin,
@@ -18190,6 +18251,10 @@ class MnemonicsModal extends Modal {
 			{ value: "humorous", label: "Humorous" },
 			{ value: "visual", label: "Visual/Concrete" },
 			{ value: "story", label: "Story-based" },
+			{ value: "sounds-alike", label: "Sounds-Alike/Phonetic" },
+			{ value: "acronym", label: "Acronym/Acrostic" },
+			{ value: "peg", label: "Peg/Body Method" },
+			{ value: "spatial", label: "Memory Palace/Spatial" },
 		];
 
 		styleOptions.forEach((option) => {
@@ -18200,9 +18265,98 @@ class MnemonicsModal extends Modal {
 		});
 
 		styleDropdown.value = this.selectedStyle;
+
+		// Create containers for peg system and memory palace selection (initially hidden)
+		const pegSystemContainer = styleContainer.createDiv({
+			cls: "peg-system-selection-container",
+		});
+		pegSystemContainer.style.cssText = "display: none; margin-top: 10px;";
+		pegSystemContainer.createEl("label", {
+			text: "Select Peg System:",
+			cls: "peg-system-label",
+		});
+		const pegSystemDropdown = pegSystemContainer.createEl("select", {
+			cls: "peg-system-dropdown",
+		});
+		pegSystemDropdown.style.cssText =
+			"width: 200px; padding: 5px; border-radius: 4px; border: 1px solid var(--background-modifier-border); margin-left: 10px;";
+
+		const memoryPalaceContainer = styleContainer.createDiv({
+			cls: "memory-palace-selection-container",
+		});
+		memoryPalaceContainer.style.cssText = "display: none; margin-top: 10px;";
+		memoryPalaceContainer.createEl("label", {
+			text: "Select Memory Palace:",
+			cls: "memory-palace-label",
+		});
+		const memoryPalaceDropdown = memoryPalaceContainer.createEl("select", {
+			cls: "memory-palace-dropdown",
+		});
+		memoryPalaceDropdown.style.cssText =
+			"width: 200px; padding: 5px; border-radius: 4px; border: 1px solid var(--background-modifier-border); margin-left: 10px;";
+
+		// Populate peg systems dropdown
+		this.plugin.settings.pegSystems.forEach((system) => {
+			const optionEl = pegSystemDropdown.createEl("option", {
+				text: system.name,
+				value: system.name,
+			});
+		});
+
+		// Populate memory palaces dropdown
+		this.plugin.settings.memoryPalaces.forEach((palace) => {
+			const optionEl = memoryPalaceDropdown.createEl("option", {
+				text: palace.name,
+				value: palace.name,
+			});
+		});
+
+		// Function to update second dropdown visibility
+		const updateSecondDropdown = () => {
+			const style = styleDropdown.value;
+
+			// Hide both by default
+			pegSystemContainer.style.display = "none";
+			memoryPalaceContainer.style.display = "none";
+
+			// Show appropriate dropdown based on style
+			if (style === "peg") {
+				pegSystemContainer.style.display = "block";
+				if (this.plugin.settings.pegSystems.length > 0) {
+					this.selectedPegSystem = pegSystemDropdown.value || this.plugin.settings.pegSystems[0].name;
+					pegSystemDropdown.value = this.selectedPegSystem;
+				}
+			} else if (style === "spatial") {
+				memoryPalaceContainer.style.display = "block";
+				if (this.plugin.settings.memoryPalaces.length > 0) {
+					this.selectedMemoryPalace = memoryPalaceDropdown.value || this.plugin.settings.memoryPalaces[0].name;
+					memoryPalaceDropdown.value = this.selectedMemoryPalace;
+				}
+			} else {
+				// Clear selections when not using peg/spatial
+				this.selectedPegSystem = null;
+				this.selectedMemoryPalace = null;
+			}
+		};
+
+		// Update on style change
 		styleDropdown.addEventListener("change", () => {
 			this.selectedStyle = styleDropdown.value;
+			updateSecondDropdown();
 		});
+
+		// Update on peg system selection
+		pegSystemDropdown.addEventListener("change", () => {
+			this.selectedPegSystem = pegSystemDropdown.value;
+		});
+
+		// Update on memory palace selection
+		memoryPalaceDropdown.addEventListener("change", () => {
+			this.selectedMemoryPalace = memoryPalaceDropdown.value;
+		});
+
+		// Initialize on load
+		updateSecondDropdown();
 
 		// Card Type Override Section
 		const cardTypeContainer = freeformSection.createDiv({
@@ -18258,6 +18412,30 @@ class MnemonicsModal extends Modal {
 			if (cardTypeCheckbox.checked) {
 				this.cardTypeOverride = cardTypeDropdown.value;
 			}
+		});
+
+		// Multi-generation checkbox
+		const multiGenContainer = freeformSection.createDiv({
+			cls: "multi-gen-container",
+		});
+		multiGenContainer.style.cssText = "margin-top: 10px; margin-bottom: 10px;";
+
+		const multiGenToggle = multiGenContainer.createEl("label", {
+			cls: "multi-gen-toggle-label",
+		});
+
+		const multiGenCheckbox = multiGenToggle.createEl("input", {
+			type: "checkbox",
+			cls: "multi-gen-checkbox",
+		});
+
+		multiGenToggle.createSpan({
+			text: " Generate 3 alternatives (instead of 1)",
+			cls: "multi-gen-toggle-text",
+		});
+
+		multiGenCheckbox.addEventListener("change", () => {
+			this.generateMultiple = multiGenCheckbox.checked;
 		});
 
 		const aiButtonsContainer = freeformSection.createDiv({
@@ -18578,26 +18756,36 @@ class MnemonicsModal extends Modal {
 					"\nYou may use these words in your mental imagery if they help make it more memorable.";
 			}
 
-			// Check for existing freeform content - remove labels for LLM, prepare for display
+			// Parse existing content to extract mnemonics and determine next number
 			const rawValue = this.freeformNotesTextarea.value.trim();
-			let contentForLlm = rawValue;
-			let existingContentForDisplay = rawValue;
+			let priorMnemonics = "";
+			let nextMnemonicNumber = 1;
 
-			// If content has labels, extract all content for LLM and preserve for display
-			if (
-				rawValue.includes("**ORIGINAL:**\n") &&
-				rawValue.includes("\n\n**NEW GENERATION:**\n")
-			) {
-				// Remove the labels but keep all content for LLM
-				contentForLlm = rawValue
-					.replace("**ORIGINAL:**\n", "")
-					.replace("\n\n**NEW GENERATION:**\n", "\n\n");
-				// For display, we'll use the cleaned content as "ORIGINAL"
-				existingContentForDisplay = contentForLlm;
+			// Extract all prior mnemonics (everything before "NEW MNEMONICS:" if it exists)
+			if (rawValue.includes("NEW MNEMONICS:")) {
+				const parts = rawValue.split("NEW MNEMONICS:");
+				priorMnemonics = parts[0].replace("PRIOR MNEMONICS:", "").trim();
+			} else if (rawValue.includes("PRIOR MNEMONICS:")) {
+				priorMnemonics = rawValue.replace("PRIOR MNEMONICS:", "").trim();
+			} else if (rawValue) {
+				// Content exists but no labels yet - treat as prior mnemonics
+				priorMnemonics = rawValue;
 			}
 
-			const existingMnemonicsContext = contentForLlm
-				? `\n\nEXISTING MNEMONICS:\n\`\`\`\n${contentForLlm}\n\`\`\`\n\nThe above are mnemonics the user already has. Create additional mental imagery that complements or provides alternatives to what's already there.`
+			// Count existing mnemonics to determine next number
+			if (priorMnemonics) {
+				const mnemonicMatches = priorMnemonics.match(/Mnemonic (\d+):/g);
+				if (mnemonicMatches) {
+					const numbers = mnemonicMatches.map(m => {
+						const match = m.match(/\d+/);
+						return match ? parseInt(match[0]) : 0;
+					});
+					nextMnemonicNumber = Math.max(...numbers) + 1;
+				}
+			}
+
+			const existingMnemonicsContext = priorMnemonics
+				? `\n\nPRIOR MNEMONICS:\n\`\`\`\n${priorMnemonics}\n\`\`\`\n\nThe user already has the above mnemonics. Create ${this.generateMultiple ? "3" : "1"} additional mnemonic${this.generateMultiple ? "s" : ""} that complement${this.generateMultiple ? "" : "s"} or provide${this.generateMultiple ? "" : "s"} alternative${this.generateMultiple ? "s" : ""} to what's already there.`
 				: "";
 
 			// Get style-specific instructions
@@ -18623,37 +18811,77 @@ class MnemonicsModal extends Modal {
 					styleInstructions =
 						"Create a NARRATIVE story structure with characters, plot, and sequence that connects all elements in a memorable tale.";
 					break;
+				case "sounds-alike":
+					styleInstructions =
+						"Use SOUNDS-ALIKE/PHONETIC anchors - find words or phrases that sound similar to what needs to be remembered. Create vivid associations using these phonetic connections (e.g., 'Astyanax' sounds like 'ask-tea-in-axe').";
+					break;
+				case "acronym":
+					styleInstructions =
+						"Create an ACRONYM or ACROSTIC using these steps:\n1. First, extract the KEY WORD from each item that needs to be remembered\n2. List out the mapping (Item → Key Word → Letter)\n3. Take the first letter of each key word to form your letter sequence\n4. Create EITHER:\n   - A memorable pronounceable word from those letters (like HOMES for Great Lakes: Huron, Ontario, Michigan, Erie, Superior)\n   - OR a memorable sentence where each word starts with the needed letter\n5. For multiple alternatives, try choosing DIFFERENT key words from the items, not different sentences for the same letters";
+					break;
+				case "peg":
+					if (this.selectedPegSystem) {
+						const pegSystem = this.plugin.settings.pegSystems.find(s => s.name === this.selectedPegSystem);
+						if (pegSystem) {
+							const pegList = pegSystem.pegs.map(p => `${p.number}=${p.word}`).join(", ");
+							styleInstructions =
+								`Use the PEG/BODY METHOD - attach each item to a numbered peg using the "${pegSystem.name}" system:\n\n${pegList}\n\nDo not modify these peg words. Create vivid interactions between each item and its peg/body location.`;
+						} else {
+							styleInstructions = "Use the PEG/BODY METHOD - No peg system selected.";
+						}
+					} else {
+						styleInstructions = "Use the PEG/BODY METHOD - No peg system selected.";
+					}
+					break;
+				case "spatial":
+					if (this.selectedMemoryPalace) {
+						const palace = this.plugin.settings.memoryPalaces.find(p => p.name === this.selectedMemoryPalace);
+						if (palace) {
+							const locationList = palace.locations.map(l => `${l.order}=${l.location}`).join(", ");
+							styleInstructions =
+								`Create a MEMORY PALACE/SPATIAL arrangement using the "${palace.name}" palace:\n\nLocations: ${locationList}\n\nPlace items in these specific locations in sequence. Describe where each item is positioned and what it's doing in that location.`;
+						} else {
+							styleInstructions = "Create a MEMORY PALACE/SPATIAL arrangement - No memory palace selected.";
+						}
+					} else {
+						styleInstructions = "Create a MEMORY PALACE/SPATIAL arrangement - No memory palace selected.";
+					}
+					break;
 				default:
 					styleInstructions =
 						"Use any memorable technique that works best for this content.";
 			}
 
-			// Get card type specific instructions
+			// Determine if we need card type instructions
+			// Skip generic card type analysis if using a specific mnemonic strategy
+			const hasSpecificStrategy = ["sounds-alike", "acronym", "peg", "spatial"].includes(this.selectedStyle);
+
 			let cardTypeInstructions = "";
 			if (this.cardTypeOverride) {
 				switch (this.cardTypeOverride) {
 					case "list":
 						cardTypeInstructions =
-							"CARD TYPE: This is a **list** (steps, parts, names). Create a short visual story where each item appears in order and is clearly symbolized.";
+							"CARD TYPE: This is a **list** (steps, parts, names). Apply your chosen mnemonic strategy to each item in order.";
 						break;
 					case "quote":
 						cardTypeInstructions =
-							"CARD TYPE: This is a **quote or verse**. Make an image that helps trigger the wording or message.";
+							"CARD TYPE: This is a **quote or verse**. Use your strategy to help trigger the wording or message.";
 						break;
 					case "foreign":
 						cardTypeInstructions =
-							"CARD TYPE: This involves **foreign or unfamiliar words**. Use 'sounds-like' or symbolic associations to anchor the terms.";
+							"CARD TYPE: This involves **foreign or unfamiliar words**. Apply your strategy with special attention to pronunciation and meaning.";
 						break;
 					case "concept":
 						cardTypeInstructions =
-							"CARD TYPE: This is a **concept or definition**. Use metaphors or striking visual symbols.";
+							"CARD TYPE: This is a **concept or definition**. Use your strategy to make the abstract concrete.";
 						break;
 					case "number":
 						cardTypeInstructions =
-							"CARD TYPE: This **contains numbers**. Incorporate the provided Major System words to enhance memorability.";
+							"CARD TYPE: This **contains numbers**. You may incorporate the provided Major System words if helpful.";
 						break;
 				}
-			} else {
+			} else if (!hasSpecificStrategy) {
+				// Only add generic analysis instructions if not using a specific strategy
 				cardTypeInstructions = `Start by analyzing the card type:
 - If it's a **list** (e.g. steps, parts, names), create a short visual story where each item appears in order and is clearly symbolized.
 - If it's a **quote or verse**, make an image that helps trigger the wording or message.
@@ -18662,15 +18890,41 @@ class MnemonicsModal extends Modal {
 - If it's a **concept**, use metaphors or striking visual symbols.`;
 			}
 
-			const prompt = `You are a mnemonic coach helping someone remember flashcards. Your job is to ${
-				this.cardTypeOverride
-					? "create"
-					: "first identify what kind of memory is required and then generate"
-			} a vivid image, scene, or memory hook accordingly.
+			// Determine output format instructions based on strategy
+			let outputInstructions = "";
+			if (this.selectedStyle === "acronym") {
+				outputInstructions = this.generateMultiple
+					? `Return 3 different acronym/acrostic options in this exact format:\n\nMnemonic ${nextMnemonicNumber}:\nKey words: [Item 1 → Word → Letter, Item 2 → Word → Letter, etc.]\nAcronym: [The resulting acronym/acrostic]\nExplanation: [Brief vivid description if helpful]\n\nMnemonic ${nextMnemonicNumber + 1}:\nKey words: [Different key words chosen from the items]\nAcronym: [The resulting acronym/acrostic]\nExplanation: [Brief vivid description if helpful]\n\nMnemonic ${nextMnemonicNumber + 2}:\nKey words: [Yet another set of key words]\nAcronym: [The resulting acronym/acrostic]\nExplanation: [Brief vivid description if helpful]\n\nDo not add any other text or labels.`
+					: `Return a single acronym/acrostic in this exact format:\n\nMnemonic ${nextMnemonicNumber}:\nKey words: [Item 1 → Word → Letter, Item 2 → Word → Letter, etc.]\nAcronym: [The resulting acronym/acrostic]\nExplanation: [Brief vivid description if helpful]\n\nDo not add any other text or labels.`;
+			} else if (this.selectedStyle === "sounds-alike") {
+				outputInstructions = this.generateMultiple
+					? `Return 3 different sounds-alike options in this exact format:\n\nMnemonic ${nextMnemonicNumber}:\nWord/Phrase: [What needs to be remembered]\nSounds like: [Phonetic breakdown]\nVivid association: [The memorable connection]\n\nMnemonic ${nextMnemonicNumber + 1}:\nWord/Phrase: [What needs to be remembered]\nSounds like: [Different phonetic breakdown]\nVivid association: [The memorable connection]\n\nMnemonic ${nextMnemonicNumber + 2}:\nWord/Phrase: [What needs to be remembered]\nSounds like: [Yet another phonetic breakdown]\nVivid association: [The memorable connection]\n\nDo not add any other text or labels.`
+					: `Return a single sounds-alike mnemonic in this exact format:\n\nMnemonic ${nextMnemonicNumber}:\nWord/Phrase: [What needs to be remembered]\nSounds like: [Phonetic breakdown]\nVivid association: [The memorable connection]\n\nDo not add any other text or labels.`;
+			} else if (this.selectedStyle === "peg") {
+				const pegSystemName = this.selectedPegSystem || "selected system";
+				outputInstructions = this.generateMultiple
+					? `Return 3 different peg/body method options in this exact format:\n\nMnemonic ${nextMnemonicNumber}:\nPeg system: ${pegSystemName}\nMappings:\n  Item 1 → Peg/Location → [vivid interaction]\n  Item 2 → Peg/Location → [vivid interaction]\n  [etc.]\n\nMnemonic ${nextMnemonicNumber + 1}:\nPeg system: ${pegSystemName}\nMappings:\n  [different mappings]\n\nMnemonic ${nextMnemonicNumber + 2}:\nPeg system: ${pegSystemName}\nMappings:\n  [different mappings]\n\nDo not add any other text or labels.`
+					: `Return a single peg/body method mnemonic in this exact format:\n\nMnemonic ${nextMnemonicNumber}:\nPeg system: ${pegSystemName}\nMappings:\n  Item 1 → Peg/Location → [vivid interaction]\n  Item 2 → Peg/Location → [vivid interaction]\n  [etc.]\n\nDo not add any other text or labels.`;
+			} else if (this.selectedStyle === "spatial") {
+				const palaceName = this.selectedMemoryPalace || "selected palace";
+				outputInstructions = this.generateMultiple
+					? `Return 3 different memory palace/spatial options in this exact format:\n\nMnemonic ${nextMnemonicNumber}:\nLocation: ${palaceName}\nSpatial mappings:\n  Item 1 → [Location 1] → [what's happening there]\n  Item 2 → [Location 2] → [what's happening there]\n  [etc.]\n\nMnemonic ${nextMnemonicNumber + 1}:\nLocation: ${palaceName}\nSpatial mappings:\n  [different mappings]\n\nMnemonic ${nextMnemonicNumber + 2}:\nLocation: ${palaceName}\nSpatial mappings:\n  [different mappings]\n\nDo not add any other text or labels.`
+					: `Return a single memory palace/spatial mnemonic in this exact format:\n\nMnemonic ${nextMnemonicNumber}:\nLocation: ${palaceName}\nSpatial mappings:\n  Item 1 → [Location 1] → [what's happening there]\n  Item 2 → [Location 2] → [what's happening there]\n  [etc.]\n\nDo not add any other text or labels.`;
+			} else {
+				// Visual strategies (default, alliterative, rhyming, humorous, visual, story)
+				outputInstructions = this.generateMultiple
+					? `Return ${this.generateMultiple ? "3 different vivid mental image" : "a single vivid mental image"} option${this.generateMultiple ? "s" : ""} in this exact format:\n\nMnemonic ${nextMnemonicNumber}:\n[Your vivid mental image]\n\nMnemonic ${nextMnemonicNumber + 1}:\n[Your vivid mental image]\n\nMnemonic ${nextMnemonicNumber + 2}:\n[Your vivid mental image]\n\nDo not explain or label the card type. Do not describe your reasoning. Just output the memory image${this.generateMultiple ? "s" : ""}.`
+					: `Return a single vivid mental image in this exact format:\n\nMnemonic ${nextMnemonicNumber}:\n[Your vivid mental image]\n\nDo not explain or label the card type. Do not describe your reasoning. Just output the memory image.`;
+			}
+
+			const prompt = `You are a mnemonic coach helping someone remember flashcards. ${
+				hasSpecificStrategy
+					? "Apply the specified mnemonic technique to create a memorable hook for this card."
+					: `Your job is to ${this.cardTypeOverride ? "create" : "first identify what kind of memory is required and then generate"} a vivid image, scene, or memory hook accordingly.`
+			}
 
 STYLE PREFERENCE: ${styleInstructions}
-
-${cardTypeInstructions}
+${cardTypeInstructions ? "\n" + cardTypeInstructions : ""}
 
 Use concrete, sensory details—sight, sound, exaggeration, emotion. Be weird, wild, or surprising if it helps memory.
 
@@ -18678,19 +18932,20 @@ Use concrete, sensory details—sight, sound, exaggeration, emotion. Be weird, w
 FRONT: ${front}
 BACK: ${back}${majorSystemContext}${existingMnemonicsContext}
 
-Return only the vivid mental image. Do not explain or label the card type. Do not describe your reasoning. Just output the memory image.`;
+${outputInstructions}`;
 
 			const response = await this.plugin.sendToLlm(prompt, [], {}, "flashcard");
 
 			if (response.content.trim()) {
-				if (existingContentForDisplay) {
-					// Side-by-side format: all previous content as ORIGINAL, new response as NEW GENERATION
+				if (priorMnemonics) {
+					// Collapse prior mnemonics and add new ones
 					this.freeformNotesTextarea.value =
-						"**ORIGINAL:**\n" +
-						existingContentForDisplay +
-						"\n\n**NEW GENERATION:**\n" +
+						"PRIOR MNEMONICS:\n" +
+						priorMnemonics +
+						"\n\nNEW MNEMONICS:\n" +
 						response.content.trim();
 				} else {
+					// First generation - no labels needed
 					this.freeformNotesTextarea.value = response.content.trim();
 				}
 				new Notice("Mental imagery generated!");
@@ -18773,6 +19028,22 @@ Return only the vivid mental image. Do not explain or label the card type. Do no
 					styleInstructions =
 						"Create a NARRATIVE sequence - arrange emojis to tell a story with beginning, middle, and end that connects the concepts.";
 					break;
+				case "sounds-alike":
+					styleInstructions =
+						"Use SOUNDS-ALIKE/PHONETIC emojis - choose emojis whose names sound like the words to remember (e.g., 🐝 'bee' for the letter B, 👁️ 'eye' for I).";
+					break;
+				case "acronym":
+					styleInstructions =
+						"Create an ACRONYM using emojis - select emojis whose first letters spell out a word or memorable phrase. Use emoji names strategically.";
+					break;
+				case "peg":
+					styleInstructions =
+						"Use PEG/BODY METHOD emojis - show items attached to numbered pegs or body parts. Include number emojis or body part emojis followed by the item emojis.";
+					break;
+				case "spatial":
+					styleInstructions =
+						"Create SPATIAL/MEMORY PALACE emojis - use location/building emojis (🏠🚪🪟) to show where items are placed in space.";
+					break;
 				default:
 					styleInstructions =
 						"Use any creative approach that makes the most memorable emoji sequence.";
@@ -18851,6 +19122,996 @@ Provide only the emoji sequence, no additional explanation.`;
 			console.error("Error generating emoji sequence:", error);
 			new Notice("Error generating emoji sequence. Please try again.");
 		}
+	}
+
+	onClose() {
+		this.contentEl.empty();
+	}
+}
+
+/**
+ * Modal for managing peg systems.
+ */
+class PegSystemsManagementModal extends Modal {
+	constructor(
+		private plugin: GatedNotesPlugin,
+		private onUpdate: () => void
+	) {
+		super(plugin.app);
+	}
+
+	onOpen() {
+		this.titleEl.setText("Manage Peg Systems");
+		this.contentEl.empty();
+
+		// Add "Create New" button at top
+		const createButtonContainer = this.contentEl.createDiv({
+			cls: "peg-create-button-container",
+		});
+		createButtonContainer.style.cssText = "margin-bottom: 16px;";
+
+		new ButtonComponent(createButtonContainer)
+			.setButtonText("Create New Peg System")
+			.setCta()
+			.onClick(() => {
+				new PegSystemEditModal(
+					this.plugin,
+					null,
+					null,
+					() => {
+						this.onUpdate();
+						this.onOpen(); // Refresh
+					}
+				).open();
+			});
+
+		const pegSystems = this.plugin.settings.pegSystems;
+
+		if (pegSystems.length === 0) {
+			this.contentEl.createEl("p", {
+				text: "No peg systems found. Create one to get started.",
+				cls: "u-center",
+			});
+			return;
+		}
+
+		// Add instructions for reordering
+		if (pegSystems.length > 1) {
+			const instructions = this.contentEl.createDiv({
+				cls: "peg-instructions",
+			});
+			instructions.style.cssText =
+				"margin-bottom: 16px; padding: 8px; background: var(--background-secondary); border-radius: 4px; font-size: 0.9em; color: var(--text-muted);";
+			instructions.createEl("span", {
+				text: "💡 Tip: Drag and drop to reorder systems",
+			});
+		}
+
+		// Create sortable container
+		const listContainer = this.contentEl.createDiv({
+			cls: "peg-system-list",
+		});
+
+		pegSystems.forEach((system, index) => {
+			const container = listContainer.createDiv({
+				cls: "peg-system-item",
+				attr: { "data-index": index.toString() },
+			});
+			container.style.cssText =
+				"padding: 12px; border: 1px solid var(--background-modifier-border); margin-bottom: 8px; border-radius: 4px; cursor: grab; position: relative;";
+			container.draggable = true;
+
+			// Add drag handle
+			const dragHandle = container.createDiv({ cls: "drag-handle" });
+			dragHandle.style.cssText =
+				"position: absolute; left: 4px; top: 50%; transform: translateY(-50%); color: var(--text-muted); font-size: 14px; cursor: grab;";
+			dragHandle.textContent = "⋮⋮";
+
+			// Adjust container padding to account for drag handle
+			container.style.paddingLeft = "24px";
+
+			const header = container.createDiv({
+				cls: "peg-system-header",
+			});
+			header.style.cssText =
+				"display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px;";
+			header.createEl("strong", { text: system.name });
+
+			const preview = container.createDiv({
+				cls: "peg-system-preview",
+			});
+			preview.style.cssText =
+				"margin-bottom: 12px; color: var(--text-muted); font-size: 0.9em; line-height: 1.3;";
+			const previewText = system.pegs
+				.slice(0, 3)
+				.map((p) => `${p.number}=${p.word}`)
+				.join(", ");
+			const moreText =
+				system.pegs.length > 3
+					? ` ... (${system.pegs.length} total)`
+					: "";
+			preview.createEl("span", { text: previewText + moreText });
+
+			const buttonContainer = container.createDiv({
+				cls: "peg-system-buttons",
+			});
+			buttonContainer.style.cssText = "display: flex; gap: 8px;";
+
+			new ButtonComponent(buttonContainer)
+				.setButtonText("Edit")
+				.onClick(() => {
+					new PegSystemEditModal(
+						this.plugin,
+						index,
+						system,
+						() => {
+							this.onUpdate();
+							this.onOpen(); // Refresh
+						}
+					).open();
+				});
+
+			new ButtonComponent(buttonContainer)
+				.setButtonText("Delete")
+				.setWarning()
+				.onClick(async () => {
+					if (
+						confirm(
+							`Delete peg system "${system.name}"? This cannot be undone.`
+						)
+					) {
+						this.plugin.settings.pegSystems.splice(index, 1);
+						await this.plugin.saveSettings();
+						this.onUpdate();
+						this.onOpen(); // Refresh
+					}
+				});
+		});
+
+		// Add drag and drop event listeners
+		this.setupDragAndDrop(listContainer);
+	}
+
+	private setupDragAndDrop(container: HTMLElement) {
+		let draggedElement: HTMLElement | null = null;
+
+		container.addEventListener("dragstart", (e) => {
+			if (
+				e.target instanceof HTMLElement &&
+				e.target.classList.contains("peg-system-item")
+			) {
+				draggedElement = e.target;
+				e.target.style.opacity = "0.5";
+			}
+		});
+
+		container.addEventListener("dragend", (e) => {
+			if (
+				e.target instanceof HTMLElement &&
+				e.target.classList.contains("peg-system-item")
+			) {
+				e.target.style.opacity = "1";
+				draggedElement = null;
+			}
+		});
+
+		container.addEventListener("dragover", (e) => {
+			e.preventDefault();
+		});
+
+		container.addEventListener("drop", async (e) => {
+			e.preventDefault();
+
+			if (!draggedElement) return;
+
+			const targetElement = (e.target as HTMLElement).closest(
+				".peg-system-item"
+			) as HTMLElement;
+			if (!targetElement || targetElement === draggedElement) return;
+
+			// Get the new order
+			const items = Array.from(
+				container.querySelectorAll(".peg-system-item")
+			);
+			const draggedIndex = items.indexOf(draggedElement);
+			const targetIndex = items.indexOf(targetElement);
+
+			// Move the element in the DOM
+			if (draggedIndex < targetIndex) {
+				targetElement.parentNode?.insertBefore(
+					draggedElement,
+					targetElement.nextSibling
+				);
+			} else {
+				targetElement.parentNode?.insertBefore(
+					draggedElement,
+					targetElement
+				);
+			}
+
+			// Update the order in settings
+			const newOrder: Array<{
+				name: string;
+				pegs: Array<{ number: number; word: string }>;
+			}> = [];
+			const itemElements = Array.from(
+				container.querySelectorAll(".peg-system-item")
+			);
+
+			itemElements.forEach((el) => {
+				const idx = parseInt(
+					(el as HTMLElement).getAttribute("data-index") || "0"
+				);
+				newOrder.push(this.plugin.settings.pegSystems[idx]);
+			});
+
+			this.plugin.settings.pegSystems = newOrder;
+			await this.plugin.saveSettings();
+			this.onUpdate();
+			this.onOpen(); // Refresh to update indices
+		});
+	}
+
+	onClose() {
+		this.contentEl.empty();
+	}
+}
+
+/**
+ * Modal for editing a single peg system.
+ */
+class PegSystemEditModal extends Modal {
+	private nameInput!: TextComponent;
+	private pegListContainer!: HTMLElement;
+	private pegs: Array<{ number: number; word: string }> = [];
+
+	constructor(
+		private plugin: GatedNotesPlugin,
+		private systemIndex: number | null,
+		private existingSystem: {
+			name: string;
+			pegs: Array<{ number: number; word: string }>;
+		} | null,
+		private onDone: () => void
+	) {
+		super(plugin.app);
+
+		// Initialize with existing data or empty
+		if (existingSystem) {
+			this.pegs = [...existingSystem.pegs];
+		} else {
+			this.pegs = [{ number: 1, word: "" }];
+		}
+	}
+
+	onOpen() {
+		this.titleEl.setText(
+			this.existingSystem ? "Edit Peg System" : "Create Peg System"
+		);
+		this.contentEl.empty();
+
+		// System name
+		new Setting(this.contentEl).setName("System Name").addText((text) => {
+			this.nameInput = text;
+			text.setPlaceholder("e.g., Rhyming 1-10");
+			if (this.existingSystem) {
+				text.setValue(this.existingSystem.name);
+			}
+		});
+
+		// Pegs list header
+		const pegsHeader = this.contentEl.createDiv({
+			cls: "pegs-list-header",
+		});
+		pegsHeader.style.cssText =
+			"margin-top: 16px; margin-bottom: 8px; font-weight: bold;";
+		pegsHeader.createEl("span", { text: "Pegs" });
+
+		// Instructions for reordering
+		const instructions = this.contentEl.createDiv({
+			cls: "pegs-instructions",
+		});
+		instructions.style.cssText =
+			"margin-bottom: 12px; padding: 8px; background: var(--background-secondary); border-radius: 4px; font-size: 0.9em; color: var(--text-muted);";
+		instructions.createEl("span", {
+			text: "💡 Tip: Drag and drop to reorder pegs",
+		});
+
+		// Container for peg items
+		this.pegListContainer = this.contentEl.createDiv({
+			cls: "peg-list-container",
+		});
+		this.pegListContainer.style.cssText = "margin-bottom: 16px;";
+
+		this.renderPegList();
+
+		// Add peg button
+		const addButtonContainer = this.contentEl.createDiv();
+		addButtonContainer.style.cssText = "margin-bottom: 16px;";
+
+		new ButtonComponent(addButtonContainer)
+			.setButtonText("Add Peg")
+			.onClick(() => {
+				const maxNumber =
+					this.pegs.length > 0
+						? Math.max(...this.pegs.map((p) => p.number))
+						: 0;
+				this.pegs.push({ number: maxNumber + 1, word: "" });
+				this.renderPegList();
+			});
+
+		// Save/Cancel buttons
+		const buttonContainer = this.contentEl.createDiv({
+			cls: "modal-button-container",
+		});
+		buttonContainer.style.marginTop = "16px";
+
+		new ButtonComponent(buttonContainer)
+			.setButtonText("Save")
+			.setCta()
+			.onClick(async () => {
+				const name = this.nameInput.getValue().trim();
+				if (!name) {
+					new Notice("Please enter a system name");
+					return;
+				}
+
+				// Validate pegs
+				const validPegs = this.pegs.filter((p) => p.word.trim() !== "");
+				if (validPegs.length === 0) {
+					new Notice("Please add at least one peg");
+					return;
+				}
+
+				const newSystem = {
+					name,
+					pegs: validPegs,
+				};
+
+				if (this.systemIndex !== null) {
+					// Update existing
+					this.plugin.settings.pegSystems[this.systemIndex] =
+						newSystem;
+				} else {
+					// Create new
+					this.plugin.settings.pegSystems.push(newSystem);
+				}
+
+				await this.plugin.saveSettings();
+				this.close();
+				this.onDone();
+			});
+
+		new ButtonComponent(buttonContainer)
+			.setButtonText("Cancel")
+			.onClick(() => {
+				this.close();
+			});
+	}
+
+	private renderPegList() {
+		this.pegListContainer.empty();
+
+		this.pegs.forEach((peg, index) => {
+			const pegItem = this.pegListContainer.createDiv({
+				cls: "peg-item",
+				attr: { "data-index": index.toString() },
+			});
+			pegItem.style.cssText =
+				"display: flex; align-items: center; gap: 8px; padding: 8px; border: 1px solid var(--background-modifier-border); margin-bottom: 4px; border-radius: 4px; cursor: grab; position: relative;";
+			pegItem.draggable = true;
+
+			// Drag handle
+			const dragHandle = pegItem.createDiv({ cls: "drag-handle" });
+			dragHandle.style.cssText =
+				"color: var(--text-muted); font-size: 14px; cursor: grab;";
+			dragHandle.textContent = "⋮⋮";
+
+			// Number input
+			const numberInput = pegItem.createEl("input", {
+				type: "number",
+				attr: { min: "1", step: "1" },
+			});
+			numberInput.style.cssText = "width: 60px;";
+			numberInput.value = peg.number.toString();
+			numberInput.addEventListener("change", () => {
+				this.pegs[index].number = parseInt(numberInput.value) || 1;
+			});
+
+			// Word input
+			const wordInput = pegItem.createEl("input", {
+				type: "text",
+				attr: { placeholder: "e.g., bun" },
+			});
+			wordInput.style.cssText = "flex: 1;";
+			wordInput.value = peg.word;
+			wordInput.addEventListener("change", () => {
+				this.pegs[index].word = wordInput.value;
+			});
+
+			// Delete button
+			const deleteButton = new ButtonComponent(pegItem);
+			deleteButton.setButtonText("×");
+			deleteButton.setWarning();
+			deleteButton.onClick(() => {
+				this.pegs.splice(index, 1);
+				this.renderPegList();
+			});
+		});
+
+		// Setup drag and drop
+		this.setupPegDragAndDrop();
+	}
+
+	private setupPegDragAndDrop() {
+		let draggedElement: HTMLElement | null = null;
+
+		this.pegListContainer.addEventListener("dragstart", (e) => {
+			if (
+				e.target instanceof HTMLElement &&
+				e.target.classList.contains("peg-item")
+			) {
+				draggedElement = e.target;
+				e.target.style.opacity = "0.5";
+			}
+		});
+
+		this.pegListContainer.addEventListener("dragend", (e) => {
+			if (
+				e.target instanceof HTMLElement &&
+				e.target.classList.contains("peg-item")
+			) {
+				e.target.style.opacity = "1";
+				draggedElement = null;
+			}
+		});
+
+		this.pegListContainer.addEventListener("dragover", (e) => {
+			e.preventDefault();
+		});
+
+		this.pegListContainer.addEventListener("drop", (e) => {
+			e.preventDefault();
+
+			if (!draggedElement) return;
+
+			const targetElement = (e.target as HTMLElement).closest(
+				".peg-item"
+			) as HTMLElement;
+			if (!targetElement || targetElement === draggedElement) return;
+
+			// Get the new order
+			const items = Array.from(
+				this.pegListContainer.querySelectorAll(".peg-item")
+			);
+			const draggedIndex = items.indexOf(draggedElement);
+			const targetIndex = items.indexOf(targetElement);
+
+			// Move the element in the DOM
+			if (draggedIndex < targetIndex) {
+				targetElement.parentNode?.insertBefore(
+					draggedElement,
+					targetElement.nextSibling
+				);
+			} else {
+				targetElement.parentNode?.insertBefore(
+					draggedElement,
+					targetElement
+				);
+			}
+
+			// Update the pegs array
+			const newOrder: Array<{ number: number; word: string }> = [];
+			const itemElements = Array.from(
+				this.pegListContainer.querySelectorAll(".peg-item")
+			);
+
+			itemElements.forEach((el) => {
+				const idx = parseInt(
+					(el as HTMLElement).getAttribute("data-index") || "0"
+				);
+				newOrder.push(this.pegs[idx]);
+			});
+
+			this.pegs = newOrder;
+			this.renderPegList();
+		});
+	}
+
+	onClose() {
+		this.contentEl.empty();
+	}
+}
+
+/**
+ * Modal for managing memory palaces.
+ */
+class MemoryPalacesManagementModal extends Modal {
+	constructor(
+		private plugin: GatedNotesPlugin,
+		private onUpdate: () => void
+	) {
+		super(plugin.app);
+	}
+
+	onOpen() {
+		this.titleEl.setText("Manage Memory Palaces");
+		this.contentEl.empty();
+
+		// Add "Create New" button at top
+		const createButtonContainer = this.contentEl.createDiv({
+			cls: "palace-create-button-container",
+		});
+		createButtonContainer.style.cssText = "margin-bottom: 16px;";
+
+		new ButtonComponent(createButtonContainer)
+			.setButtonText("Create New Memory Palace")
+			.setCta()
+			.onClick(() => {
+				new MemoryPalaceEditModal(
+					this.plugin,
+					null,
+					null,
+					() => {
+						this.onUpdate();
+						this.onOpen(); // Refresh
+					}
+				).open();
+			});
+
+		const palaces = this.plugin.settings.memoryPalaces;
+
+		if (palaces.length === 0) {
+			this.contentEl.createEl("p", {
+				text: "No memory palaces found. Create one to get started.",
+				cls: "u-center",
+			});
+			return;
+		}
+
+		// Add instructions for reordering
+		if (palaces.length > 1) {
+			const instructions = this.contentEl.createDiv({
+				cls: "palace-instructions",
+			});
+			instructions.style.cssText =
+				"margin-bottom: 16px; padding: 8px; background: var(--background-secondary); border-radius: 4px; font-size: 0.9em; color: var(--text-muted);";
+			instructions.createEl("span", {
+				text: "💡 Tip: Drag and drop to reorder palaces",
+			});
+		}
+
+		// Create sortable container
+		const listContainer = this.contentEl.createDiv({
+			cls: "palace-list",
+		});
+
+		palaces.forEach((palace, index) => {
+			const container = listContainer.createDiv({
+				cls: "palace-item",
+				attr: { "data-index": index.toString() },
+			});
+			container.style.cssText =
+				"padding: 12px; border: 1px solid var(--background-modifier-border); margin-bottom: 8px; border-radius: 4px; cursor: grab; position: relative;";
+			container.draggable = true;
+
+			// Add drag handle
+			const dragHandle = container.createDiv({ cls: "drag-handle" });
+			dragHandle.style.cssText =
+				"position: absolute; left: 4px; top: 50%; transform: translateY(-50%); color: var(--text-muted); font-size: 14px; cursor: grab;";
+			dragHandle.textContent = "⋮⋮";
+
+			// Adjust container padding to account for drag handle
+			container.style.paddingLeft = "24px";
+
+			const header = container.createDiv({
+				cls: "palace-header",
+			});
+			header.style.cssText =
+				"display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px;";
+			header.createEl("strong", { text: palace.name });
+
+			const preview = container.createDiv({
+				cls: "palace-preview",
+			});
+			preview.style.cssText =
+				"margin-bottom: 12px; color: var(--text-muted); font-size: 0.9em; line-height: 1.3;";
+			const previewText = palace.locations
+				.slice(0, 3)
+				.map((l) => `${l.order}=${l.location}`)
+				.join(", ");
+			const moreText =
+				palace.locations.length > 3
+					? ` ... (${palace.locations.length} total)`
+					: "";
+			preview.createEl("span", { text: previewText + moreText });
+
+			const buttonContainer = container.createDiv({
+				cls: "palace-buttons",
+			});
+			buttonContainer.style.cssText = "display: flex; gap: 8px;";
+
+			new ButtonComponent(buttonContainer)
+				.setButtonText("Edit")
+				.onClick(() => {
+					new MemoryPalaceEditModal(
+						this.plugin,
+						index,
+						palace,
+						() => {
+							this.onUpdate();
+							this.onOpen(); // Refresh
+						}
+					).open();
+				});
+
+			new ButtonComponent(buttonContainer)
+				.setButtonText("Delete")
+				.setWarning()
+				.onClick(async () => {
+					if (
+						confirm(
+							`Delete memory palace "${palace.name}"? This cannot be undone.`
+						)
+					) {
+						this.plugin.settings.memoryPalaces.splice(index, 1);
+						await this.plugin.saveSettings();
+						this.onUpdate();
+						this.onOpen(); // Refresh
+					}
+				});
+		});
+
+		// Add drag and drop event listeners
+		this.setupDragAndDrop(listContainer);
+	}
+
+	private setupDragAndDrop(container: HTMLElement) {
+		let draggedElement: HTMLElement | null = null;
+
+		container.addEventListener("dragstart", (e) => {
+			if (
+				e.target instanceof HTMLElement &&
+				e.target.classList.contains("palace-item")
+			) {
+				draggedElement = e.target;
+				e.target.style.opacity = "0.5";
+			}
+		});
+
+		container.addEventListener("dragend", (e) => {
+			if (
+				e.target instanceof HTMLElement &&
+				e.target.classList.contains("palace-item")
+			) {
+				e.target.style.opacity = "1";
+				draggedElement = null;
+			}
+		});
+
+		container.addEventListener("dragover", (e) => {
+			e.preventDefault();
+		});
+
+		container.addEventListener("drop", async (e) => {
+			e.preventDefault();
+
+			if (!draggedElement) return;
+
+			const targetElement = (e.target as HTMLElement).closest(
+				".palace-item"
+			) as HTMLElement;
+			if (!targetElement || targetElement === draggedElement) return;
+
+			// Get the new order
+			const items = Array.from(
+				container.querySelectorAll(".palace-item")
+			);
+			const draggedIndex = items.indexOf(draggedElement);
+			const targetIndex = items.indexOf(targetElement);
+
+			// Move the element in the DOM
+			if (draggedIndex < targetIndex) {
+				targetElement.parentNode?.insertBefore(
+					draggedElement,
+					targetElement.nextSibling
+				);
+			} else {
+				targetElement.parentNode?.insertBefore(
+					draggedElement,
+					targetElement
+				);
+			}
+
+			// Update the order in settings
+			const newOrder: Array<{
+				name: string;
+				locations: Array<{ order: number; location: string }>;
+			}> = [];
+			const itemElements = Array.from(
+				container.querySelectorAll(".palace-item")
+			);
+
+			itemElements.forEach((el) => {
+				const idx = parseInt(
+					(el as HTMLElement).getAttribute("data-index") || "0"
+				);
+				newOrder.push(this.plugin.settings.memoryPalaces[idx]);
+			});
+
+			this.plugin.settings.memoryPalaces = newOrder;
+			await this.plugin.saveSettings();
+			this.onUpdate();
+			this.onOpen(); // Refresh to update indices
+		});
+	}
+
+	onClose() {
+		this.contentEl.empty();
+	}
+}
+
+/**
+ * Modal for editing a single memory palace.
+ */
+class MemoryPalaceEditModal extends Modal {
+	private nameInput!: TextComponent;
+	private locationListContainer!: HTMLElement;
+	private locations: Array<{ order: number; location: string }> = [];
+
+	constructor(
+		private plugin: GatedNotesPlugin,
+		private palaceIndex: number | null,
+		private existingPalace: {
+			name: string;
+			locations: Array<{ order: number; location: string }>;
+		} | null,
+		private onDone: () => void
+	) {
+		super(plugin.app);
+
+		// Initialize with existing data or empty
+		if (existingPalace) {
+			this.locations = [...existingPalace.locations];
+		} else {
+			this.locations = [{ order: 1, location: "" }];
+		}
+	}
+
+	onOpen() {
+		this.titleEl.setText(
+			this.existingPalace ? "Edit Memory Palace" : "Create Memory Palace"
+		);
+		this.contentEl.empty();
+
+		// Palace name
+		new Setting(this.contentEl).setName("Palace Name").addText((text) => {
+			this.nameInput = text;
+			text.setPlaceholder("e.g., My House, School Route");
+			if (this.existingPalace) {
+				text.setValue(this.existingPalace.name);
+			}
+		});
+
+		// Locations list header
+		const locationsHeader = this.contentEl.createDiv({
+			cls: "locations-list-header",
+		});
+		locationsHeader.style.cssText =
+			"margin-top: 16px; margin-bottom: 8px; font-weight: bold;";
+		locationsHeader.createEl("span", { text: "Locations" });
+
+		// Instructions for reordering
+		const instructions = this.contentEl.createDiv({
+			cls: "locations-instructions",
+		});
+		instructions.style.cssText =
+			"margin-bottom: 12px; padding: 8px; background: var(--background-secondary); border-radius: 4px; font-size: 0.9em; color: var(--text-muted);";
+		instructions.createEl("span", {
+			text: "💡 Tip: Drag and drop to reorder locations",
+		});
+
+		// Container for location items
+		this.locationListContainer = this.contentEl.createDiv({
+			cls: "location-list-container",
+		});
+		this.locationListContainer.style.cssText = "margin-bottom: 16px;";
+
+		this.renderLocationList();
+
+		// Add location button
+		const addButtonContainer = this.contentEl.createDiv();
+		addButtonContainer.style.cssText = "margin-bottom: 16px;";
+
+		new ButtonComponent(addButtonContainer)
+			.setButtonText("Add Location")
+			.onClick(() => {
+				const maxOrder =
+					this.locations.length > 0
+						? Math.max(...this.locations.map((l) => l.order))
+						: 0;
+				this.locations.push({ order: maxOrder + 1, location: "" });
+				this.renderLocationList();
+			});
+
+		// Save/Cancel buttons
+		const buttonContainer = this.contentEl.createDiv({
+			cls: "modal-button-container",
+		});
+		buttonContainer.style.marginTop = "16px";
+
+		new ButtonComponent(buttonContainer)
+			.setButtonText("Save")
+			.setCta()
+			.onClick(async () => {
+				const name = this.nameInput.getValue().trim();
+				if (!name) {
+					new Notice("Please enter a palace name");
+					return;
+				}
+
+				// Validate locations
+				const validLocations = this.locations.filter(
+					(l) => l.location.trim() !== ""
+				);
+				if (validLocations.length === 0) {
+					new Notice("Please add at least one location");
+					return;
+				}
+
+				const newPalace = {
+					name,
+					locations: validLocations,
+				};
+
+				if (this.palaceIndex !== null) {
+					// Update existing
+					this.plugin.settings.memoryPalaces[this.palaceIndex] =
+						newPalace;
+				} else {
+					// Create new
+					this.plugin.settings.memoryPalaces.push(newPalace);
+				}
+
+				await this.plugin.saveSettings();
+				this.close();
+				this.onDone();
+			});
+
+		new ButtonComponent(buttonContainer)
+			.setButtonText("Cancel")
+			.onClick(() => {
+				this.close();
+			});
+	}
+
+	private renderLocationList() {
+		this.locationListContainer.empty();
+
+		this.locations.forEach((location, index) => {
+			const locationItem = this.locationListContainer.createDiv({
+				cls: "location-item",
+				attr: { "data-index": index.toString() },
+			});
+			locationItem.style.cssText =
+				"display: flex; align-items: center; gap: 8px; padding: 8px; border: 1px solid var(--background-modifier-border); margin-bottom: 4px; border-radius: 4px; cursor: grab; position: relative;";
+			locationItem.draggable = true;
+
+			// Drag handle
+			const dragHandle = locationItem.createDiv({ cls: "drag-handle" });
+			dragHandle.style.cssText =
+				"color: var(--text-muted); font-size: 14px; cursor: grab;";
+			dragHandle.textContent = "⋮⋮";
+
+			// Order input
+			const orderInput = locationItem.createEl("input", {
+				type: "number",
+				attr: { min: "1", step: "1" },
+			});
+			orderInput.style.cssText = "width: 60px;";
+			orderInput.value = location.order.toString();
+			orderInput.addEventListener("change", () => {
+				this.locations[index].order = parseInt(orderInput.value) || 1;
+			});
+
+			// Location input
+			const locationInput = locationItem.createEl("input", {
+				type: "text",
+				attr: { placeholder: "e.g., Front door" },
+			});
+			locationInput.style.cssText = "flex: 1;";
+			locationInput.value = location.location;
+			locationInput.addEventListener("change", () => {
+				this.locations[index].location = locationInput.value;
+			});
+
+			// Delete button
+			const deleteButton = new ButtonComponent(locationItem);
+			deleteButton.setButtonText("×");
+			deleteButton.setWarning();
+			deleteButton.onClick(() => {
+				this.locations.splice(index, 1);
+				this.renderLocationList();
+			});
+		});
+
+		// Setup drag and drop
+		this.setupLocationDragAndDrop();
+	}
+
+	private setupLocationDragAndDrop() {
+		let draggedElement: HTMLElement | null = null;
+
+		this.locationListContainer.addEventListener("dragstart", (e) => {
+			if (
+				e.target instanceof HTMLElement &&
+				e.target.classList.contains("location-item")
+			) {
+				draggedElement = e.target;
+				e.target.style.opacity = "0.5";
+			}
+		});
+
+		this.locationListContainer.addEventListener("dragend", (e) => {
+			if (
+				e.target instanceof HTMLElement &&
+				e.target.classList.contains("location-item")
+			) {
+				e.target.style.opacity = "1";
+				draggedElement = null;
+			}
+		});
+
+		this.locationListContainer.addEventListener("dragover", (e) => {
+			e.preventDefault();
+		});
+
+		this.locationListContainer.addEventListener("drop", (e) => {
+			e.preventDefault();
+
+			if (!draggedElement) return;
+
+			const targetElement = (e.target as HTMLElement).closest(
+				".location-item"
+			) as HTMLElement;
+			if (!targetElement || targetElement === draggedElement) return;
+
+			// Get the new order
+			const items = Array.from(
+				this.locationListContainer.querySelectorAll(".location-item")
+			);
+			const draggedIndex = items.indexOf(draggedElement);
+			const targetIndex = items.indexOf(targetElement);
+
+			// Move the element in the DOM
+			if (draggedIndex < targetIndex) {
+				targetElement.parentNode?.insertBefore(
+					draggedElement,
+					targetElement.nextSibling
+				);
+			} else {
+				targetElement.parentNode?.insertBefore(
+					draggedElement,
+					targetElement
+				);
+			}
+
+			// Update the locations array
+			const newOrder: Array<{ order: number; location: string }> = [];
+			const itemElements = Array.from(
+				this.locationListContainer.querySelectorAll(".location-item")
+			);
+
+			itemElements.forEach((el) => {
+				const idx = parseInt(
+					(el as HTMLElement).getAttribute("data-index") || "0"
+				);
+				newOrder.push(this.locations[idx]);
+			});
+
+			this.locations = newOrder;
+			this.renderLocationList();
+		});
 	}
 
 	onClose() {
@@ -22150,6 +23411,35 @@ class GNSettingsTab extends PluginSettingTab {
 				}
 			}
 		}
+
+		// --- MNEMONIC SYSTEMS SECTION ---
+		containerEl.createEl("h3", { text: "Mnemonic Systems" });
+
+		new Setting(containerEl)
+			.setName("Manage Peg Systems")
+			.setDesc(
+				"Create and manage peg systems for mnemonic generation (e.g., Rhyming 1-10, Body Method, Major System)."
+			)
+			.addButton((button) =>
+				button.setButtonText("Manage Peg Systems").onClick(() => {
+					new PegSystemsManagementModal(this.plugin, () => {
+						// onUpdate callback - refresh settings display if needed
+					}).open();
+				})
+			);
+
+		new Setting(containerEl)
+			.setName("Manage Memory Palaces")
+			.setDesc(
+				"Create and manage memory palaces for spatial mnemonic generation (e.g., My House, School Route)."
+			)
+			.addButton((button) =>
+				button.setButtonText("Manage Memory Palaces").onClick(() => {
+					new MemoryPalacesManagementModal(this.plugin, () => {
+						// onUpdate callback - refresh settings display if needed
+					}).open();
+				})
+			);
 	}
 
 	private createNumericArraySetting(
