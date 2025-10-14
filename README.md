@@ -25,12 +25,29 @@ Instead of passively consuming information, you must _earn_ your way through a n
     -   The plugin keeps a log of all AI API calls, allowing you to track your token usage and spending over time.
 
 -   **🧠 Smarter Review & Learning Engine:**
-    -   **🎯 Advanced Mnemonic System (Major System):** Comprehensive memory aid system with AI-powered generation:
-        -   **Automatic Number Detection:** Detects numbers in your cards and generates memorable phonetic word associations
-        -   **6 AI Generation Styles:** Choose from Alliterative, Rhyming, Humorous, Visual/Concrete, Story-based, or Default approaches
+    -   **🎯 Advanced Mnemonic System:** Comprehensive memory aid system with AI-powered generation:
+        -   **Automatic Number Detection:** Detects numbers in your cards and generates memorable phonetic word associations using the Major System
+        -   **10 AI Generation Styles:** Choose from Alliterative, Rhyming, Humorous, Visual/Concrete, Story-based, Sounds-Alike/Phonetic, Acronym/Acrostic, Peg/Body Method, Memory Palace/Spatial, or Default approaches
+        -   **Customizable Peg Systems:** Create and manage multiple peg systems (e.g., Rhyming 1-10, Body Parts) with custom number-to-word mappings
+        -   **Customizable Memory Palaces:** Design multiple memory palaces with sequential locations for spatial mnemonic techniques
+        -   **CRUD Management:** Full create, read, update, delete functionality for both peg systems and memory palaces
+        -   **Drag-to-Reorder:** Organize pegs and palace locations with intuitive drag-and-drop reordering
+        -   **Multi-Generation Mode:** Generate 3 alternative mnemonics at once for comparison and selection
         -   **Card Type Override:** Manual control over content analysis - specify List, Quote/verse, Foreign words, Concept, or Number-focused generation
-        -   **Iterative Content Development:** Generate multiple mnemonics with side-by-side comparison (Original vs New Generation)
+        -   **Iterative Content Development:** Generate multiple mnemonics with automatic numbering (Mnemonic 1, Mnemonic 2, etc.)
         -   **Context-Aware Generation:** AI receives existing mnemonic content to create complementary alternatives
+    -   **🎨 Card Appearance Randomization:** Optional visual randomization for desirable difficulty:
+        -   **Font Size:** Randomize between min/max pixel values
+        -   **Font Family:** Randomize from a customizable list of fonts
+        -   **Text Color:** Randomize from a customizable color palette
+        -   **Text Alignment:** Randomize between left, center, or right
+        -   **Text Transform:** Randomize capitalization (none, capitalize, uppercase, lowercase)
+        -   **Background Color:** Randomize card background from a customizable palette
+        -   **Rotation:** Apply subtle rotation between min/max degrees
+        -   **Blur:** Add slight blur effect for increased difficulty
+        -   **Line Height:** Randomize line spacing for varied visual density
+        -   **Letter Spacing:** Randomize character spacing
+        -   **Granular Control:** Enable/disable and configure each randomization option independently
     -   **🔀 Smart Interleaving:** In Custom Session and Review-only modes, cards are selected using a weighted random algorithm that prioritizes more overdue cards, making study sessions more effective.
     -   **⏭️ Session Continuation:** Smart session management that prompts users to review additional cards that become due during study sessions, with skip tracking to avoid re-prompting skipped cards.
     -   **Review Ahead:** Finished your queue? A new modal prompts you to study cards due in the near future.
@@ -43,9 +60,32 @@ Instead of passively consuming information, you must _earn_ your way through a n
     -   **Intelligent Tagging:** Links image-based cards directly to the source image for quick context-jumping.
     -   **File Explorer Decorator:** See the status of your notes at a glance with new icons (⏳, 📆, ✅) directly in the file explorer.
 
+-   **📖 Polyglot Vocabulary System:** Specialized flashcard mode for language learners:
+    -   **Cluster-Based Organization:** Group related vocabulary with headings (`## Cluster: Topic Name`)
+    -   **Flexible Formats:** Support for `word|translation`, `phrase :: meaning`, and `term - definition` formats
+    -   **Frontmatter Configuration:** Control native/target language, card direction (forward/reverse/bidirectional)
+    -   **Automatic Card Generation:** Parse notes and generate flashcards automatically from cluster content
+    -   **No Paragraph Indexing:** Polyglot cards bypass standard gating requirements for streamlined vocabulary study
+
+-   **📝 Verbatim Flashcard System:** Memorize text word-for-word with intelligent splitting:
+    -   **Multiple Split Modes:** Word-by-word, line-by-line, sentence-by-sentence, or custom delimiter
+    -   **Stanza Preservation:** Line mode intelligently preserves empty lines (stanza breaks) in context
+    -   **Progressive Display:** Each card shows all prior text as context for the current unit
+    -   **Named Collections:** Optionally name your verbatim collection for organization
+    -   **No Gating Impact:** Verbatim cards never block content gating
+    -   **Context Menu Access:** Right-click selected text → "Create verbatim flashcards"
+
 -   **🤖 Advanced AI Tools:**
     -   **Post-Generation Review:** After generating new cards, you're prompted to immediately review, edit, or delete them in a streamlined workflow.
+    -   **Guidance Repository System:** Save, manage, and reuse custom AI instructions across all generation tasks:
+        -   **6 Built-in Snippets:** Essential, Expanded, and Comprehensive card generation presets (plus "Additional" variants for complementing existing cards)
+        -   **Save & Load:** Store frequently-used instructions and recall them with one click via the Repository button
+        -   **Drag-to-Reorder:** Organize your guidance snippets in your preferred order
+        -   **Priority System:** Custom guidance takes highest priority, overriding conflicting default instructions
     -   **Custom Guidance (for Cards):** Direct the AI during card generation with specific instructions.
+    -   **Bulk Operations:** Process entire notes at once for efficient card management:
+        -   **Bulk Refocus:** Invert front/back information for all cards in a note to create complementary questions
+        -   **Bulk Variants:** Create alternate phrasings for all cards in an entire note in one operation
     -   **Split Card:** Break a complex card into smaller, more atomic ones.
     -   **Refocus Card:** Generate alternate phrasings or "reverse" questions for the same fact.
     -   **Generate Variants:** Create multiple alternative phrasings of existing cards ("Just One" or "One or More") with cost confirmation.
@@ -57,6 +97,12 @@ Instead of passively consuming information, you must _earn_ your way through a n
         -   **Exact String Search:** Wrap any search term in quotes for precise matching
         -   **Three-State Filtering:** Off/Include-Only/Exclude states for flagged, suspended, buried, and new cards
         -   **Modal Navigation History:** Navigate seamlessly between views without losing your place
+        -   **Scroll Position Memory:** Automatically saves and restores your scroll position when switching between notes
+    -   **Intelligent Duplicate Detection:** Find and remove duplicate flashcards with advanced similarity analysis:
+        -   **Jaccard Similarity Algorithm:** Uses lemmatization and set-based comparison for accurate duplicate detection
+        -   **Multiple Comparison Modes:** Compare fronts only, backs only, front OR back, front AND back, or front+back combined
+        -   **Flexible Scope:** Scan current note only, entire vault, current folder, or by card type (regular/polyglot/verbatim)
+        -   **Review & Delete Workflow:** Examine duplicate groups with similarity scores before selective deletion
     -   **Related Cards Discovery:** "Related: X" buttons in edit modals and review sessions instantly find cards sharing the same tags.
     -   **Flag & Suspend Cards:** Mark cards with a 🚩 for future attention or suspend them (⏸️) to temporarily remove them from reviews.
     -   **Card Variants:** Edit cards with multiple variant phrasings in a dropdown interface.

@@ -1,3 +1,195 @@
+# v2.9.0
+
+## ✨ Comprehensive Mnemonic System, New Flashcard Types & Advanced Card Management ✨
+
+This release represents a major expansion of the plugin's capabilities with user-customizable peg systems and memory palaces for advanced mnemonic techniques, two new specialized flashcard types (Polyglot for language learning and Verbatim for word-for-word memorization), intelligent duplicate detection for card management, comprehensive card appearance randomization for desirable difficulty, and powerful AI workflow improvements including a guidance repository system and hierarchical API provider configuration.
+
+### 🚀 New Features
+
+-   **📁 Guidance Repository System:** Save, manage, and reuse custom AI instructions across all generation tasks:
+    -   **Persistent Snippet Library:** Store frequently-used AI instructions and recall them with one click
+    -   **6 Built-in Presets:** Essential, Expanded, and Comprehensive card generation snippets, plus "Additional" variants for complementing existing cards
+    -   **Repository Modal:** Browse, use, edit, and delete saved guidance snippets in one unified interface
+    -   **Drag-to-Reorder:** Organize your guidance library in your preferred order with intuitive drag-and-drop
+    -   **Priority System:** Custom guidance now takes highest priority, with clear formatting that overrides conflicting default instructions
+    -   **Universal Integration:** Repository button appears in all modals with custom guidance support (card generation, variants, refocus, PDF/EPUB conversion)
+
+### 🎯 Customizable Peg Systems & Memory Palaces
+
+-   **User-Customizable Mnemonic Techniques:** Full CRUD management for peg systems and memory palaces:
+    -   **Peg System Management:**
+        -   **Create Custom Peg Systems:** Define your own number-to-word mappings for any mnemonic system
+        -   **Two Default Systems:** Ships with "Rhyming 1-10" (bun, shoe, tree...) and "Body Parts 1-10" (head, shoulders, chest...)
+        -   **CRUD Operations:** Add, edit, rename, and delete peg systems through dedicated management modal
+        -   **Drag-to-Reorder Pegs:** Organize peg mappings in your preferred sequence
+        -   **Style Selection:** Choose "Peg/Body Method" style in mnemonic modal to use selected peg system
+    -   **Memory Palace Management:**
+        -   **Create Custom Palaces:** Design memory palaces with sequential locations for spatial mnemonics
+        -   **Default Palace:** Ships with "Generic House" (Front door, Hallway, Living room, Kitchen, Bedroom)
+        -   **CRUD Operations:** Full management interface for creating, editing, renaming, and deleting palaces
+        -   **Drag-to-Reorder Locations:** Arrange palace locations to match your mental journey
+        -   **Style Selection:** Choose "Memory Palace/Spatial" style to use selected palace
+    -   **Enhanced Mnemonic Styles:**
+        -   **10 Total Styles:** Added 4 new styles to existing 6 (Alliterative, Rhyming, Humorous, Visual, Story, Default):
+            -   **Sounds-Alike/Phonetic:** Phonetic anchors for foreign words (e.g., "Astyanax" → "ask-tea-in-axe")
+            -   **Acronym/Acrostic:** Extract key words and create memorable acronyms (like HOMES for Great Lakes)
+            -   **Peg/Body Method:** Attach items to numbered pegs using user-defined systems
+            -   **Memory Palace/Spatial:** Place items in specific locations within user-defined palaces
+    -   **Multi-Generation Mode:** Checkbox to generate 3 alternative mnemonics at once instead of 1
+    -   **Improved Mnemonic Numbering:** Automatic sequential numbering (Mnemonic 1, 2, 3...) with intelligent counter
+    -   **Structured Output Formats:** Each strategy has tailored output format (e.g., Acronym shows "Key words → Acronym → Explanation")
+    -   **Settings Commands:**
+        -   **Manage peg systems:** Opens peg system management modal
+        -   **Manage memory palaces:** Opens memory palace management modal
+
+### 🎨 Card Appearance Randomization
+
+-   **Desirable Difficulty Through Visual Variation:** Optional randomization of card appearance during review sessions:
+    -   **Ten Randomization Categories:**
+        -   **Font Size:** Vary text size between customizable min/max pixel values (default: 14-20px)
+        -   **Font Family:** Rotate through a customizable list of fonts (default: Arial, Helvetica, Georgia, Verdana)
+        -   **Text Color:** Apply random colors from a customizable palette (default: black, dark gray, medium gray, blue)
+        -   **Text Alignment:** Randomize between left, center, and right alignment
+        -   **Text Transform:** Randomize capitalization (none, capitalize, uppercase, lowercase)
+        -   **Background Color:** Randomize card background from palette (default: white, light gray, light yellow, light blue)
+        -   **Rotation:** Apply subtle rotation between min/max degrees (default: -3 to +3 degrees)
+        -   **Blur:** Add slight blur effect for increased difficulty (default: 0-1px)
+        -   **Line Height:** Adjust vertical spacing between lines (default: 1.4-1.8)
+        -   **Letter Spacing:** Modify horizontal spacing between characters (default: 0-1px)
+    -   **Granular Control:** Each randomization type can be independently enabled/disabled with custom ranges
+    -   **Master Toggle:** Global on/off switch for all randomization features
+    -   **Per-Card Application:** Randomization applied fresh for each flashcard front during review
+    -   **Settings UI:** Comprehensive configuration panel with collapsible sections for each randomization type
+    -   **Smart Padding:** Automatic padding added when rotation is enabled to prevent overlap with UI buttons
+
+### 📝 Verbatim Flashcard System
+
+-   **Word-for-Word Memorization with Intelligent Splitting:** A new flashcard type for verbatim text memorization:
+    -   **Four Split Modes:**
+        -   **Word-by-Word:** Each card prompts for the next single word
+        -   **Line-by-Line:** Each card prompts for the next complete line
+        -   **Sentence-by-Sentence:** Each card prompts for the next complete sentence
+        -   **Custom Delimiter:** Split by any character/string you specify
+    -   **Stanza-Aware Line Splitting:** Line mode preserves poem/verse structure:
+        -   Empty lines (stanza breaks) are intelligently included in context
+        -   Context shows all prior lines including blank lines for proper structure
+        -   Only non-empty lines count toward progression
+    -   **Progressive Context Display:** Each card shows all previous text as context, with the current unit as the answer
+    -   **Named Collections:** Optional collection names for organizing related verbatim sets
+    -   **Gating Bypass:** Verbatim cards are marked as `bypassesGating` and never block content unlocking
+    -   **Easy Creation:** Right-click any selected text → "Create verbatim flashcards" → Choose split mode
+    -   **Separate Storage:** Verbatim cards stored with `type: 'verbatim'` for filtering and management
+
+### 📖 Polyglot Vocabulary System
+
+-   **New Specialized Mode for Language Learning:** A complete vocabulary flashcard system designed specifically for language learners:
+    -   **Cluster-Based Organization:** Group related vocabulary using `## Cluster: Topic Name` headings
+    -   **Multiple Input Formats:** Supports three formats for maximum flexibility:
+        -   Pipe format: `word|translation`
+        -   Double-colon format: `phrase :: meaning`
+        -   Dash format: `term - definition`
+    -   **Frontmatter Configuration:** Control behavior through YAML frontmatter:
+        -   Set `nativeLanguage` and `targetLanguage` names
+        -   Choose card direction: `forward`, `reverse`, or `bidirectional`
+        -   Mark as `special: polyglot` to enable polyglot parsing
+    -   **Automatic Flashcard Generation:** `Polyglot: Generate cards for this note` command parses clusters and creates cards
+    -   **Separate Data Storage:** Polyglot metadata stored in `_polyglot.json` files (parallel to `_flashcards.json`)
+    -   **Streamlined Workflow:** Polyglot cards bypass paragraph indexing requirements - no gating, just vocabulary study
+    -   **New Commands:**
+        -   `Polyglot: New vocabulary note` - Creates template note with frontmatter
+        -   `Polyglot: Parse this note` - Updates metadata without generating cards
+        -   `Polyglot: Generate cards for this note` - Parses and creates flashcards
+
+### 🔍 Intelligent Duplicate Detection
+
+-   **Advanced Duplicate Card Scanner:** Find and eliminate duplicate flashcards with sophisticated similarity analysis:
+    -   **Jaccard Similarity Algorithm:** Uses lemmatization-based set comparison with proper possessive handling to detect semantically similar cards
+    -   **Smart Possessive Preprocessing:** Strips possessive 's before lemmatization to prevent false negatives (e.g., "John's book" and "John book" correctly recognized as similar)
+    -   **Five Comparison Modes:**
+        -   **Front Only:** Compare card fronts exclusively
+        -   **Back Only:** Compare card backs exclusively
+        -   **Front OR Back:** Match if either front or back are similar
+        -   **Front AND Back:** Match only if both front and back are similar
+        -   **Front+Back Combined:** Concatenate and compare as single text
+    -   **Flexible Scanning Scope:**
+        -   Current note only
+        -   Entire vault
+        -   Current folder and subfolders
+        -   Filter by card type (Regular/Polyglot/Verbatim)
+    -   **Interactive Review Modal:**
+        -   Groups displayed with similarity scores
+        -   Side-by-side card comparison
+        -   Selective deletion with checkboxes
+        -   Preserves first card in each group by default
+    -   **Performance Optimizations:**
+        -   Pre-lemmatization of all cards for efficiency
+        -   Progress indicators during scanning
+        -   Detailed logging of comparisons and processing time
+    -   **Verbatim Card Exclusion:** Verbatim cards automatically excluded from duplicate detection scanning
+    -   **New Command:** `Find duplicate flashcards` - Launches duplicate detection workflow with configuration modal
+
+### 💾 Scroll Position Memory
+
+-   **Automatic Scroll Restoration:** Never lose your place when navigating between notes:
+    -   **Per-Note Memory:** Tracks scroll position independently for each note
+    -   **Seamless Restoration:** Automatically restores position when returning to a note
+    -   **Persistent Storage:** Scroll positions saved in plugin settings across sessions
+    -   **Threshold Logic:** Only saves meaningful scroll positions (>0) to avoid clutter
+
+### ⚡ Bulk Operations
+
+-   **Bulk Refocus Cards:** Process entire notes at once with `Bulk refocus cards for current note` command:
+    -   **Inversion Processing:** Automatically inverts front/back information for all cards to create complementary questions
+    -   **Confirmation Modal:** Shows card count and estimated cost before processing
+    -   **Batch Efficiency:** Generates multiple refocused cards per original card in one operation
+    -   **Duplicate Prevention:** Built-in logic to avoid creating cards similar to existing ones
+    -   **Progress Tracking:** Real-time progress display with success/failure reporting
+
+-   **Bulk Create Variants:** Generate variant cards for all cards in a note with `Bulk create variants for current note`:
+    -   **Automatic Rephrasing:** Creates alternate phrasings for every card in one operation
+    -   **Skip Logic:** Intelligently skips cards that already have variants
+    -   **Confirmation Workflow:** Pre-flight modal with card count before processing
+    -   **Detailed Reporting:** Shows processed count, successful variants, and skipped cards
+
+### 📚 PDF & EPUB Conversion Improvements
+
+-   **Enhanced EPUB Processing:** Major improvements to EPUB-to-note conversion accuracy and formatting:
+    -   **CSS Style Extraction:** Automatically parses embedded CSS to correctly handle subscript/superscript styling via class attributes
+    -   **Smart Formatting:** Preserves subscript (`<sub>`) and superscript (`<sup>`) elements in converted markdown
+    -   **Image Deduplication:** Computes image hashes to prevent duplicate image files when the same image appears multiple times
+    -   **Fragment Handling:** Properly resolves file paths with fragment identifiers (e.g., `chapter01.xhtml#section2`)
+    -   **Whitespace Preservation:** Improved text joining logic that better preserves original EPUB spacing and formatting
+    -   **Image Tracking:** Automatically updates `_images.json` with hash-based deduplication metadata
+
+-   **Optimized PDF Processing:** Intelligent processing strategy based on document length:
+    -   **Small Document Mode:** PDFs under 10 pages processed in a single API call for speed and coherence
+    -   **Chunked Processing:** PDFs with 10+ pages automatically use chunked processing to stay within context limits
+    -   **Adaptive Strategy:** System automatically selects optimal processing approach based on page count
+
+### ⚙️ API Provider Configuration Improvements
+
+-   **Hierarchical API Provider System:** Separate provider/model configurations for different operations:
+    -   **Operation-Specific Settings:** Configure different providers and models for three operation types:
+        -   Flashcard Generation (Primary settings)
+        -   Refocus/Split Operations
+        -   Variant Generation
+    -   **"Match Primary" Option:** Refocus and Variant operations can be set to "Match Primary" to use the same provider/model as flashcard generation
+    -   **Per-Operation Model Lists:** Separate model lists for OpenAI and LM Studio providers
+    -   **Explicit Model Validation:** Clear error messages when no model is selected for an operation
+    -   **Provider-Specific Clients:** Each operation gets its own OpenAI client instance configured with appropriate provider settings
+    -   **Descriptive Notifications:** Operation notifications now show which provider/model is being used (e.g., "Generating 5 cards using OpenAI (gpt-4o)...")
+    -   **Settings Migration:** Automatic migration of old `availableModels` setting to new provider-specific lists
+    -   **Backward Compatibility:** Legacy methods maintained for smooth transition from older versions
+
+### 🛠️ Bug Fixes
+
+-   **Fixed Buried Card Gating Logic:** Introduced new `isBlockingGating()` function that correctly handles buried cards:
+    -   **Proper Bury Period Handling:** Buried cards with unexpired bury periods no longer block content gating
+    -   **Expired Bury Detection:** Cards whose bury period has passed correctly resume blocking behavior
+    -   **Consistent Logic:** Both in-note gating and chapter statistics now use unified buried card handling
+
+---
+
 # v2.8.0
 
 ## ✨ Mnemonic Generation System Enhancements ✨
