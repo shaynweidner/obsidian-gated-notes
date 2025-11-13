@@ -7235,6 +7235,23 @@ Return ONLY valid JSON of this shape: [{"front":"...","back":"..."}] or [] if no
 			card.status = "learning";
 		}
 
+		// Handle "Again" rating - immediate review with early return
+		if (rating === "Again") {
+			if (originalStatus === "review") {
+				card.status = "relearn";
+			}
+			card.learning_step_index = 0;
+			card.interval = 0;
+			card.due = now;  // Immediately due for re-review
+			card.blocked = true;
+			card.last_reviewed = new Date(now).toISOString();
+			console.log(
+				`[Ebisu] Card failed with "Again" - immediately due for review`
+			);
+			return;
+		}
+
+		// Handle learning/relearning progression
 		if (["learning", "relearn"].includes(card.status)) {
 			const ONE_MINUTE_MS = 60_000;
 			const steps =
@@ -7242,40 +7259,35 @@ Return ONLY valid JSON of this shape: [{"front":"...","back":"..."}] or [] if no
 					? this.settings.relearnSteps
 					: this.settings.learningSteps;
 
-			if (rating === "Again") {
-				card.learning_step_index = 0;
+			card.blocked = false;
+			const stepIncrement = rating === "Easy" ? 2 : 1;
+			const currentIndex =
+				(card.learning_step_index ?? -1) + stepIncrement;
+
+			if (currentIndex < steps.length) {
+				card.learning_step_index = currentIndex;
 				card.interval = 0;
-				card.due = now + steps[0] * ONE_MINUTE_MS;
-				card.blocked = true;
+				card.due = now + steps[currentIndex] * ONE_MINUTE_MS;
 			} else {
-				card.blocked = false;
-				const stepIncrement = rating === "Easy" ? 2 : 1;
-				const currentIndex =
-					(card.learning_step_index ?? -1) + stepIncrement;
+				card.status = "review";
+				delete card.learning_step_index;
 
-				if (currentIndex < steps.length) {
-					card.learning_step_index = currentIndex;
-					card.interval = 0;
-					card.due = now + steps[currentIndex] * ONE_MINUTE_MS;
-				} else {
-					card.status = "review";
-					delete card.learning_step_index;
-
-					const nextIntervalHours = getRecommendedInterval(
-						updatedModel,
-						config
-					);
-					const nextIntervalDays = nextIntervalHours / 24;
-					console.log(
-						`[Ebisu] Graduated to review! Recommended interval: ${nextIntervalHours.toFixed(
-							1
-						)}h (${nextIntervalDays} days)`
-					);
-					card.interval = nextIntervalDays;
-					card.due = now + nextIntervalDays * ONE_DAY_MS;
-				}
+				const nextIntervalHours = getRecommendedInterval(
+					updatedModel,
+					config
+				);
+				const nextIntervalDays = nextIntervalHours / 24;
+				console.log(
+					`[Ebisu] Graduated to review! Recommended interval: ${nextIntervalHours.toFixed(
+						1
+					)}h (${nextIntervalDays} days)`
+				);
+				card.interval = nextIntervalDays;
+				card.due = now + nextIntervalDays * ONE_DAY_MS;
 			}
 		} else {
+			// Mature card (status = "review") with successful rating
+			card.blocked = false;
 			const nextIntervalHours = getRecommendedInterval(
 				updatedModel,
 				config
@@ -7290,11 +7302,6 @@ Return ONLY valid JSON of this shape: [{"front":"...","back":"..."}] or [] if no
 			);
 			card.interval = nextIntervalDays;
 			card.due = now + nextIntervalDays * ONE_DAY_MS;
-			card.blocked = rating === "Again";
-
-			if (rating === "Again" && originalStatus === "review") {
-				card.status = "relearn";
-			}
 		}
 
 		card.last_reviewed = new Date(now).toISOString();

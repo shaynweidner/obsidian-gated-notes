@@ -1,6 +1,6 @@
 {
 	"name": "gated-notes",
-	"version": "2.10.0",
+	"version": "2.10.1",
 	"description": "Gated Notes plugin for Obsidian - spaced repetition with anchored flashcards",
 	"main": "main.js",
 	"scripts": {

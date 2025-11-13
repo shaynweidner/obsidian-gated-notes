@@ -1,3 +1,32 @@
+# v2.10.1
+
+## 🐛 Bug Fix: Ebisu "Again" Rating Scheduling 🐛
+
+This patch release fixes a critical bug in the Ebisu scheduling algorithm where pressing "Again" on a card would schedule it days in the future instead of making it immediately available for review.
+
+### 🔧 Bug Fixes
+
+-   **🐛 Fixed Ebisu "Again" Scheduling:** Cards answered with "Again" are now immediately due for review (matching SM-2 behavior):
+    -   **Immediate Availability:** `card.due = now` ensures cards are instantly available after failure
+    -   **Proper Relearning Entry:** Mature cards correctly enter relearning state on "Again"
+    -   **Model Still Updates:** Ebisu model (alpha/beta/time) continues to learn from failures
+    -   **Early Return:** "Again" handling now exits early before Bayesian interval calculations
+    -   **Note Focus Workflow:** Failed cards now appear immediately when restarting review session
+    -   **Review-Only Workflow:** Failed cards now join queue immediately with minimal overdue time
+-   **🔍 Learning Step Fix:** Removed incorrect behavior where "Again" in learning/relearning would use first step interval instead of immediate availability
+
+### 📝 Technical Details
+
+The bug occurred because Ebisu was calculating a Bayesian interval (potentially days) for "Again" ratings before changing the card status to "relearn". Now "Again" ratings are handled with an early return that:
+1. Updates the Ebisu model to learn from the failure
+2. Sets the card as immediately due (`due = now`)
+3. Changes status to "relearn" if mature
+4. Exits before any interval calculations
+
+This ensures the gated reading workflow functions correctly: hitting "Again" gates the content, exits the session, and makes the card available immediately for the next review.
+
+---
+
 # v2.10.0
 
 ## 🎯 Ebisu Bayesian Scheduling & Split Card Inheritance 🎯
