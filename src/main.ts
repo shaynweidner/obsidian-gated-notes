@@ -38,13 +38,20 @@ import {
 } from "./navigation-stack";
 
 import * as JSZip from "jszip";
+import {
+	createDefaultModel,
+	updateModel,
+	getRecommendedInterval,
+	predictRecall,
+	type EbisuConfig,
+	type EbisuModel,
+} from "./ebisu_scheduler";
 
 const DECK_FILE_NAME = "_flashcards.json";
 const SPLIT_TAG = "---GATED-NOTES-SPLIT---";
 const PARA_CLASS = "gn-paragraph";
 const PARA_ID_ATTR = "data-para-id";
 const PARA_MD_ATTR = "data-gn-md";
-const API_URL_COMPLETIONS = "https://api.openai.com/v1/chat/completions";
 const API_URL_MODELS = "https://api.openai.com/v1/models";
 const IMAGE_ANALYSIS_FILE_NAME = "_images.json";
 const POLYGLOT_FILE_NAME = "_polyglot.json";
@@ -84,10 +91,10 @@ enum ComparisonMode {
 	BACK = "back",
 	FRONT_OR_BACK = "front|back",
 	FRONT_AND_BACK = "front*back",
-	FRONT_PLUS_BACK = "front+back"
+	FRONT_PLUS_BACK = "front+back",
 }
 
-type CardRating = "Again" | "Hard" | "Good" | "Easy";
+export type CardRating = "Again" | "Hard" | "Good" | "Easy";
 type CardStatus = "new" | "learning" | "review" | "relearn";
 type ReviewResult = "answered" | "skip" | "abort" | "again";
 
@@ -97,6 +104,11 @@ interface ReviewLog {
 	state: CardStatus;
 	interval: number;
 	ease_factor: number;
+	// Ebisu-specific fields (only populated when Ebisu algorithm is active)
+	ebisu_alpha?: number;
+	ebisu_beta?: number;
+	ebisu_time?: number;
+	ebisu_recall?: number;
 }
 
 /**
@@ -178,6 +190,12 @@ export interface Flashcard {
 		freeformNotes?: string;
 	};
 	polyglot?: PolyglotCardData;
+	// Ebisu-specific fields (only populated when Ebisu algorithm is active)
+	ebisu?: {
+		alpha: number; // Alpha parameter of Beta distribution
+		beta: number; // Beta parameter of Beta distribution
+		time: number; // Half-life in hours
+	};
 }
 
 interface FlashcardGraph {
@@ -203,6 +221,8 @@ interface Settings {
 	refocusOpenaiModel: string;
 	refocusLmStudioUrl: string;
 	refocusLmStudioModel: string;
+	/** Whether split cards should inherit the parent card's review history. */
+	splitInheritHistory: boolean;
 
 	// Variant Generation
 	variantApiProvider: "match" | "openai" | "lmstudio";
@@ -295,6 +315,33 @@ interface Settings {
 		name: string;
 		locations: Array<{ order: number; location: string }>;
 	}>;
+
+	/** Spaced repetition algorithm: SM-2 or Ebisu. */
+	algorithm: "SM2" | "Ebisu";
+
+	// Ebisu settings
+	/** Ebisu: Default half-life for new cards (in hours). */
+	ebisuDefaultHalflife: number;
+	/** Ebisu: Alpha parameter (confidence in halflife, typically 2-4). */
+	ebisuDefaultAlpha: number;
+	/** Ebisu: Beta parameter (should equal alpha for symmetric prior). */
+	ebisuDefaultBeta: number;
+	/** Ebisu: Target recall probability for scheduling (0.80 - 0.95). */
+	ebisuTargetRecall: number;
+	/** Ebisu: Update parameters for "Again" rating (successes/total). */
+	ebisuAgainSuccesses: number;
+	ebisuAgainTotal: number;
+	/** Ebisu: Update parameters for "Hard" rating (successes/total). */
+	ebisuHardSuccesses: number;
+	ebisuHardTotal: number;
+	/** Ebisu: Update parameters for "Good" rating (successes/total). */
+	ebisuGoodSuccesses: number;
+	ebisuGoodTotal: number;
+	/** Ebisu: Update parameters for "Easy" rating (successes/total). */
+	ebisuEasySuccesses: number;
+	ebisuEasyTotal: number;
+	/** Ebisu: Always recalculate model from history (ignore stored alpha/beta). */
+	ebisuAlwaysRecalculate: boolean;
 }
 
 const DEFAULT_SETTINGS: Settings = {
@@ -313,6 +360,7 @@ const DEFAULT_SETTINGS: Settings = {
 	refocusOpenaiModel: "gpt-4o",
 	refocusLmStudioUrl: "http://localhost:1234",
 	refocusLmStudioModel: "",
+	splitInheritHistory: true,
 
 	// Variant Generation
 	variantApiProvider: "match",
@@ -435,6 +483,23 @@ const DEFAULT_SETTINGS: Settings = {
 			],
 		},
 	],
+
+	algorithm: "SM2",
+
+	// Ebisu settings
+	ebisuDefaultHalflife: 24,
+	ebisuDefaultAlpha: 3.0,
+	ebisuDefaultBeta: 3.0,
+	ebisuTargetRecall: 0.85,
+	ebisuAgainSuccesses: 0,
+	ebisuAgainTotal: 1,
+	ebisuHardSuccesses: 1,
+	ebisuHardTotal: 2,
+	ebisuGoodSuccesses: 1,
+	ebisuGoodTotal: 1,
+	ebisuEasySuccesses: 2,
+	ebisuEasyTotal: 2,
+	ebisuAlwaysRecalculate: false,
 };
 
 interface ImageAnalysis {
@@ -3475,6 +3540,8 @@ export default class GatedNotesPlugin extends Plugin {
 		this.reviewDue();
 	}
 
+	
+
 	public startCustomReviewFromCards(cards: Flashcard[]): void {
 		this.customSessionCards = cards;
 		this.customSessionPaths = [];
@@ -3485,7 +3552,10 @@ export default class GatedNotesPlugin extends Plugin {
 		this.reviewDue();
 	}
 
-	public startCustomSessionFromPaths(paths: string[], excludeNewCards: boolean): void {
+	public startCustomSessionFromPaths(
+		paths: string[],
+		excludeNewCards: boolean
+	): void {
 		this.customSessionPaths = paths;
 		this.customSessionExcludeNewCards = excludeNewCards;
 		this.studyMode = StudyMode.CUSTOM_SESSION;
@@ -3707,7 +3777,10 @@ export default class GatedNotesPlugin extends Plugin {
 				if (card.buried) stats.byState.buried++;
 				if (card.flagged) stats.byState.flagged++;
 				// Only count missing paraIdx for non-polyglot cards (polyglot cards don't need paraIdx)
-				if ((card.paraIdx === undefined || card.paraIdx === null) && !card.polyglot?.isPolyglot)
+				if (
+					(card.paraIdx === undefined || card.paraIdx === null) &&
+					!card.polyglot?.isPolyglot
+				)
 					stats.byState.missingParaIdx++;
 
 				const subject = this.subjectOf(card.chapter);
@@ -4304,7 +4377,8 @@ export default class GatedNotesPlugin extends Plugin {
 			id: "gn-bulk-refocus",
 			name: "Bulk refocus cards for current note",
 			checkCallback: (checking: boolean) => {
-				const view = this.app.workspace.getActiveViewOfType(MarkdownView);
+				const view =
+					this.app.workspace.getActiveViewOfType(MarkdownView);
 				if (!view?.file) return false;
 				if (!checking) this.bulkRefocusCards(view.file);
 				return true;
@@ -4315,7 +4389,8 @@ export default class GatedNotesPlugin extends Plugin {
 			id: "gn-bulk-variants",
 			name: "Bulk create variants for current note",
 			checkCallback: (checking: boolean) => {
-				const view = this.app.workspace.getActiveViewOfType(MarkdownView);
+				const view =
+					this.app.workspace.getActiveViewOfType(MarkdownView);
 				if (!view?.file) return false;
 				if (!checking) this.bulkCreateVariants(view.file);
 				return true;
@@ -4326,7 +4401,8 @@ export default class GatedNotesPlugin extends Plugin {
 			id: "gn-find-duplicates",
 			name: "Find duplicate flashcards",
 			checkCallback: (checking: boolean) => {
-				const view = this.app.workspace.getActiveViewOfType(MarkdownView);
+				const view =
+					this.app.workspace.getActiveViewOfType(MarkdownView);
 				if (!view?.file) return false;
 				if (!checking) this.findDuplicateCards(view.file);
 				return true;
@@ -4337,7 +4413,8 @@ export default class GatedNotesPlugin extends Plugin {
 			id: "gn-llm-edit-note",
 			name: "LLM-assisted note editing",
 			checkCallback: (checking: boolean) => {
-				const view = this.app.workspace.getActiveViewOfType(MarkdownView);
+				const view =
+					this.app.workspace.getActiveViewOfType(MarkdownView);
 				if (!view?.file) return false;
 				if (!checking) this.showLlmEditModal(view.file);
 				return true;
@@ -4798,7 +4875,10 @@ fetchImages: true
 		}
 	}
 
-	private async executeRefocusForCard(card: Flashcard, preventDuplicates: boolean): Promise<Flashcard[]> {
+	private async executeRefocusForCard(
+		card: Flashcard,
+		preventDuplicates: boolean
+	): Promise<Flashcard[]> {
 		// Extract refocus logic from handleRefocus method
 		const cardJson = JSON.stringify({
 			front: card.front,
@@ -4835,13 +4915,13 @@ fetchImages: true
 
 		let contextPrompt = "";
 		if (preventDuplicates) {
-			const folderPath = card.chapter.split('/').slice(0, -1).join('/');
-			const deckPath = folderPath ? `${folderPath}/${DECK_FILE_NAME}` : DECK_FILE_NAME;
+			const folderPath = card.chapter.split("/").slice(0, -1).join("/");
+			const deckPath = folderPath
+				? `${folderPath}/${DECK_FILE_NAME}`
+				: DECK_FILE_NAME;
 			const deck = await this.readDeck(deckPath);
 			const otherCards = Object.values(deck).filter(
-				(c) =>
-					c.chapter === card.chapter &&
-					c.id !== card.id
+				(c) => c.chapter === card.chapter && c.id !== card.id
 			);
 			if (otherCards.length > 0) {
 				const simplified = otherCards.map((c) => ({
@@ -4870,11 +4950,17 @@ fetchImages: true
 		}
 
 		// Parse the response - refocused cards don't have tags, so use extractJsonObjects
-		const parsedItems = extractJsonObjects<{ front: string; back: string }>(response);
-		const validItems = parsedItems.filter(item =>
-			item.front && item.back &&
-			typeof item.front === "string" && typeof item.back === "string" &&
-			item.front.trim().length > 0 && item.back.trim().length > 0
+		const parsedItems = extractJsonObjects<{ front: string; back: string }>(
+			response
+		);
+		const validItems = parsedItems.filter(
+			(item) =>
+				item.front &&
+				item.back &&
+				typeof item.front === "string" &&
+				typeof item.back === "string" &&
+				item.front.trim().length > 0 &&
+				item.back.trim().length > 0
 		);
 
 		if (validItems.length === 0) {
@@ -4882,8 +4968,10 @@ fetchImages: true
 		}
 
 		// Add the cards to the deck
-		const folderPath = card.chapter.split('/').slice(0, -1).join('/');
-		const deckPath = folderPath ? `${folderPath}/${DECK_FILE_NAME}` : DECK_FILE_NAME;
+		const folderPath = card.chapter.split("/").slice(0, -1).join("/");
+		const deckPath = folderPath
+			? `${folderPath}/${DECK_FILE_NAME}`
+			: DECK_FILE_NAME;
 		const deck = await this.readDeck(deckPath);
 		const newCards: Flashcard[] = [];
 		for (const item of validItems) {
@@ -4902,13 +4990,15 @@ fetchImages: true
 		return newCards;
 	}
 
-	private async executeBulkRefocus(cards: Flashcard[]): Promise<BulkRefocusResult[]> {
+	private async executeBulkRefocus(
+		cards: Flashcard[]
+	): Promise<BulkRefocusResult[]> {
 		// Prepare cards for LLM with identifiers
-		const cardsForLlm = cards.map(card => ({
+		const cardsForLlm = cards.map((card) => ({
 			id: card.id,
 			front: card.front,
 			back: card.back,
-			tag: card.tag // Include for context
+			tag: card.tag, // Include for context
 		}));
 
 		const basePrompt = `You are an AI assistant that creates new, insightful flashcards by "refocusing" existing ones.
@@ -4947,7 +5037,12 @@ fetchImages: true
 **Cards to Refocus:**
 ${JSON.stringify(cardsForLlm, null, 2)}`;
 
-		const { content: response, usage } = await this.sendToLlm(basePrompt, [], {}, "refocus");
+		const { content: response, usage } = await this.sendToLlm(
+			basePrompt,
+			[],
+			{},
+			"refocus"
+		);
 
 		if (!response) {
 			throw new Error("LLM returned an empty response.");
@@ -4962,25 +5057,33 @@ ${JSON.stringify(cardsForLlm, null, 2)}`;
 		// Validate and map back to original cards
 		const results: BulkRefocusResult[] = [];
 		for (const item of parsedResponse) {
-			if (!item.originalId || !item.refocusedCards || !Array.isArray(item.refocusedCards)) {
+			if (
+				!item.originalId ||
+				!item.refocusedCards ||
+				!Array.isArray(item.refocusedCards)
+			) {
 				continue;
 			}
 
-			const originalCard = cards.find(c => c.id === item.originalId);
+			const originalCard = cards.find((c) => c.id === item.originalId);
 			if (!originalCard) {
 				continue;
 			}
 
-			const validRefocusedCards = item.refocusedCards.filter(card =>
-				card.front && card.back &&
-				typeof card.front === "string" && typeof card.back === "string" &&
-				card.front.trim().length > 0 && card.back.trim().length > 0
+			const validRefocusedCards = item.refocusedCards.filter(
+				(card) =>
+					card.front &&
+					card.back &&
+					typeof card.front === "string" &&
+					typeof card.back === "string" &&
+					card.front.trim().length > 0 &&
+					card.back.trim().length > 0
 			);
 
 			if (validRefocusedCards.length > 0) {
 				results.push({
 					originalCard,
-					refocusedCards: validRefocusedCards
+					refocusedCards: validRefocusedCards,
 				});
 			}
 		}
@@ -4988,7 +5091,9 @@ ${JSON.stringify(cardsForLlm, null, 2)}`;
 		return results;
 	}
 
-	private async executeVariantsForCard(card: Flashcard): Promise<Flashcard[]> {
+	private async executeVariantsForCard(
+		card: Flashcard
+	): Promise<Flashcard[]> {
 		// Extract variant logic from executeVariantGeneration method
 		const currentVariant = {
 			front: card.front,
@@ -5002,7 +5107,9 @@ ${JSON.stringify(cardsForLlm, null, 2)}`;
 		let promptVariants = "";
 		if (includeExisting) {
 			promptVariants = existingVariants
-				.map((v, i) => `${i + 1}. Front: ${v.front}\n   Back: ${v.back}`)
+				.map(
+					(v, i) => `${i + 1}. Front: ${v.front}\n   Back: ${v.back}`
+				)
 				.join("\n");
 		} else {
 			promptVariants = `1. Front: ${currentVariant.front}\n   Back: ${currentVariant.back}`;
@@ -5052,22 +5159,33 @@ ${promptVariants}
 
 Return ONLY valid JSON of this shape: [{"front":"...","back":"..."}] or [] if no good variants possible`;
 
-		const { content: response, usage } = await this.sendToLlm(prompt, [], {}, "variant");
+		const { content: response, usage } = await this.sendToLlm(
+			prompt,
+			[],
+			{},
+			"variant"
+		);
 
 		if (!response) {
 			throw new Error("LLM returned an empty response.");
 		}
 
 		// Parse the response
-		const parsedItems = extractJsonObjects<{ front: string; back: string }>(response);
-		const validVariants = parsedItems.filter(item => item.front && item.back);
+		const parsedItems = extractJsonObjects<{ front: string; back: string }>(
+			response
+		);
+		const validVariants = parsedItems.filter(
+			(item) => item.front && item.back
+		);
 		if (validVariants.length === 0) {
 			throw new Error("Could not parse new variants from LLM response.");
 		}
 
 		// Add variants to the card
-		const folderPath = card.chapter.split('/').slice(0, -1).join('/');
-		const deckPath = folderPath ? `${folderPath}/${DECK_FILE_NAME}` : DECK_FILE_NAME;
+		const folderPath = card.chapter.split("/").slice(0, -1).join("/");
+		const deckPath = folderPath
+			? `${folderPath}/${DECK_FILE_NAME}`
+			: DECK_FILE_NAME;
 		const deck = await this.readDeck(deckPath);
 		if (!card.variants) {
 			card.variants = [];
@@ -5085,17 +5203,23 @@ Return ONLY valid JSON of this shape: [{"front":"...","back":"..."}] or [] if no
 		await this.writeDeck(deckPath, deck);
 
 		// Return pseudo-flashcards for counting purposes
-		return validVariants.map(v => ({ ...card, front: v.front, back: v.back }));
+		return validVariants.map((v) => ({
+			...card,
+			front: v.front,
+			back: v.back,
+		}));
 	}
 
 	private async bulkRefocusCards(file: TFile): Promise<void> {
 		try {
 			// Load deck to get cards for this note
 			const folderPath = file.parent?.path || "";
-			const deckPath = folderPath ? `${folderPath}/${DECK_FILE_NAME}` : DECK_FILE_NAME;
+			const deckPath = folderPath
+				? `${folderPath}/${DECK_FILE_NAME}`
+				: DECK_FILE_NAME;
 			const deck = await this.readDeck(deckPath);
-			const noteCards = Object.values(deck).filter(card =>
-				card.chapter === file.path && !card.suspended
+			const noteCards = Object.values(deck).filter(
+				(card) => card.chapter === file.path && !card.suspended
 			);
 
 			if (noteCards.length === 0) {
@@ -5104,15 +5228,24 @@ Return ONLY valid JSON of this shape: [{"front":"...","back":"..."}] or [] if no
 			}
 
 			// Show confirmation modal
-			const confirmed = await new Promise<boolean>(resolve => {
-				new BulkRefocusConfirmModal(this, noteCards.length, file.name, resolve).open();
+			const confirmed = await new Promise<boolean>((resolve) => {
+				new BulkRefocusConfirmModal(
+					this,
+					noteCards.length,
+					file.name,
+					resolve
+				).open();
 			});
 
 			if (!confirmed) return;
 
 			// Execute bulk refocus with single LLM call
-			const providerModelDesc = this.getProviderModelDescription("refocus");
-			const notice = new Notice(`🔄 Refocusing ${noteCards.length} cards using ${providerModelDesc}...`, 0);
+			const providerModelDesc =
+				this.getProviderModelDescription("refocus");
+			const notice = new Notice(
+				`🔄 Refocusing ${noteCards.length} cards using ${providerModelDesc}...`,
+				0
+			);
 
 			try {
 				const refocusResults = await this.executeBulkRefocus(noteCards);
@@ -5124,8 +5257,12 @@ Return ONLY valid JSON of this shape: [{"front":"...","back":"..."}] or [] if no
 				}
 
 				// Show review interface
-				const approved = await new Promise<boolean>(resolve => {
-					new BulkRefocusReviewModal(this, refocusResults, resolve).open();
+				const approved = await new Promise<boolean>((resolve) => {
+					new BulkRefocusReviewModal(
+						this,
+						refocusResults,
+						resolve
+					).open();
 				});
 
 				if (!approved) {
@@ -5150,15 +5287,16 @@ Return ONLY valid JSON of this shape: [{"front":"...","back":"..."}] or [] if no
 				}
 
 				await this.writeDeck(deckPath, deck);
-				const providerModelDesc = this.getProviderModelDescription("refocus");
-				new Notice(`✅ Bulk refocus complete: ${totalAdded} new cards created using ${providerModelDesc}`);
-
+				const providerModelDesc =
+					this.getProviderModelDescription("refocus");
+				new Notice(
+					`✅ Bulk refocus complete: ${totalAdded} new cards created using ${providerModelDesc}`
+				);
 			} catch (error) {
 				notice.hide();
 				new Notice("❌ Failed to refocus cards");
 				console.error("Bulk refocus error:", error);
 			}
-
 		} catch (error) {
 			new Notice("❌ Failed to bulk refocus cards");
 			console.error("Bulk refocus error:", error);
@@ -5169,7 +5307,8 @@ Return ONLY valid JSON of this shape: [{"front":"...","back":"..."}] or [] if no
 		try {
 			// Determine if current note is polyglot to decide card filtering strategy
 			const currentFileContent = await this.app.vault.read(currentFile);
-			const isCurrentNotePolyglot = this.isPolyglotNote(currentFileContent);
+			const isCurrentNotePolyglot =
+				this.isPolyglotNote(currentFileContent);
 
 			// Load all deck files
 			const allDeckFiles = this.app.vault
@@ -5190,11 +5329,16 @@ Return ONLY valid JSON of this shape: [{"front":"...","back":"..."}] or [] if no
 					const deck = await this.readDeck(deckFile.path);
 					const allDeckCards = Object.values(deck);
 					const targetCards = isCurrentNotePolyglot
-						? allDeckCards.filter(card => this.isPolyglotCard(card))
-						: allDeckCards.filter(card => !this.isPolyglotCard(card));
+						? allDeckCards.filter((card) =>
+								this.isPolyglotCard(card)
+						  )
+						: allDeckCards.filter(
+								(card) => !this.isPolyglotCard(card)
+						  );
 
 					if (targetCards.length >= 2) {
-						const deckComparisons = (targetCards.length * (targetCards.length - 1)) / 2;
+						const deckComparisons =
+							(targetCards.length * (targetCards.length - 1)) / 2;
 						totalComparisons += deckComparisons;
 						totalTargetCards += targetCards.length;
 					}
@@ -5206,8 +5350,16 @@ Return ONLY valid JSON of this shape: [{"front":"...","back":"..."}] or [] if no
 
 			// Show confirmation prompt with scope selection
 			const noteTypeText = isCurrentNotePolyglot ? "is" : "is not";
-			const cardTypeText = isCurrentNotePolyglot ? "polyglot" : "non-polyglot";
-			const result = await new Promise<{ confirmed: boolean; selectedScope: string; excludeSuspended: boolean; excludeFlagged: boolean; comparisonMode: ComparisonMode } | null>(resolve => {
+			const cardTypeText = isCurrentNotePolyglot
+				? "polyglot"
+				: "non-polyglot";
+			const result = await new Promise<{
+				confirmed: boolean;
+				selectedScope: string;
+				excludeSuspended: boolean;
+				excludeFlagged: boolean;
+				comparisonMode: ComparisonMode;
+			} | null>((resolve) => {
 				new DuplicateDetectionConfirmModal(
 					this,
 					currentFile,
@@ -5220,17 +5372,25 @@ Return ONLY valid JSON of this shape: [{"front":"...","back":"..."}] or [] if no
 
 			if (!result || !result.confirmed) return;
 
-			const { selectedScope, excludeSuspended, excludeFlagged, comparisonMode } = result;
+			const {
+				selectedScope,
+				excludeSuspended,
+				excludeFlagged,
+				comparisonMode,
+			} = result;
 
 			const notice = new Notice("🔍 Scanning for duplicate cards...", 0);
 			let allDuplicateGroups: DuplicateGroup[] = [];
 			let totalDecksProcessed = 0;
 
 			// Filter deck files based on selected scope
-			const filteredDeckFiles = allDeckFiles.filter(deckFile => {
+			const filteredDeckFiles = allDeckFiles.filter((deckFile) => {
 				if (selectedScope === currentFile.path) {
 					// Current note only - check if this deck contains cards from current note
-					return deckFile.path === this.getDeckPathForNote(currentFile.path);
+					return (
+						deckFile.path ===
+						this.getDeckPathForNote(currentFile.path)
+					);
 				} else if (selectedScope === "/") {
 					// Vault-wide - include all
 					return true;
@@ -5240,7 +5400,10 @@ Return ONLY valid JSON of this shape: [{"front":"...","back":"..."}] or [] if no
 				}
 			});
 
-			this.logger(LogLevel.NORMAL, `Starting duplicate detection across ${filteredDeckFiles.length} deck files in scope "${selectedScope}" (${cardTypeText} cards only)`);
+			this.logger(
+				LogLevel.NORMAL,
+				`Starting duplicate detection across ${filteredDeckFiles.length} deck files in scope "${selectedScope}" (${cardTypeText} cards only)`
+			);
 
 			for (const deckFile of filteredDeckFiles) {
 				try {
@@ -5249,15 +5412,20 @@ Return ONLY valid JSON of this shape: [{"front":"...","back":"..."}] or [] if no
 
 					// Filter cards based on current note type
 					let deckCards = isCurrentNotePolyglot
-						? allDeckCards.filter(card => this.isPolyglotCard(card))  // Only polyglot cards
-						: allDeckCards.filter(card => !this.isPolyglotCard(card)); // Only non-polyglot cards
+						? allDeckCards.filter((card) =>
+								this.isPolyglotCard(card)
+						  ) // Only polyglot cards
+						: allDeckCards.filter(
+								(card) => !this.isPolyglotCard(card)
+						  ); // Only non-polyglot cards
 
 					// Apply suspended/flagged/verbatim filtering
-					deckCards = deckCards.filter(card => {
+					deckCards = deckCards.filter((card) => {
 						if (card.suspended && excludeSuspended) return false;
 						if (card.flagged && excludeFlagged) return false;
 						// Always exclude verbatim cards from duplicate detection
-						if (card.tag && card.tag.includes("verbatim_")) return false;
+						if (card.tag && card.tag.includes("verbatim_"))
+							return false;
 						return true;
 					});
 
@@ -5267,19 +5435,30 @@ Return ONLY valid JSON of this shape: [{"front":"...","back":"..."}] or [] if no
 					}
 
 					// Find duplicates within this deck only
-					const deckDuplicateGroups = this.detectDuplicateCards(deckCards, deckFile.path, comparisonMode);
+					const deckDuplicateGroups = this.detectDuplicateCards(
+						deckCards,
+						deckFile.path,
+						comparisonMode
+					);
 					allDuplicateGroups.push(...deckDuplicateGroups);
 
 					totalDecksProcessed++;
-					notice.setMessage(`🔍 Scanning for duplicates... (${totalDecksProcessed}/${allDeckFiles.length} decks)`);
-
+					notice.setMessage(
+						`🔍 Scanning for duplicates... (${totalDecksProcessed}/${allDeckFiles.length} decks)`
+					);
 				} catch (error) {
-					console.warn(`Could not read deck ${deckFile.path}:`, error);
+					console.warn(
+						`Could not read deck ${deckFile.path}:`,
+						error
+					);
 				}
 			}
 
 			notice.hide();
-			this.logger(LogLevel.NORMAL, `Duplicate detection complete: processed ${totalDecksProcessed} decks, found ${allDuplicateGroups.length} duplicate groups`);
+			this.logger(
+				LogLevel.NORMAL,
+				`Duplicate detection complete: processed ${totalDecksProcessed} decks, found ${allDuplicateGroups.length} duplicate groups`
+			);
 
 			if (allDuplicateGroups.length === 0) {
 				new Notice("✅ No duplicate cards found");
@@ -5288,14 +5467,17 @@ Return ONLY valid JSON of this shape: [{"front":"...","back":"..."}] or [] if no
 
 			// Show results
 			new DuplicateCardsModal(this, allDuplicateGroups).open();
-
 		} catch (error) {
 			new Notice("❌ Failed to scan for duplicates");
 			console.error("Duplicate detection error:", error);
 		}
 	}
 
-	private detectDuplicateCards(allCards: Flashcard[], deckPath?: string, comparisonMode: ComparisonMode = ComparisonMode.FRONT_PLUS_BACK): DuplicateGroup[] {
+	private detectDuplicateCards(
+		allCards: Flashcard[],
+		deckPath?: string,
+		comparisonMode: ComparisonMode = ComparisonMode.FRONT_PLUS_BACK
+	): DuplicateGroup[] {
 		const duplicateGroups: DuplicateGroup[] = [];
 		const processedCards = new Set<string>();
 		const totalComparisons = (allCards.length * (allCards.length - 1)) / 2;
@@ -5303,25 +5485,34 @@ Return ONLY valid JSON of this shape: [{"front":"...","back":"..."}] or [] if no
 		let lastLogTime = Date.now();
 
 		// Extract deck name from path (e.g., "folder/subfolder/_flashcards.json" -> "subfolder")
-		let deckName = 'All cards';
+		let deckName = "All cards";
 		if (deckPath) {
-			const pathParts = deckPath.split('/');
+			const pathParts = deckPath.split("/");
 			if (pathParts.length > 1) {
 				// Get the parent folder name (the folder containing _flashcards.json)
-				deckName = pathParts[pathParts.length - 2] || 'Root';
+				deckName = pathParts[pathParts.length - 2] || "Root";
 			} else {
-				deckName = 'Root';
+				deckName = "Root";
 			}
 		}
 
 		// Only log for larger decks to avoid spam
 		if (allCards.length >= 100) {
-			this.logger(LogLevel.NORMAL, `Checking deck "${deckName}": ${allCards.length} cards, ~${totalComparisons} comparisons`);
+			this.logger(
+				LogLevel.NORMAL,
+				`Checking deck "${deckName}": ${allCards.length} cards, ~${totalComparisons} comparisons`
+			);
 		}
 
 		// Pre-lemmatize all cards for this deck to avoid redundant processing
-		this.logger(LogLevel.VERBOSE, `Pre-processing ${allCards.length} cards for lemmatization (mode: ${comparisonMode})...`);
-		const lemmaCache = new Map<string, { front: string[], back: string[], combined: string[] }>();
+		this.logger(
+			LogLevel.VERBOSE,
+			`Pre-processing ${allCards.length} cards for lemmatization (mode: ${comparisonMode})...`
+		);
+		const lemmaCache = new Map<
+			string,
+			{ front: string[]; back: string[]; combined: string[] }
+		>();
 		let lemmatizationStart = Date.now();
 
 		for (let k = 0; k < allCards.length; k++) {
@@ -5334,25 +5525,40 @@ Return ONLY valid JSON of this shape: [{"front":"...","back":"..."}] or [] if no
 
 			// For front+back mode, concatenate and lemmatize together
 			if (comparisonMode === ComparisonMode.FRONT_PLUS_BACK) {
-				const combinedText = [card.front || "", card.back || ""].filter(t => t.trim()).join(" ");
-				combinedLemmas = combinedText ? this.lemmatize(combinedText) : [];
+				const combinedText = [card.front || "", card.back || ""]
+					.filter((t) => t.trim())
+					.join(" ");
+				combinedLemmas = combinedText
+					? this.lemmatize(combinedText)
+					: [];
 			}
 
 			lemmaCache.set(card.id, {
 				front: frontLemmas,
 				back: backLemmas,
-				combined: combinedLemmas
+				combined: combinedLemmas,
 			});
 
 			// Progress logging for lemmatization
-			if (allCards.length >= 200 && (k % 100 === 0 || k === allCards.length - 1)) {
+			if (
+				allCards.length >= 200 &&
+				(k % 100 === 0 || k === allCards.length - 1)
+			) {
 				const progress = Math.round(((k + 1) / allCards.length) * 100);
-				this.logger(LogLevel.VERBOSE, `  Lemmatization progress: ${progress}% (${k + 1}/${allCards.length} cards)`);
+				this.logger(
+					LogLevel.VERBOSE,
+					`  Lemmatization progress: ${progress}% (${k + 1}/${
+						allCards.length
+					} cards)`
+				);
 			}
 		}
 
 		const lemmatizationTime = Date.now() - lemmatizationStart;
-		this.logger(LogLevel.VERBOSE, `Lemmatization complete in ${lemmatizationTime}ms`);
+		this.logger(
+			LogLevel.VERBOSE,
+			`Lemmatization complete in ${lemmatizationTime}ms`
+		);
 
 		for (let i = 0; i < allCards.length; i++) {
 			const card1 = allCards[i];
@@ -5360,10 +5566,19 @@ Return ONLY valid JSON of this shape: [{"front":"...","back":"..."}] or [] if no
 
 			// Progress logging for comparison phase
 			const now = Date.now();
-			if (allCards.length >= 500 && (i % 250 === 0 || now - lastLogTime > 3000)) {
+			if (
+				allCards.length >= 500 &&
+				(i % 250 === 0 || now - lastLogTime > 3000)
+			) {
 				const progress = Math.round((i / allCards.length) * 100);
-				const comparisonsLeft = (allCards.length - i) * (allCards.length - i - 1) / 2;
-				this.logger(LogLevel.VERBOSE, `  "${deckName}" comparison progress: ${progress}% (card ${i}/${allCards.length}, ~${Math.round(comparisonsLeft)} comparisons left)`);
+				const comparisonsLeft =
+					((allCards.length - i) * (allCards.length - i - 1)) / 2;
+				this.logger(
+					LogLevel.VERBOSE,
+					`  "${deckName}" comparison progress: ${progress}% (card ${i}/${
+						allCards.length
+					}, ~${Math.round(comparisonsLeft)} comparisons left)`
+				);
 				lastLogTime = now;
 			}
 
@@ -5374,14 +5589,22 @@ Return ONLY valid JSON of this shape: [{"front":"...","back":"..."}] or [] if no
 			}> = [];
 
 			// Get pre-lemmatized data for card1
-			const lemmas1 = lemmaCache.get(card1.id) || { front: [], back: [], combined: [] };
+			const lemmas1 = lemmaCache.get(card1.id) || {
+				front: [],
+				back: [],
+				combined: [],
+			};
 
 			for (let j = i + 1; j < allCards.length; j++) {
 				const card2 = allCards[j];
 				if (processedCards.has(card2.id)) continue;
 
 				// Get pre-lemmatized data for card2
-				const lemmas2 = lemmaCache.get(card2.id) || { front: [], back: [], combined: [] };
+				const lemmas2 = lemmaCache.get(card2.id) || {
+					front: [],
+					back: [],
+					combined: [],
+				};
 
 				// Calculate similarity based on comparison mode
 				let bestSimilarity = 0;
@@ -5391,7 +5614,10 @@ Return ONLY valid JSON of this shape: [{"front":"...","back":"..."}] or [] if no
 				switch (comparisonMode) {
 					case ComparisonMode.FRONT:
 						// Only compare fronts
-						bestSimilarity = this.calculateJaccardSimilarity(lemmas1.front, lemmas2.front);
+						bestSimilarity = this.calculateJaccardSimilarity(
+							lemmas1.front,
+							lemmas2.front
+						);
 						if (card1.front && card2.front) {
 							bestText1 = card1.front;
 							bestText2 = card2.front;
@@ -5400,7 +5626,10 @@ Return ONLY valid JSON of this shape: [{"front":"...","back":"..."}] or [] if no
 
 					case ComparisonMode.BACK:
 						// Only compare backs
-						bestSimilarity = this.calculateJaccardSimilarity(lemmas1.back, lemmas2.back);
+						bestSimilarity = this.calculateJaccardSimilarity(
+							lemmas1.back,
+							lemmas2.back
+						);
 						if (card1.back && card2.back) {
 							bestText1 = card1.back;
 							bestText2 = card2.back;
@@ -5409,12 +5638,25 @@ Return ONLY valid JSON of this shape: [{"front":"...","back":"..."}] or [] if no
 
 					case ComparisonMode.FRONT_OR_BACK:
 						// Max of front-to-front and back-to-back similarities
-						const frontSimilarity = this.calculateJaccardSimilarity(lemmas1.front, lemmas2.front);
-						const backSimilarity = this.calculateJaccardSimilarity(lemmas1.back, lemmas2.back);
-						bestSimilarity = Math.max(frontSimilarity, backSimilarity);
+						const frontSimilarity = this.calculateJaccardSimilarity(
+							lemmas1.front,
+							lemmas2.front
+						);
+						const backSimilarity = this.calculateJaccardSimilarity(
+							lemmas1.back,
+							lemmas2.back
+						);
+						bestSimilarity = Math.max(
+							frontSimilarity,
+							backSimilarity
+						);
 
 						// Show text pair with higher similarity
-						if (frontSimilarity >= backSimilarity && card1.front && card2.front) {
+						if (
+							frontSimilarity >= backSimilarity &&
+							card1.front &&
+							card2.front
+						) {
 							bestText1 = card1.front;
 							bestText2 = card2.front;
 						} else if (card1.back && card2.back) {
@@ -5425,8 +5667,14 @@ Return ONLY valid JSON of this shape: [{"front":"...","back":"..."}] or [] if no
 
 					case ComparisonMode.FRONT_AND_BACK:
 						// Combined similarity: 1-(1-front)*(1-back) (probabilistic)
-						const frontSim = this.calculateJaccardSimilarity(lemmas1.front, lemmas2.front);
-						const backSim = this.calculateJaccardSimilarity(lemmas1.back, lemmas2.back);
+						const frontSim = this.calculateJaccardSimilarity(
+							lemmas1.front,
+							lemmas2.front
+						);
+						const backSim = this.calculateJaccardSimilarity(
+							lemmas1.back,
+							lemmas2.back
+						);
 						bestSimilarity = 1 - (1 - frontSim) * (1 - backSim);
 
 						// Show text pair with higher individual similarity
@@ -5441,9 +5689,22 @@ Return ONLY valid JSON of this shape: [{"front":"...","back":"..."}] or [] if no
 
 					case ComparisonMode.FRONT_PLUS_BACK:
 						// Compare concatenated front+back strings
-						bestSimilarity = this.calculateJaccardSimilarity(lemmas1.combined, lemmas2.combined);
-						const combinedText1 = [card1.front || "", card1.back || ""].filter(t => t.trim()).join(" ");
-						const combinedText2 = [card2.front || "", card2.back || ""].filter(t => t.trim()).join(" ");
+						bestSimilarity = this.calculateJaccardSimilarity(
+							lemmas1.combined,
+							lemmas2.combined
+						);
+						const combinedText1 = [
+							card1.front || "",
+							card1.back || "",
+						]
+							.filter((t) => t.trim())
+							.join(" ");
+						const combinedText2 = [
+							card2.front || "",
+							card2.back || "",
+						]
+							.filter((t) => t.trim())
+							.join(" ");
 						bestText1 = combinedText1;
 						bestText2 = combinedText2;
 						break;
@@ -5458,14 +5719,14 @@ Return ONLY valid JSON of this shape: [{"front":"...","back":"..."}] or [] if no
 						similarCards.push({
 							card: card1,
 							similarText: bestText1,
-							similarity: 1.0
+							similarity: 1.0,
 						});
 					}
 
 					similarCards.push({
 						card: card2,
 						similarText: bestText2,
-						similarity: bestSimilarity
+						similarity: bestSimilarity,
 					});
 
 					processedCards.add(card2.id);
@@ -5481,41 +5742,116 @@ Return ONLY valid JSON of this shape: [{"front":"...","back":"..."}] or [] if no
 		// Log completion with timing information
 		const processingTime = Date.now() - lemmatizationStart;
 		if (duplicateGroups.length > 0 || allCards.length >= 100) {
-			this.logger(LogLevel.NORMAL, `  "${deckName}" complete: ${comparisonsCompleted} comparisons, found ${duplicateGroups.length} duplicate groups (${processingTime}ms total, ${lemmatizationTime}ms lemmatization)`);
+			this.logger(
+				LogLevel.NORMAL,
+				`  "${deckName}" complete: ${comparisonsCompleted} comparisons, found ${duplicateGroups.length} duplicate groups (${processingTime}ms total, ${lemmatizationTime}ms lemmatization)`
+			);
 		} else {
-			this.logger(LogLevel.VERBOSE, `  "${deckName}" complete: ${comparisonsCompleted} comparisons, found ${duplicateGroups.length} duplicate groups (${processingTime}ms total, ${lemmatizationTime}ms lemmatization)`);
+			this.logger(
+				LogLevel.VERBOSE,
+				`  "${deckName}" complete: ${comparisonsCompleted} comparisons, found ${duplicateGroups.length} duplicate groups (${processingTime}ms total, ${lemmatizationTime}ms lemmatization)`
+			);
 		}
 		return duplicateGroups;
 	}
 
 	// Stopwords for lemmatization
 	private readonly stopwords = new Set([
-		"a", "an", "the", "is", "was", "were", "are", "of", "to", "in", "and", "that", "it", "on", "for", "with", "as", "at", "by", "from",
-		"be", "been", "being", "have", "has", "had", "do", "does", "did", "will", "would", "could", "should", "may", "might", "can", "must", "shall",
-		"this", "that", "these", "those", "but", "or", "not", "no", "yes", "so", "if", "when", "where", "why", "how", "what", "who", "which", "i", "you", "he", "she", "we", "they", "me", "him", "her", "us", "them"
+		"a",
+		"an",
+		"the",
+		"is",
+		"was",
+		"were",
+		"are",
+		"of",
+		"to",
+		"in",
+		"and",
+		"that",
+		"it",
+		"on",
+		"for",
+		"with",
+		"as",
+		"at",
+		"by",
+		"from",
+		"be",
+		"been",
+		"being",
+		"have",
+		"has",
+		"had",
+		"do",
+		"does",
+		"did",
+		"will",
+		"would",
+		"could",
+		"should",
+		"may",
+		"might",
+		"can",
+		"must",
+		"shall",
+		"this",
+		"that",
+		"these",
+		"those",
+		"but",
+		"or",
+		"not",
+		"no",
+		"yes",
+		"so",
+		"if",
+		"when",
+		"where",
+		"why",
+		"how",
+		"what",
+		"who",
+		"which",
+		"i",
+		"you",
+		"he",
+		"she",
+		"we",
+		"they",
+		"me",
+		"him",
+		"her",
+		"us",
+		"them",
 	]);
 
 	private lemmatize(text: string): string[] {
-		if (!text || text.trim() === '') return [];
+		if (!text || text.trim() === "") return [];
 
 		// Strip possessive 's before processing to avoid "John's" becoming "johns" instead of "john"
-		const textWithoutPossessives = text.replace(/([a-zA-Z])'s\b/g, '$1');
+		const textWithoutPossessives = text.replace(/([a-zA-Z])'s\b/g, "$1");
 
 		let doc = nlp(textWithoutPossessives);
 		doc.verbs().toInfinitive();
 		doc.nouns().toSingular();
-		return doc.terms().out('array')
-			.map((t: string) => t.toLowerCase().replace(/[^\w]/g, '')) // Remove punctuation
+		return doc
+			.terms()
+			.out("array")
+			.map((t: string) => t.toLowerCase().replace(/[^\w]/g, "")) // Remove punctuation
 			.filter((t: string) => t.length > 1 && !this.stopwords.has(t)); // Filter short words and stopwords
 	}
 
-	private calculateJaccardSimilarity(lemmas1: string[], lemmas2: string[]): number {
+	private calculateJaccardSimilarity(
+		lemmas1: string[],
+		lemmas2: string[]
+	): number {
 		if (lemmas1.length === 0 && lemmas2.length === 0) return 1.0;
 		if (lemmas1.length === 0 || lemmas2.length === 0) return 0.0;
 
 		const setA = new Set(lemmas1);
 		const setB = new Set(lemmas2);
-		const intersection = [...setA].filter(x => setB.has(x));
+		const intersection = [...setA].filter((x) => setB.has(x));
 		const union = new Set([...setA, ...setB]);
 		return intersection.length / union.size;
 	}
@@ -5523,13 +5859,12 @@ Return ONLY valid JSON of this shape: [{"front":"...","back":"..."}] or [] if no
 	// TODO: Add variant comparison if they exist
 	// In future, we could also compare card.variants front-to-front and back-to-back
 
-
 	public isPolyglotCard(card: Flashcard): boolean {
 		return card.polyglot?.isPolyglot === true;
 	}
 
 	public getDeckPathForNote(notePath: string): string {
-		const folderPath = notePath.split('/').slice(0, -1).join('/');
+		const folderPath = notePath.split("/").slice(0, -1).join("/");
 		return folderPath ? `${folderPath}/${DECK_FILE_NAME}` : DECK_FILE_NAME;
 	}
 
@@ -5537,10 +5872,12 @@ Return ONLY valid JSON of this shape: [{"front":"...","back":"..."}] or [] if no
 		try {
 			// Load deck to get cards for this note
 			const folderPath = file.parent?.path || "";
-			const deckPath = folderPath ? `${folderPath}/${DECK_FILE_NAME}` : DECK_FILE_NAME;
+			const deckPath = folderPath
+				? `${folderPath}/${DECK_FILE_NAME}`
+				: DECK_FILE_NAME;
 			const deck = await this.readDeck(deckPath);
-			const noteCards = Object.values(deck).filter(card =>
-				card.chapter === file.path && !card.suspended
+			const noteCards = Object.values(deck).filter(
+				(card) => card.chapter === file.path && !card.suspended
 			);
 
 			if (noteCards.length === 0) {
@@ -5549,21 +5886,33 @@ Return ONLY valid JSON of this shape: [{"front":"...","back":"..."}] or [] if no
 			}
 
 			// Show confirmation modal
-			const confirmed = await new Promise<boolean>(resolve => {
-				new BulkVariantsConfirmModal(this, noteCards.length, file.name, resolve).open();
+			const confirmed = await new Promise<boolean>((resolve) => {
+				new BulkVariantsConfirmModal(
+					this,
+					noteCards.length,
+					file.name,
+					resolve
+				).open();
 			});
 
 			if (!confirmed) return;
 
 			// Process cards with progress tracking
-			const notice = new Notice(`🎲 Creating variants for ${noteCards.length} cards...`, 0);
+			const notice = new Notice(
+				`🎲 Creating variants for ${noteCards.length} cards...`,
+				0
+			);
 			let processed = 0;
 			let successful = 0;
 			let skipped = 0;
 
 			for (const card of noteCards) {
 				try {
-					notice.setMessage(`🎲 Creating variants... (${processed + 1}/${noteCards.length})`);
+					notice.setMessage(
+						`🎲 Creating variants... (${processed + 1}/${
+							noteCards.length
+						})`
+					);
 
 					// Use variant logic extracted from executeVariantGeneration method
 					const result = await this.executeVariantsForCard(card);
@@ -5575,16 +5924,23 @@ Return ONLY valid JSON of this shape: [{"front":"...","back":"..."}] or [] if no
 
 					processed++;
 				} catch (error) {
-					console.error(`Failed to create variants for card ${card.id}:`, error);
+					console.error(
+						`Failed to create variants for card ${card.id}:`,
+						error
+					);
 					skipped++;
 					processed++;
 				}
 			}
 
 			notice.hide();
-			const skippedMsg = skipped > 0 ? ` (${skipped} cards skipped as unsuitable for variants)` : "";
-			new Notice(`✅ Bulk variants complete: ${successful} new variant cards created from ${processed} originals${skippedMsg}`);
-
+			const skippedMsg =
+				skipped > 0
+					? ` (${skipped} cards skipped as unsuitable for variants)`
+					: "";
+			new Notice(
+				`✅ Bulk variants complete: ${successful} new variant cards created from ${processed} originals${skippedMsg}`
+			);
 		} catch (error) {
 			new Notice("❌ Failed to bulk create variants");
 			console.error("Bulk variants error:", error);
@@ -5600,33 +5956,50 @@ Return ONLY valid JSON of this shape: [{"front":"...","back":"..."}] or [] if no
 
 			// Check if note is finalized (contains gn-para class)
 			if (content.includes(PARA_CLASS)) {
-				new Notice("❌ Note must be unfinalized before LLM editing. Use 'Unfinalize note' command first.");
+				new Notice(
+					"❌ Note must be unfinalized before LLM editing. Use 'Unfinalize note' command first."
+				);
 				return;
 			}
 
 			// Check for existing flashcards
 			const folderPath = file.parent?.path || "";
-			const deckPath = folderPath ? `${folderPath}/${DECK_FILE_NAME}` : DECK_FILE_NAME;
+			const deckPath = folderPath
+				? `${folderPath}/${DECK_FILE_NAME}`
+				: DECK_FILE_NAME;
 
 			let hasFlashcards = false;
 			let flashcardTags: string[] = [];
 
 			try {
 				const deck = await this.readDeck(deckPath);
-				const noteCards = Object.values(deck).filter(card => card.chapter === file.path);
+				const noteCards = Object.values(deck).filter(
+					(card) => card.chapter === file.path
+				);
 				hasFlashcards = noteCards.length > 0;
 
 				if (hasFlashcards) {
 					// Get unique tags for highlighting
-					flashcardTags = [...new Set(noteCards.map(card => card.tag).filter(tag => tag))];
+					flashcardTags = [
+						...new Set(
+							noteCards
+								.map((card) => card.tag)
+								.filter((tag) => tag)
+						),
+					];
 				}
 			} catch (error) {
 				// No deck file exists, continue without warning
 			}
 
 			// Show the LLM edit modal
-			new LlmEditModal(this.app, file, content, flashcardTags, this).open();
-
+			new LlmEditModal(
+				this.app,
+				file,
+				content,
+				flashcardTags,
+				this
+			).open();
 		} catch (error) {
 			new Notice("❌ Failed to read note content");
 			console.error("LLM edit error:", error);
@@ -5654,7 +6027,9 @@ Return ONLY valid JSON of this shape: [{"front":"...","back":"..."}] or [] if no
 		this.registerEvent(this.app.vault.on("delete", refreshOnDeckChange));
 
 		// Scroll position memory
-		this.registerEvent(this.app.workspace.on("file-open", this.handleFileOpen.bind(this)));
+		this.registerEvent(
+			this.app.workspace.on("file-open", this.handleFileOpen.bind(this))
+		);
 	}
 
 	/**
@@ -5677,7 +6052,11 @@ Return ONLY valid JSON of this shape: [{"front":"...","back":"..."}] or [] if no
 				}, 100);
 			}
 		} catch (error) {
-			this.logger(LogLevel.VERBOSE, "Error handling file open for scroll position:", error);
+			this.logger(
+				LogLevel.VERBOSE,
+				"Error handling file open for scroll position:",
+				error
+			);
 		}
 	}
 
@@ -5686,20 +6065,29 @@ Return ONLY valid JSON of this shape: [{"front":"...","back":"..."}] or [] if no
 	 */
 	private async saveScrollPosition(filePath: string): Promise<void> {
 		try {
-			const activeView = this.app.workspace.getActiveViewOfType(MarkdownView);
+			const activeView =
+				this.app.workspace.getActiveViewOfType(MarkdownView);
 			if (!activeView) return;
 
 			const state = activeView.getEphemeralState();
-			const scrollPosition = typeof state?.scroll === 'number' ? state.scroll : 0;
+			const scrollPosition =
+				typeof state?.scroll === "number" ? state.scroll : 0;
 
 			// Only save if there's a meaningful scroll position
 			if (scrollPosition > 0) {
 				this.settings.scrollPositions[filePath] = scrollPosition;
 				await this.saveSettings();
-				this.logger(LogLevel.VERBOSE, `Saved scroll position ${scrollPosition} for ${filePath}`);
+				this.logger(
+					LogLevel.VERBOSE,
+					`Saved scroll position ${scrollPosition} for ${filePath}`
+				);
 			}
 		} catch (error) {
-			this.logger(LogLevel.VERBOSE, "Error saving scroll position:", error);
+			this.logger(
+				LogLevel.VERBOSE,
+				"Error saving scroll position:",
+				error
+			);
 		}
 	}
 
@@ -5711,13 +6099,21 @@ Return ONLY valid JSON of this shape: [{"front":"...","back":"..."}] or [] if no
 			const savedPosition = this.settings.scrollPositions[filePath];
 			if (savedPosition === undefined) return;
 
-			const activeView = this.app.workspace.getActiveViewOfType(MarkdownView);
+			const activeView =
+				this.app.workspace.getActiveViewOfType(MarkdownView);
 			if (!activeView) return;
 
 			activeView.setEphemeralState({ scroll: savedPosition });
-			this.logger(LogLevel.VERBOSE, `Restored scroll position ${savedPosition} for ${filePath}`);
+			this.logger(
+				LogLevel.VERBOSE,
+				`Restored scroll position ${savedPosition} for ${filePath}`
+			);
 		} catch (error) {
-			this.logger(LogLevel.VERBOSE, "Error restoring scroll position:", error);
+			this.logger(
+				LogLevel.VERBOSE,
+				"Error restoring scroll position:",
+				error
+			);
 		}
 	}
 
@@ -5744,10 +6140,7 @@ Return ONLY valid JSON of this shape: [{"front":"...","back":"..."}] or [] if no
 						.setTitle("Create verbatim flashcards")
 						.setIcon("layers")
 						.onClick(() =>
-							this.createVerbatimFlashcards(
-								selection,
-								view.file!
-							)
+							this.createVerbatimFlashcards(selection, view.file!)
 						)
 				);
 			})
@@ -5817,10 +6210,7 @@ Return ONLY valid JSON of this shape: [{"front":"...","back":"..."}] or [] if no
 					.setTitle("Create verbatim flashcards")
 					.setIcon("layers")
 					.onClick(() =>
-						this.createVerbatimFlashcards(
-							selection,
-							view.file!
-						)
+						this.createVerbatimFlashcards(selection, view.file!)
 					)
 			);
 
@@ -6221,7 +6611,6 @@ Return ONLY valid JSON of this shape: [{"front":"...","back":"..."}] or [] if no
 		let allCards: Flashcard[] = [];
 		let relevantDeckFiles: TFile[] = [];
 
-
 		switch (this.studyMode) {
 			case StudyMode.NOTE:
 				const noteDeckPath = getDeckPathForChapter(activePath);
@@ -6282,7 +6671,11 @@ Return ONLY valid JSON of this shape: [{"front":"...","back":"..."}] or [] if no
 			}
 		}
 
-		let suspendedCount = 0, notDueCount = 0, reviewUnseenCount = 0, blockedCount = 0, passedCount = 0;
+		let suspendedCount = 0,
+			notDueCount = 0,
+			reviewUnseenCount = 0,
+			blockedCount = 0,
+			passedCount = 0;
 
 		for (const card of allCards) {
 			const cardId = card.id.slice(-8);
@@ -6329,7 +6722,6 @@ Return ONLY valid JSON of this shape: [{"front":"...","back":"..."}] or [] if no
 			passedCount++;
 			reviewPool.push({ card, deck: deckFile });
 		}
-
 
 		if (this.studyMode === StudyMode.NOTE && reviewPool.length === 0) {
 			this.logger(
@@ -6427,23 +6819,33 @@ Return ONLY valid JSON of this shape: [{"front":"...","back":"..."}] or [] if no
 
 		// Font Size
 		if (this.settings.randomizeFontSize) {
-			const fontSize = Math.round(randomBetween(
-				this.settings.randomizeFontSizeMin,
-				this.settings.randomizeFontSizeMax
-			));
+			const fontSize = Math.round(
+				randomBetween(
+					this.settings.randomizeFontSizeMin,
+					this.settings.randomizeFontSizeMax
+				)
+			);
 			container.style.fontSize = `${fontSize}px`;
 		}
 
 		// Font Family
-		if (this.settings.randomizeFontFamily && this.settings.randomizeFontFamilies.length > 0) {
-			const fontFamily = randomFromArray(this.settings.randomizeFontFamilies);
+		if (
+			this.settings.randomizeFontFamily &&
+			this.settings.randomizeFontFamilies.length > 0
+		) {
+			const fontFamily = randomFromArray(
+				this.settings.randomizeFontFamilies
+			);
 			if (fontFamily) {
 				container.style.fontFamily = fontFamily;
 			}
 		}
 
 		// Text Color
-		if (this.settings.randomizeTextColor && this.settings.randomizeTextColors.length > 0) {
+		if (
+			this.settings.randomizeTextColor &&
+			this.settings.randomizeTextColors.length > 0
+		) {
 			const color = randomFromArray(this.settings.randomizeTextColors);
 			if (color) {
 				container.style.color = color;
@@ -6451,8 +6853,13 @@ Return ONLY valid JSON of this shape: [{"front":"...","back":"..."}] or [] if no
 		}
 
 		// Text Alignment
-		if (this.settings.randomizeTextAlignment && this.settings.randomizeTextAlignments.length > 0) {
-			const alignment = randomFromArray(this.settings.randomizeTextAlignments);
+		if (
+			this.settings.randomizeTextAlignment &&
+			this.settings.randomizeTextAlignments.length > 0
+		) {
+			const alignment = randomFromArray(
+				this.settings.randomizeTextAlignments
+			);
 			if (alignment) {
 				container.style.textAlign = alignment;
 			}
@@ -6477,16 +6884,26 @@ Return ONLY valid JSON of this shape: [{"front":"...","back":"..."}] or [] if no
 		}
 
 		// Text Transform
-		if (this.settings.randomizeTextTransform && this.settings.randomizeTextTransforms.length > 0) {
-			const transform = randomFromArray(this.settings.randomizeTextTransforms);
+		if (
+			this.settings.randomizeTextTransform &&
+			this.settings.randomizeTextTransforms.length > 0
+		) {
+			const transform = randomFromArray(
+				this.settings.randomizeTextTransforms
+			);
 			if (transform) {
 				container.style.textTransform = transform;
 			}
 		}
 
 		// Background Color
-		if (this.settings.randomizeBackgroundColor && this.settings.randomizeBackgroundColors.length > 0) {
-			const bgColor = randomFromArray(this.settings.randomizeBackgroundColors);
+		if (
+			this.settings.randomizeBackgroundColor &&
+			this.settings.randomizeBackgroundColors.length > 0
+		) {
+			const bgColor = randomFromArray(
+				this.settings.randomizeBackgroundColors
+			);
 			if (bgColor) {
 				container.style.backgroundColor = bgColor;
 			}
@@ -6504,7 +6921,7 @@ Return ONLY valid JSON of this shape: [{"front":"...","back":"..."}] or [] if no
 		}
 
 		if (transforms.length > 0) {
-			container.style.transform = transforms.join(' ');
+			container.style.transform = transforms.join(" ");
 			// Add padding to prevent overlap with buttons when rotated
 			container.style.padding = "20px";
 			container.style.marginBottom = "10px";
@@ -6522,7 +6939,7 @@ Return ONLY valid JSON of this shape: [{"front":"...","back":"..."}] or [] if no
 		}
 
 		if (filters.length > 0) {
-			container.style.filter = filters.join(' ');
+			container.style.filter = filters.join(" ");
 		}
 	}
 
@@ -6558,6 +6975,10 @@ Return ONLY valid JSON of this shape: [{"front":"...","back":"..."}] or [] if no
 		}
 	}
 
+	/**
+	 * Apply SM-2 algorithm for spaced repetition scheduling.
+	 * Uses ease factor and interval-based calculations.
+	 */
 	private applySm2(card: Flashcard, rating: CardRating): void {
 		const { status: originalStatus, interval, ease_factor } = card;
 		const previousState: ReviewLog = {
@@ -6649,6 +7070,255 @@ Return ONLY valid JSON of this shape: [{"front":"...","back":"..."}] or [] if no
 		);
 	}
 
+	/**
+	 * Build Ebisu model from card's review history.
+	 * Replays all historical reviews to initialize model parameters.
+	 */
+	private buildEbisuFromHistory(
+		card: Flashcard,
+		config: EbisuConfig
+	): EbisuModel {
+		const ONE_HOUR_MS = 60 * 60 * 1000;
+
+		const events = (card.review_history ?? [])
+			.filter((e) => {
+				const r = (e.rating as string | undefined)?.toLowerCase?.();
+				return (
+					r === "again" ||
+					r === "hard" ||
+					r === "good" ||
+					r === "easy"
+				);
+			})
+			.sort((a, b) => a.timestamp - b.timestamp);
+
+		if (events.length === 0) return createDefaultModel(config);
+
+		let model = createDefaultModel(config);
+		let lastTs = events[0].timestamp;
+
+		for (const ev of events) {
+			const elapsedHours = Math.max(
+				0.01,
+				(ev.timestamp - lastTs) / ONE_HOUR_MS
+			);
+			model = updateModel(
+				model,
+				ev.rating as CardRating,
+				elapsedHours,
+				config
+			);
+			lastTs = ev.timestamp;
+		}
+
+		return model;
+	}
+
+	/**
+	 * Apply Ebisu algorithm for Bayesian spaced repetition scheduling.
+	 * Uses Beta distribution to model recall probability over time.
+	 */
+	private applyEbisu(card: Flashcard, rating: CardRating): void {
+		const now = Date.now();
+		const ONE_DAY_MS = 86_400_000;
+		const ONE_HOUR_MS = 3_600_000;
+
+		const config: EbisuConfig = {
+			defaultHalflife: this.settings.ebisuDefaultHalflife,
+			defaultAlpha: this.settings.ebisuDefaultAlpha,
+			defaultBeta: this.settings.ebisuDefaultBeta,
+			targetRecall: this.settings.ebisuTargetRecall,
+			updateParams: {
+				again: {
+					successes: this.settings.ebisuAgainSuccesses,
+					total: this.settings.ebisuAgainTotal,
+				},
+				hard: {
+					successes: this.settings.ebisuHardSuccesses,
+					total: this.settings.ebisuHardTotal,
+				},
+				good: {
+					successes: this.settings.ebisuGoodSuccesses,
+					total: this.settings.ebisuGoodTotal,
+				},
+				easy: {
+					successes: this.settings.ebisuEasySuccesses,
+					total: this.settings.ebisuEasyTotal,
+				},
+			},
+		};
+
+		if (!card.ebisu || this.settings.ebisuAlwaysRecalculate) {
+			const boot: EbisuModel = this.buildEbisuFromHistory(card, config);
+			if (!card.ebisu) {
+				card.ebisu = { alpha: boot[0], beta: boot[1], time: boot[2] };
+			} else {
+				card.ebisu.alpha = boot[0];
+				card.ebisu.beta = boot[1];
+				card.ebisu.time = boot[2];
+			}
+			console.log(`[Ebisu] ${this.settings.ebisuAlwaysRecalculate ? 'Recalculated' : 'Initialized'} card model from history:`, {
+				alpha: boot[0].toFixed(2),
+				beta: boot[1].toFixed(2),
+				halflife_hours: boot[2].toFixed(1),
+			});
+		}
+
+		const { status: originalStatus } = card;
+		const currentModel: EbisuModel = [
+			card.ebisu.alpha,
+			card.ebisu.beta,
+			card.ebisu.time,
+		];
+
+		const elapsedHours = card.last_reviewed
+			? (now - new Date(card.last_reviewed).getTime()) / ONE_HOUR_MS
+			: 0;
+		const recallProb =
+			elapsedHours > 0 ? predictRecall(currentModel, elapsedHours) : 1.0;
+
+		const previousState: ReviewLog = {
+			timestamp: now,
+			rating,
+			state: originalStatus,
+			interval: card.interval,
+			ease_factor: card.ease_factor,
+			ebisu_alpha: card.ebisu.alpha,
+			ebisu_beta: card.ebisu.beta,
+			ebisu_time: card.ebisu.time,
+			ebisu_recall: recallProb,
+		};
+		if (!card.review_history) card.review_history = [];
+		card.review_history.push(previousState);
+
+		card.buried = false;
+
+		console.log(
+			`\n[Ebisu] Card ${card.id.substring(0, 8)}... - Rating: ${rating}`
+		);
+		console.log(
+			`[Ebisu] Time since last review: ${elapsedHours.toFixed(
+				1
+			)} hours (${(elapsedHours / 24).toFixed(1)} days)`
+		);
+		console.log(`[Ebisu] Current model (before update):`, {
+			alpha: currentModel[0].toFixed(2),
+			beta: currentModel[1].toFixed(2),
+			time: currentModel[2].toFixed(1) + "h",
+			recall_prob: recallProb.toFixed(3),
+		});
+		console.log(
+			`[Ebisu] Update params for "${rating}":`,
+			config.updateParams[
+				rating.toLowerCase() as keyof typeof config.updateParams
+			]
+		);
+
+		const updatedModel: EbisuModel = updateModel(
+			currentModel,
+			rating,
+			elapsedHours || 0.01,
+			config
+		);
+
+		card.ebisu.alpha = updatedModel[0];
+		card.ebisu.beta = updatedModel[1];
+		card.ebisu.time = updatedModel[2];
+
+		console.log(`[Ebisu] Updated model (after update):`, {
+			alpha: updatedModel[0].toFixed(2),
+			beta: updatedModel[1].toFixed(2),
+			time: updatedModel[2].toFixed(1) + "h",
+		});
+
+		if (originalStatus === "new") {
+			card.status = "learning";
+		}
+
+		if (["learning", "relearn"].includes(card.status)) {
+			const ONE_MINUTE_MS = 60_000;
+			const steps =
+				card.status === "relearn"
+					? this.settings.relearnSteps
+					: this.settings.learningSteps;
+
+			if (rating === "Again") {
+				card.learning_step_index = 0;
+				card.interval = 0;
+				card.due = now + steps[0] * ONE_MINUTE_MS;
+				card.blocked = true;
+			} else {
+				card.blocked = false;
+				const stepIncrement = rating === "Easy" ? 2 : 1;
+				const currentIndex =
+					(card.learning_step_index ?? -1) + stepIncrement;
+
+				if (currentIndex < steps.length) {
+					card.learning_step_index = currentIndex;
+					card.interval = 0;
+					card.due = now + steps[currentIndex] * ONE_MINUTE_MS;
+				} else {
+					card.status = "review";
+					delete card.learning_step_index;
+
+					const nextIntervalHours = getRecommendedInterval(
+						updatedModel,
+						config
+					);
+					const nextIntervalDays = nextIntervalHours / 24;
+					console.log(
+						`[Ebisu] Graduated to review! Recommended interval: ${nextIntervalHours.toFixed(
+							1
+						)}h (${nextIntervalDays} days)`
+					);
+					card.interval = nextIntervalDays;
+					card.due = now + nextIntervalDays * ONE_DAY_MS;
+				}
+			}
+		} else {
+			const nextIntervalHours = getRecommendedInterval(
+				updatedModel,
+				config
+			);
+			const nextIntervalDays = nextIntervalHours / 24;
+			console.log(
+				`[Ebisu] Next review interval: ${nextIntervalHours.toFixed(
+					1
+				)}h (${nextIntervalDays} days) for ${(
+					config.targetRecall * 100
+				).toFixed(0)}% target recall`
+			);
+			card.interval = nextIntervalDays;
+			card.due = now + nextIntervalDays * ONE_DAY_MS;
+			card.blocked = rating === "Again";
+
+			if (rating === "Again" && originalStatus === "review") {
+				card.status = "relearn";
+			}
+		}
+
+		card.last_reviewed = new Date(now).toISOString();
+
+		const halflifeHours =
+			updatedModel[2] * Math.pow(0.5, 1.0 / updatedModel[0]);
+		card.ease_factor = Math.max(1.3, Math.min(2.5, halflifeHours / 24));
+
+		this.logger(
+			LogLevel.VERBOSE,
+			`Ebisu card properties after answering with "${rating}":`,
+			{
+				id: card.id,
+				due: new Date(card.due).toLocaleString(),
+				interval: card.interval,
+				alpha: card.ebisu.alpha.toFixed(2),
+				beta: card.ebisu.beta.toFixed(2),
+				time: card.ebisu.time.toFixed(1) + "h",
+				recallProb: recallProb.toFixed(3),
+				status: card.status,
+			}
+		);
+	}
+
 	private async autoFinalizeNote(file: TFile): Promise<void> {
 		const content = await this.app.vault.read(file);
 		if (content.includes(PARA_CLASS)) {
@@ -6700,14 +7370,16 @@ Return ONLY valid JSON of this shape: [{"front":"...","back":"..."}] or [] if no
 
 		const finalizedIndicator = `<!-- 📝 GATED NOTES: This note is finalized. Switch to Reading View to see content. Use "Unfinalize note" command to edit. -->\n\n`;
 
-		const wrappedContent = finalizedIndicator + paragraphs
-			.map(
-				(md, i) =>
-					`<br class="gn-sentinel"><div class="${PARA_CLASS}" ${PARA_ID_ATTR}="${
-						i + 1
-					}" ${PARA_MD_ATTR}="${md2attr(md)}"></div>`
-			)
-			.join("\n\n");
+		const wrappedContent =
+			finalizedIndicator +
+			paragraphs
+				.map(
+					(md, i) =>
+						`<br class="gn-sentinel"><div class="${PARA_CLASS}" ${PARA_ID_ATTR}="${
+							i + 1
+						}" ${PARA_MD_ATTR}="${md2attr(md)}"></div>`
+				)
+				.join("\n\n");
 		await this.app.vault.modify(file, wrappedContent);
 
 		// Switch to reading view after finalization
@@ -6735,14 +7407,16 @@ Return ONLY valid JSON of this shape: [{"front":"...","back":"..."}] or [] if no
 
 		const finalizedIndicator = `<!-- 📝 GATED NOTES: This note is finalized. Switch to Reading View to see content. Use "Unfinalize note" command to edit. -->\n\n`;
 
-		const wrappedContent = finalizedIndicator + chunks
-			.map((md, i) => {
-				const trimmedMd = md.trim();
-				return `<br class="gn-sentinel"><div class="${PARA_CLASS}" ${PARA_ID_ATTR}="${
-					i + 1
-				}" ${PARA_MD_ATTR}="${md2attr(trimmedMd)}"></div>`;
-			})
-			.join("\n\n");
+		const wrappedContent =
+			finalizedIndicator +
+			chunks
+				.map((md, i) => {
+					const trimmedMd = md.trim();
+					return `<br class="gn-sentinel"><div class="${PARA_CLASS}" ${PARA_ID_ATTR}="${
+						i + 1
+					}" ${PARA_MD_ATTR}="${md2attr(trimmedMd)}"></div>`;
+				})
+				.join("\n\n");
 
 		await this.app.vault.modify(file, wrappedContent);
 
@@ -7052,7 +7726,9 @@ ${contextPrompt}Content:
 ${plainTextForLlm}`;
 
 		const providerDesc = this.getProviderModelDescription("flashcard");
-		notice.setMessage(`🤖 Generating ${count} flashcard(s) using ${providerDesc}...`);
+		notice.setMessage(
+			`🤖 Generating ${count} flashcard(s) using ${providerDesc}...`
+		);
 		const { content: response, usage } = await this.sendToLlm(
 			initialPrompt
 		);
@@ -7261,7 +7937,12 @@ ${selection}
 """`;
 
 		try {
-			const { content: response, usage } = await this.sendToLlm(prompt, [], {}, "flashcard");
+			const { content: response, usage } = await this.sendToLlm(
+				prompt,
+				[],
+				{},
+				"flashcard"
+			);
 			if (!response) throw new Error("AI returned an empty response.");
 
 			const jsonMatch = response.match(/\{[\s\S]*\}/);
@@ -7565,7 +8246,6 @@ ${selection}
 					const graph = await this.readDeck(deckPath);
 
 					const blockedCards = Object.values(graph).filter((c) => {
-
 						return c.chapter === chapterPath && isBlockingGating(c);
 					});
 					const firstBlockedParaIdx =
@@ -7683,7 +8363,6 @@ ${selection}
 		mdView: MarkdownView,
 		highlightColor: string
 	): Promise<void> {
-
 		const applyHighlight = (el: HTMLElement) => {
 			el.style.setProperty("--highlight-color", highlightColor);
 			el.classList.add("gn-flash-highlight");
@@ -7702,8 +8381,9 @@ ${selection}
 		const frontTerm = card.front ? extractTerm(card.front) : "";
 		const backTerm = card.back ? extractTerm(card.back) : "";
 
-
-		const searchTerms = [frontTerm, backTerm].filter(term => term.length > 0);
+		const searchTerms = [frontTerm, backTerm].filter(
+			(term) => term.length > 0
+		);
 
 		// Search in the entire preview container
 		const previewContainer = mdView.previewMode.containerEl;
@@ -7716,7 +8396,7 @@ ${selection}
 		);
 
 		let textNode;
-		while (textNode = walker.nextNode()) {
+		while ((textNode = walker.nextNode())) {
 			const textContent = textNode.textContent || "";
 
 			// Check if this text node contains either of our terms
@@ -7724,10 +8404,9 @@ ${selection}
 			const containsBack = backTerm && textContent.includes(backTerm);
 
 			if (containsFront || containsBack) {
-
 				// Find the parent element (likely a <p> containing the cluster)
 				let clusterElement = textNode.parentElement;
-				while (clusterElement && clusterElement.tagName !== 'P') {
+				while (clusterElement && clusterElement.tagName !== "P") {
 					clusterElement = clusterElement.parentElement;
 				}
 
@@ -7735,7 +8414,11 @@ ${selection}
 					clusterElement.scrollIntoView({ behavior: "smooth" });
 
 					// Now highlight individual terms within this cluster
-					this.highlightPolyglotTermsInCluster(clusterElement, frontTerm, backTerm);
+					this.highlightPolyglotTermsInCluster(
+						clusterElement,
+						frontTerm,
+						backTerm
+					);
 					found = true;
 					break;
 				}
@@ -7756,7 +8439,6 @@ ${selection}
 		frontTerm: string,
 		backTerm: string
 	): void {
-
 		const walker = document.createTreeWalker(
 			clusterElement,
 			NodeFilter.SHOW_TEXT
@@ -7764,7 +8446,7 @@ ${selection}
 
 		const textNodes: Node[] = [];
 		let textNode;
-		while (textNode = walker.nextNode()) {
+		while ((textNode = walker.nextNode())) {
 			textNodes.push(textNode);
 		}
 
@@ -7794,14 +8476,17 @@ ${selection}
 
 			// Replace the text node with highlighted HTML if changes were made
 			if (hasChanges && node.parentNode) {
-				const span = document.createElement('span');
+				const span = document.createElement("span");
 				span.innerHTML = modifiedContent;
 				node.parentNode.replaceChild(span, node);
 
 				// Remove highlights after 1.5 seconds
 				setTimeout(() => {
 					if (span.parentNode) {
-						span.parentNode.replaceChild(document.createTextNode(textContent), span);
+						span.parentNode.replaceChild(
+							document.createTextNode(textContent),
+							span
+						);
 					}
 				}, 1500);
 			}
@@ -7816,7 +8501,6 @@ ${selection}
 		wrapper: HTMLElement,
 		highlightColor: string
 	): Promise<void> {
-
 		const applyHighlight = (el: HTMLElement) => {
 			el.style.setProperty("--highlight-color", highlightColor);
 			el.classList.add("gn-flash-highlight");
@@ -7836,16 +8520,13 @@ ${selection}
 		const frontTerm = card.front ? extractTerm(card.front) : "";
 		const backTerm = card.back ? extractTerm(card.back) : "";
 
-
 		// Try to find either term in the content using simple text search
 		const searchTerms = [frontTerm, backTerm].filter(
 			(term) => term.length > 0
 		);
 
-
 		let found = false;
 		for (const term of searchTerms) {
-
 			// Simple approach: find elements containing the term text
 			const walker = document.createTreeWalker(
 				wrapper,
@@ -7853,7 +8534,7 @@ ${selection}
 			);
 
 			let textNode;
-			while (textNode = walker.nextNode()) {
+			while ((textNode = walker.nextNode())) {
 				const textContent = textNode.textContent || "";
 				if (textContent.includes(term)) {
 					// Found the term! Highlight its parent element
@@ -7993,7 +8674,6 @@ ${selection}
 						applyHighlight(wrapper);
 					}
 				} else {
-
 					if (card.polyglot?.isPolyglot) {
 						// Polyglot cards: Search for actual terms in markdown
 						await this.jumpToPolyglotTerm(
@@ -8544,7 +9224,7 @@ ${selection}
 					tag: cardData.metadata.anchor,
 					chapter: mdFile.path,
 					// Store verbatim metadata in the card
-					...cardData.metadata
+					...cardData.metadata,
 				});
 				graph[card.id] = card;
 			}
@@ -8553,17 +9233,25 @@ ${selection}
 
 			new Notice(`✅ Created ${cards.length} verbatim flashcards.`);
 			this.refreshAllStatuses();
-
 		} catch (error) {
-			this.logger(LogLevel.NORMAL, "Error creating verbatim flashcards:", error);
+			this.logger(
+				LogLevel.NORMAL,
+				"Error creating verbatim flashcards:",
+				error
+			);
 			new Notice("❌ Failed to create verbatim flashcards.");
 		}
 	}
 
-	private async showVerbatimSplitModal(): Promise<{mode: "word" | "line" | "sentence" | "custom", delimiter?: string, name?: string} | null> {
+	private async showVerbatimSplitModal(): Promise<{
+		mode: "word" | "line" | "sentence" | "custom";
+		delimiter?: string;
+		name?: string;
+	} | null> {
 		return new Promise((resolve) => {
 			const modal = new Modal(this.app);
-			modal.titleEl.textContent = "Verbatim Flashcards - Choose Split Type";
+			modal.titleEl.textContent =
+				"Verbatim Flashcards - Choose Split Type";
 
 			let selectedMode: "word" | "line" | "sentence" | "custom" = "word";
 			let customDelimiter = "|";
@@ -8572,12 +9260,14 @@ ${selection}
 			const content = modal.contentEl;
 
 			// Optional name field
-			const nameSection = content.createDiv({ cls: "verbatim-name-section" });
+			const nameSection = content.createDiv({
+				cls: "verbatim-name-section",
+			});
 			nameSection.style.marginBottom = "20px";
 
 			const nameLabel = nameSection.createEl("label", {
 				text: "Name (optional):",
-				cls: "verbatim-name-label"
+				cls: "verbatim-name-label",
 			});
 			nameLabel.style.display = "block";
 			nameLabel.style.marginBottom = "5px";
@@ -8586,7 +9276,7 @@ ${selection}
 			const nameInput = nameSection.createEl("input", {
 				type: "text",
 				placeholder: "e.g., Psalm 23, Ozymandias, Introduction, etc.",
-				value: verbatimName
+				value: verbatimName,
 			});
 			nameInput.style.width = "100%";
 			nameInput.style.marginBottom = "5px";
@@ -8596,35 +9286,54 @@ ${selection}
 
 			const nameDesc = nameSection.createDiv({
 				text: "Give this text a name to help identify it during review",
-				cls: "verbatim-name-description"
+				cls: "verbatim-name-description",
 			});
 			nameDesc.style.fontSize = "0.9em";
 			nameDesc.style.color = "var(--text-muted)";
 			nameDesc.style.fontStyle = "italic";
 
 			// Split type radio buttons
-			const radioGroup = content.createDiv({ cls: "verbatim-split-options" });
+			const radioGroup = content.createDiv({
+				cls: "verbatim-split-options",
+			});
 
 			const modes = [
-				{ value: "word", label: "Word by word", description: "Each word becomes a separate card" },
-				{ value: "line", label: "Line by line", description: "Each line becomes a separate card" },
-				{ value: "sentence", label: "Sentence by sentence", description: "Each sentence becomes a separate card" },
-				{ value: "custom", label: "Custom delimiter", description: "Split using a custom character or string" }
+				{
+					value: "word",
+					label: "Word by word",
+					description: "Each word becomes a separate card",
+				},
+				{
+					value: "line",
+					label: "Line by line",
+					description: "Each line becomes a separate card",
+				},
+				{
+					value: "sentence",
+					label: "Sentence by sentence",
+					description: "Each sentence becomes a separate card",
+				},
+				{
+					value: "custom",
+					label: "Custom delimiter",
+					description: "Split using a custom character or string",
+				},
 			] as const;
 
-			modes.forEach(mode => {
+			modes.forEach((mode) => {
 				const option = radioGroup.createDiv({ cls: "verbatim-option" });
 
 				const radio = option.createEl("input", {
 					type: "radio",
-					attr: { name: "split-mode", value: mode.value }
+					attr: { name: "split-mode", value: mode.value },
 				});
 				if (mode.value === "word") radio.checked = true;
 
 				radio.addEventListener("change", () => {
 					if (radio.checked) {
 						selectedMode = mode.value;
-						delimiterInput.style.display = mode.value === "custom" ? "block" : "none";
+						delimiterInput.style.display =
+							mode.value === "custom" ? "block" : "none";
 					}
 				});
 
@@ -8632,14 +9341,17 @@ ${selection}
 				label.appendChild(radio);
 				label.appendText(` ${mode.label}`);
 
-				const desc = option.createDiv({ cls: "verbatim-description", text: mode.description });
+				const desc = option.createDiv({
+					cls: "verbatim-description",
+					text: mode.description,
+				});
 			});
 
 			// Custom delimiter input (initially hidden)
 			const delimiterInput = content.createEl("input", {
 				type: "text",
 				placeholder: "Enter delimiter (e.g., |, ;;, --)",
-				value: customDelimiter
+				value: customDelimiter,
 			});
 			delimiterInput.style.display = "none";
 			delimiterInput.style.marginTop = "10px";
@@ -8648,22 +9360,31 @@ ${selection}
 			});
 
 			// Buttons
-			const buttonContainer = content.createDiv({ cls: "modal-button-container" });
-			buttonContainer.style.cssText = "display: flex; gap: 10px; justify-content: flex-end; margin-top: 20px;";
+			const buttonContainer = content.createDiv({
+				cls: "modal-button-container",
+			});
+			buttonContainer.style.cssText =
+				"display: flex; gap: 10px; justify-content: flex-end; margin-top: 20px;";
 
-			const cancelBtn = buttonContainer.createEl("button", { text: "Cancel" });
+			const cancelBtn = buttonContainer.createEl("button", {
+				text: "Cancel",
+			});
 			cancelBtn.addEventListener("click", () => {
 				modal.close();
 				resolve(null);
 			});
 
-			const createBtn = buttonContainer.createEl("button", { text: "Create Flashcards", cls: "mod-cta" });
+			const createBtn = buttonContainer.createEl("button", {
+				text: "Create Flashcards",
+				cls: "mod-cta",
+			});
 			createBtn.addEventListener("click", () => {
 				modal.close();
 				resolve({
 					mode: selectedMode,
-					delimiter: selectedMode === "custom" ? customDelimiter : undefined,
-					name: verbatimName.trim() || undefined
+					delimiter:
+						selectedMode === "custom" ? customDelimiter : undefined,
+					name: verbatimName.trim() || undefined,
 				});
 			});
 
@@ -8692,21 +9413,27 @@ ${selection}
 		// Split the text based on the mode
 		switch (mode) {
 			case "word":
-				units = selectedText.split(/\s+/).filter(unit => unit.trim().length > 0);
+				units = selectedText
+					.split(/\s+/)
+					.filter((unit) => unit.trim().length > 0);
 				break;
 			case "line":
 				// Split by lines but keep track of original structure for context
 				allLines = selectedText.split(/\r?\n/);
 				// Only create cards for non-empty lines, but preserve empty lines for context
-				units = allLines.filter(line => line.trim().length > 0);
+				units = allLines.filter((line) => line.trim().length > 0);
 				break;
 			case "sentence":
 				// Simple sentence splitting - could be enhanced with better regex
-				units = selectedText.split(/[.!?]+/).filter(unit => unit.trim().length > 0);
+				units = selectedText
+					.split(/[.!?]+/)
+					.filter((unit) => unit.trim().length > 0);
 				break;
 			case "custom":
 				if (delimiter) {
-					units = selectedText.split(delimiter).filter(unit => unit.trim().length > 0);
+					units = selectedText
+						.split(delimiter)
+						.filter((unit) => unit.trim().length > 0);
 				} else {
 					units = [selectedText]; // Fallback if no delimiter provided
 				}
@@ -8714,7 +9441,11 @@ ${selection}
 		}
 
 		// Helper function to generate cues with progress indicators
-		const makeCue = (mode: string, index: number, total: number): string => {
+		const makeCue = (
+			mode: string,
+			index: number,
+			total: number
+		): string => {
 			const position = index + 1;
 			switch (mode) {
 				case "word":
@@ -8777,7 +9508,12 @@ ${selection}
 				} else {
 					// For other modes, use the simple approach
 					const frontUnits = units.slice(0, index);
-					const separator = mode === "sentence" ? ". " : mode === "word" ? " " : (delimiter || " ");
+					const separator =
+						mode === "sentence"
+							? ". "
+							: mode === "word"
+							? " "
+							: delimiter || " ";
 					context = frontUnits.join(separator);
 				}
 
@@ -8798,8 +9534,8 @@ ${selection}
 					cardType: "verbatim" as const,
 					unitIndex: index,
 					totalUnits: units.length,
-					anchor: anchor
-				}
+					anchor: anchor,
+				},
 			};
 		});
 
@@ -9327,7 +10063,11 @@ ${selection}
 	/**
 	 * Format polyglot card content for display with language hints
 	 */
-	private formatPolyglotContent(content: string, card: Flashcard, showingFront: boolean): string {
+	private formatPolyglotContent(
+		content: string,
+		card: Flashcard,
+		showingFront: boolean
+	): string {
 		if (!card.polyglot?.isPolyglot) {
 			return content;
 		}
@@ -9336,7 +10076,7 @@ ${selection}
 			// For text cards, show the target language hint
 			if (showingFront) {
 				// Front: show the front content + hint about back language
-				const backPrefix = card.back?.split(':')[0] || 'target';
+				const backPrefix = card.back?.split(":")[0] || "target";
 				return `${content}\n${backPrefix}: ?`;
 			} else {
 				// Back: just show the back content normally
@@ -9415,47 +10155,58 @@ ${selection}
 			const handleKeyPress = (event: KeyboardEvent) => {
 				// Only handle keystrokes if the modal is open and no input elements are active
 				const activeElement = document.activeElement;
-				if (activeElement && (activeElement.tagName === 'INPUT' || activeElement.tagName === 'TEXTAREA')) {
+				if (
+					activeElement &&
+					(activeElement.tagName === "INPUT" ||
+						activeElement.tagName === "TEXTAREA")
+				) {
 					return;
 				}
 
 				// Check if the modal is still open and visible
-				if (!modal.modalEl || !modal.modalEl.isConnected || modal.modalEl.style.display === 'none') {
+				if (
+					!modal.modalEl ||
+					!modal.modalEl.isConnected ||
+					modal.modalEl.style.display === "none"
+				) {
 					return;
 				}
 
 				switch (event.key) {
-					case '0':
+					case "0":
 						event.preventDefault();
 						event.stopPropagation();
-						if (easeButtons['Again']) {
-							easeButtons['Again'].buttonEl.click();
+						if (easeButtons["Again"]) {
+							easeButtons["Again"].buttonEl.click();
 						}
 						break;
-					case '1':
+					case "1":
 						event.preventDefault();
 						event.stopPropagation();
-						if (easeButtons['Hard']) {
-							easeButtons['Hard'].buttonEl.click();
+						if (easeButtons["Hard"]) {
+							easeButtons["Hard"].buttonEl.click();
 						}
 						break;
-					case '2':
+					case "2":
 						event.preventDefault();
 						event.stopPropagation();
-						if (easeButtons['Good']) {
-							easeButtons['Good'].buttonEl.click();
+						if (easeButtons["Good"]) {
+							easeButtons["Good"].buttonEl.click();
 						}
 						break;
-					case '3':
+					case "3":
 						event.preventDefault();
 						event.stopPropagation();
-						if (easeButtons['Easy']) {
-							easeButtons['Easy'].buttonEl.click();
+						if (easeButtons["Easy"]) {
+							easeButtons["Easy"].buttonEl.click();
 						}
 						break;
-					case 'Enter':
+					case "Enter":
 						// Only handle Enter for reveal button, not for focused ease buttons
-						if (document.activeElement && document.activeElement.classList.contains('mod-cta')) {
+						if (
+							document.activeElement &&
+							document.activeElement.classList.contains("mod-cta")
+						) {
 							// This is likely the reveal/show answer button
 							event.preventDefault();
 							event.stopPropagation();
@@ -9468,7 +10219,7 @@ ${selection}
 			};
 
 			// Add the event listener to the document
-			document.addEventListener('keydown', handleKeyPress);
+			document.addEventListener("keydown", handleKeyPress);
 
 			// Clean up event listener when modal closes
 			let isModalClosed = false;
@@ -9476,7 +10227,7 @@ ${selection}
 			modal.onClose = () => {
 				if (!isModalClosed) {
 					isModalClosed = true;
-					document.removeEventListener('keydown', handleKeyPress);
+					document.removeEventListener("keydown", handleKeyPress);
 					if (originalOnClose) originalOnClose();
 				}
 			};
@@ -9485,7 +10236,7 @@ ${selection}
 			const observer = new MutationObserver(() => {
 				if (!modal.modalEl.isConnected && !isModalClosed) {
 					isModalClosed = true;
-					document.removeEventListener('keydown', handleKeyPress);
+					document.removeEventListener("keydown", handleKeyPress);
 					observer.disconnect();
 				}
 			});
@@ -9516,7 +10267,11 @@ ${selection}
 
 			const frontContainer = modal.contentEl.createDiv();
 			const selectedVariant = this.getRandomVariant(card);
-			const formattedFront = this.formatPolyglotContent(selectedVariant.front, card, true);
+			const formattedFront = this.formatPolyglotContent(
+				selectedVariant.front,
+				card,
+				true
+			);
 			this.renderCardContent(
 				formattedFront,
 				frontContainer,
@@ -9550,7 +10305,11 @@ ${selection}
 				revealBtn.buttonEl.style.display = "none";
 
 				const backContainer = modal.contentEl.createDiv();
-				const formattedBack = this.formatPolyglotContent(selectedVariant.back, card, false);
+				const formattedBack = this.formatPolyglotContent(
+					selectedVariant.back,
+					card,
+					false
+				);
 				await this.renderCardContent(
 					formattedBack,
 					backContainer,
@@ -9591,7 +10350,12 @@ ${selection}
 											graph
 										);
 
-									this.applySm2(cardInGraph, lbl);
+									// Route to appropriate algorithm
+									if (this.settings.algorithm === "Ebisu") {
+										this.applyEbisu(cardInGraph, lbl);
+									} else {
+										this.applySm2(cardInGraph, lbl);
+									}
 
 									const dueTimeText = this.formatDueTime(
 										cardInGraph.due,
@@ -9624,10 +10388,14 @@ ${selection}
 										);
 									}
 
-									state = lbl === "Again" ? "again" : "answered";
+									state =
+										lbl === "Again" ? "again" : "answered";
 									modal.close();
 								} catch (error) {
-									console.error('Error processing card rating:', error);
+									console.error(
+										"Error processing card rating:",
+										error
+									);
 								} finally {
 									isProcessing = false;
 								}
@@ -10126,25 +10894,25 @@ ${selection}
 			const vaultStats = {
 				regular: { new: 0, learning: 0, review: 0, relearn: 0 },
 				polyglot: { new: 0, learning: 0, review: 0, relearn: 0 },
-				verbatim: { new: 0, learning: 0, review: 0, relearn: 0 }
+				verbatim: { new: 0, learning: 0, review: 0, relearn: 0 },
 			};
 
 			const dueStats = {
 				regular: { learning: 0, review: 0, relearn: 0 },
 				polyglot: { learning: 0, review: 0, relearn: 0 },
-				verbatim: { learning: 0, review: 0, relearn: 0 }
+				verbatim: { learning: 0, review: 0, relearn: 0 },
 			};
 
 			const currentNoteStats = {
 				regular: { new: 0, learning: 0, review: 0, relearn: 0 },
 				polyglot: { new: 0, learning: 0, review: 0, relearn: 0 },
-				verbatim: { new: 0, learning: 0, review: 0, relearn: 0 }
+				verbatim: { new: 0, learning: 0, review: 0, relearn: 0 },
 			};
 
 			const currentNoteDueStats = {
 				regular: { learning: 0, review: 0, relearn: 0 },
 				polyglot: { learning: 0, review: 0, relearn: 0 },
-				verbatim: { learning: 0, review: 0, relearn: 0 }
+				verbatim: { learning: 0, review: 0, relearn: 0 },
 			};
 
 			// Get current note path (if any)
@@ -10153,45 +10921,64 @@ ${selection}
 
 			for (const deck of allDeckFiles) {
 				const graph = await this.readDeck(deck.path);
-				const isCurrentNote = currentNotePath && deck.path.startsWith(currentNotePath + "/");
+				const isCurrentNote =
+					currentNotePath &&
+					deck.path.startsWith(currentNotePath + "/");
 
 				for (const c of Object.values(graph)) {
 					// Determine card type
-					let cardType: 'regular' | 'polyglot' | 'verbatim' = 'regular';
+					let cardType: "regular" | "polyglot" | "verbatim" =
+						"regular";
 					if (c.polyglot?.isPolyglot) {
-						cardType = 'polyglot';
+						cardType = "polyglot";
 					} else if (c.tag && c.tag.includes("verbatim_")) {
-						cardType = 'verbatim';
+						cardType = "verbatim";
 					}
 
 					// Count ALL cards by status (for vault totals)
 					if (c.status === "new") vaultStats[cardType].new++;
-					else if (c.status === "learning") vaultStats[cardType].learning++;
-					else if (c.status === "review") vaultStats[cardType].review++;
-					else if (c.status === "relearn") vaultStats[cardType].relearn++;
+					else if (c.status === "learning")
+						vaultStats[cardType].learning++;
+					else if (c.status === "review")
+						vaultStats[cardType].review++;
+					else if (c.status === "relearn")
+						vaultStats[cardType].relearn++;
 
 					// Count current note cards
 					if (isCurrentNote) {
-						if (c.status === "new") currentNoteStats[cardType].new++;
-						else if (c.status === "learning") currentNoteStats[cardType].learning++;
-						else if (c.status === "review") currentNoteStats[cardType].review++;
-						else if (c.status === "relearn") currentNoteStats[cardType].relearn++;
+						if (c.status === "new")
+							currentNoteStats[cardType].new++;
+						else if (c.status === "learning")
+							currentNoteStats[cardType].learning++;
+						else if (c.status === "review")
+							currentNoteStats[cardType].review++;
+						else if (c.status === "relearn")
+							currentNoteStats[cardType].relearn++;
 					}
 
 					// Check if card is DUE
-					const isDue = c.due <= now && !c.suspended && !c.blocked &&
-								  !(c.polyglot?.isPolyglot && c.status === "new");
+					const isDue =
+						c.due <= now &&
+						!c.suspended &&
+						!c.blocked &&
+						!(c.polyglot?.isPolyglot && c.status === "new");
 
 					if (isDue) {
 						// Count due cards (excluding "new" since they're never really "due")
-						if (c.status === "learning") dueStats[cardType].learning++;
-						else if (c.status === "review") dueStats[cardType].review++;
-						else if (c.status === "relearn") dueStats[cardType].relearn++;
+						if (c.status === "learning")
+							dueStats[cardType].learning++;
+						else if (c.status === "review")
+							dueStats[cardType].review++;
+						else if (c.status === "relearn")
+							dueStats[cardType].relearn++;
 
 						if (isCurrentNote) {
-							if (c.status === "learning") currentNoteDueStats[cardType].learning++;
-							else if (c.status === "review") currentNoteDueStats[cardType].review++;
-							else if (c.status === "relearn") currentNoteDueStats[cardType].relearn++;
+							if (c.status === "learning")
+								currentNoteDueStats[cardType].learning++;
+							else if (c.status === "review")
+								currentNoteDueStats[cardType].review++;
+							else if (c.status === "relearn")
+								currentNoteDueStats[cardType].relearn++;
 						}
 					}
 				}
@@ -10199,14 +10986,26 @@ ${selection}
 
 			// Calculate totals for display
 			const vaultDueTotal =
-				dueStats.regular.learning + dueStats.regular.review + dueStats.regular.relearn +
-				dueStats.polyglot.learning + dueStats.polyglot.review + dueStats.polyglot.relearn +
-				dueStats.verbatim.learning + dueStats.verbatim.review + dueStats.verbatim.relearn;
+				dueStats.regular.learning +
+				dueStats.regular.review +
+				dueStats.regular.relearn +
+				dueStats.polyglot.learning +
+				dueStats.polyglot.review +
+				dueStats.polyglot.relearn +
+				dueStats.verbatim.learning +
+				dueStats.verbatim.review +
+				dueStats.verbatim.relearn;
 
 			const currentNoteDueTotal =
-				currentNoteDueStats.regular.learning + currentNoteDueStats.regular.review + currentNoteDueStats.regular.relearn +
-				currentNoteDueStats.polyglot.learning + currentNoteDueStats.polyglot.review + currentNoteDueStats.polyglot.relearn +
-				currentNoteDueStats.verbatim.learning + currentNoteDueStats.verbatim.review + currentNoteDueStats.verbatim.relearn;
+				currentNoteDueStats.regular.learning +
+				currentNoteDueStats.regular.review +
+				currentNoteDueStats.regular.relearn +
+				currentNoteDueStats.polyglot.learning +
+				currentNoteDueStats.polyglot.review +
+				currentNoteDueStats.polyglot.relearn +
+				currentNoteDueStats.verbatim.learning +
+				currentNoteDueStats.verbatim.review +
+				currentNoteDueStats.verbatim.relearn;
 
 			// Build status text
 			let statusText = `GN: ${vaultDueTotal} due`;
@@ -10218,30 +11017,88 @@ ${selection}
 
 			// Build detailed tooltip
 			const vaultTotalCards =
-				vaultStats.regular.new + vaultStats.regular.learning + vaultStats.regular.review + vaultStats.regular.relearn +
-				vaultStats.polyglot.new + vaultStats.polyglot.learning + vaultStats.polyglot.review + vaultStats.polyglot.relearn +
-				vaultStats.verbatim.new + vaultStats.verbatim.learning + vaultStats.verbatim.review + vaultStats.verbatim.relearn;
+				vaultStats.regular.new +
+				vaultStats.regular.learning +
+				vaultStats.regular.review +
+				vaultStats.regular.relearn +
+				vaultStats.polyglot.new +
+				vaultStats.polyglot.learning +
+				vaultStats.polyglot.review +
+				vaultStats.polyglot.relearn +
+				vaultStats.verbatim.new +
+				vaultStats.verbatim.learning +
+				vaultStats.verbatim.review +
+				vaultStats.verbatim.relearn;
 
-			const regularTotal = vaultStats.regular.new + vaultStats.regular.learning + vaultStats.regular.review + vaultStats.regular.relearn;
-			const polyglotTotal = vaultStats.polyglot.new + vaultStats.polyglot.learning + vaultStats.polyglot.review + vaultStats.polyglot.relearn;
-			const verbatimTotal = vaultStats.verbatim.new + vaultStats.verbatim.learning + vaultStats.verbatim.review + vaultStats.verbatim.relearn;
+			const regularTotal =
+				vaultStats.regular.new +
+				vaultStats.regular.learning +
+				vaultStats.regular.review +
+				vaultStats.regular.relearn;
+			const polyglotTotal =
+				vaultStats.polyglot.new +
+				vaultStats.polyglot.learning +
+				vaultStats.polyglot.review +
+				vaultStats.polyglot.relearn;
+			const verbatimTotal =
+				vaultStats.verbatim.new +
+				vaultStats.verbatim.learning +
+				vaultStats.verbatim.review +
+				vaultStats.verbatim.relearn;
 
 			const currentNoteTotalCards =
-				currentNoteStats.regular.new + currentNoteStats.regular.learning + currentNoteStats.regular.review + currentNoteStats.regular.relearn +
-				currentNoteStats.polyglot.new + currentNoteStats.polyglot.learning + currentNoteStats.polyglot.review + currentNoteStats.polyglot.relearn +
-				currentNoteStats.verbatim.new + currentNoteStats.verbatim.learning + currentNoteStats.verbatim.review + currentNoteStats.verbatim.relearn;
+				currentNoteStats.regular.new +
+				currentNoteStats.regular.learning +
+				currentNoteStats.regular.review +
+				currentNoteStats.regular.relearn +
+				currentNoteStats.polyglot.new +
+				currentNoteStats.polyglot.learning +
+				currentNoteStats.polyglot.review +
+				currentNoteStats.polyglot.relearn +
+				currentNoteStats.verbatim.new +
+				currentNoteStats.verbatim.learning +
+				currentNoteStats.verbatim.review +
+				currentNoteStats.verbatim.relearn;
 
-			const currentNoteRegularTotal = currentNoteStats.regular.new + currentNoteStats.regular.learning + currentNoteStats.regular.review + currentNoteStats.regular.relearn;
-			const currentNotePolyglotTotal = currentNoteStats.polyglot.new + currentNoteStats.polyglot.learning + currentNoteStats.polyglot.review + currentNoteStats.polyglot.relearn;
-			const currentNoteVerbatimTotal = currentNoteStats.verbatim.new + currentNoteStats.verbatim.learning + currentNoteStats.verbatim.review + currentNoteStats.verbatim.relearn;
+			const currentNoteRegularTotal =
+				currentNoteStats.regular.new +
+				currentNoteStats.regular.learning +
+				currentNoteStats.regular.review +
+				currentNoteStats.regular.relearn;
+			const currentNotePolyglotTotal =
+				currentNoteStats.polyglot.new +
+				currentNoteStats.polyglot.learning +
+				currentNoteStats.polyglot.review +
+				currentNoteStats.polyglot.relearn;
+			const currentNoteVerbatimTotal =
+				currentNoteStats.verbatim.new +
+				currentNoteStats.verbatim.learning +
+				currentNoteStats.verbatim.review +
+				currentNoteStats.verbatim.relearn;
 
 			const tooltip = [
 				"## VAULT ##",
 				`Total: ${vaultTotalCards}`,
-				`  New: ${vaultStats.regular.new + vaultStats.polyglot.new + vaultStats.verbatim.new}`,
-				`  Learning: ${vaultStats.regular.learning + vaultStats.polyglot.learning + vaultStats.verbatim.learning}`,
-				`  Review: ${vaultStats.regular.review + vaultStats.polyglot.review + vaultStats.verbatim.review}`,
-				`  Relearn: ${vaultStats.regular.relearn + vaultStats.polyglot.relearn + vaultStats.verbatim.relearn}`,
+				`  New: ${
+					vaultStats.regular.new +
+					vaultStats.polyglot.new +
+					vaultStats.verbatim.new
+				}`,
+				`  Learning: ${
+					vaultStats.regular.learning +
+					vaultStats.polyglot.learning +
+					vaultStats.verbatim.learning
+				}`,
+				`  Review: ${
+					vaultStats.regular.review +
+					vaultStats.polyglot.review +
+					vaultStats.verbatim.review
+				}`,
+				`  Relearn: ${
+					vaultStats.regular.relearn +
+					vaultStats.polyglot.relearn +
+					vaultStats.verbatim.relearn
+				}`,
 				"",
 				"### Regular ###",
 				`Total: ${regularTotal}`,
@@ -10274,7 +11131,7 @@ ${selection}
 				`  Polyglot (Relearn): ${dueStats.polyglot.relearn}`,
 				`  Verbatim (Learning): ${dueStats.verbatim.learning}`,
 				`  Verbatim (Review): ${dueStats.verbatim.review}`,
-				`  Verbatim (Relearn): ${dueStats.verbatim.relearn}`
+				`  Verbatim (Relearn): ${dueStats.verbatim.relearn}`,
 			];
 
 			this.statusBar.setAttribute("aria-label", tooltip.join("\n"));
@@ -10415,9 +11272,15 @@ ${selection}
 
 		// Check if model is empty/not selected
 		if (!model || model.trim() === "") {
-			const operationName = operationType === "flashcard" ? "flashcard generation" :
-								  operationType === "refocus" ? "refocus/split operations" : "variant generation";
-			new Notice(`No ${provider} model selected for ${operationName}. Please select a model in the plugin settings.`);
+			const operationName =
+				operationType === "flashcard"
+					? "flashcard generation"
+					: operationType === "refocus"
+					? "refocus/split operations"
+					: "variant generation";
+			new Notice(
+				`No ${provider} model selected for ${operationName}. Please select a model in the plugin settings.`
+			);
 			return { content: "" };
 		}
 
@@ -10443,7 +11306,8 @@ ${selection}
 			const payload: OpenAI.Chat.Completions.ChatCompletionCreateParams =
 				{
 					model,
-					temperature: options.temperature ?? this.settings.openaiTemperature,
+					temperature:
+						options.temperature ?? this.settings.openaiTemperature,
 					messages: [{ role: "user", content: messageContent }],
 				};
 
@@ -10453,7 +11317,9 @@ ${selection}
 
 			this.logger(LogLevel.VERBOSE, "Sending payload to LLM:", payload);
 
-			const response = await openaiClient.chat.completions.create(payload);
+			const response = await openaiClient.chat.completions.create(
+				payload
+			);
 
 			this.logger(
 				LogLevel.VERBOSE,
@@ -10484,7 +11350,9 @@ ${selection}
 	 * @param operationType The type of operation (flashcard, refocus, variant)
 	 * @returns An OpenAI client instance configured for this operation
 	 */
-	private getOpenAIClientForOperation(operationType: "flashcard" | "refocus" | "variant"): OpenAI | null {
+	private getOpenAIClientForOperation(
+		operationType: "flashcard" | "refocus" | "variant"
+	): OpenAI | null {
 		const providerSettings = this.getProviderSettings(operationType);
 		const { provider, openaiApiKey, lmStudioUrl } = providerSettings;
 
@@ -10537,7 +11405,9 @@ ${selection}
 	 * @param operationType The type of operation (flashcard, refocus, variant)
 	 * @returns The provider settings to use for this operation
 	 */
-	private getProviderSettings(operationType: "flashcard" | "refocus" | "variant"): {
+	private getProviderSettings(
+		operationType: "flashcard" | "refocus" | "variant"
+	): {
 		provider: "openai" | "lmstudio";
 		openaiModel: string;
 		openaiApiKey: string;
@@ -10610,7 +11480,10 @@ ${selection}
 	 * @param lmStudioUrl The LM Studio URL to use (only needed for lmstudio provider)
 	 * @returns A promise that resolves to an array of model ID strings.
 	 */
-	public async fetchAvailableModels(provider: "openai" | "lmstudio", lmStudioUrl?: string): Promise<string[]> {
+	public async fetchAvailableModels(
+		provider: "openai" | "lmstudio",
+		lmStudioUrl?: string
+	): Promise<string[]> {
 		let apiUrl: string;
 		const headers: Record<string, string> = {};
 
@@ -10667,42 +11540,75 @@ ${selection}
 	 * @param provider The provider whose models were updated
 	 * @param availableModels The new list of available models
 	 */
-	private validateSelectedModels(provider: "openai" | "lmstudio", availableModels: string[]): void {
+	private validateSelectedModels(
+		provider: "openai" | "lmstudio",
+		availableModels: string[]
+	): void {
 		if (provider === "openai") {
 			// Check flashcard generation OpenAI model
-			if (this.settings.openaiModel && !availableModels.includes(this.settings.openaiModel)) {
+			if (
+				this.settings.openaiModel &&
+				!availableModels.includes(this.settings.openaiModel)
+			) {
 				this.settings.openaiModel = "";
-				new Notice(`OpenAI model for flashcard generation was reset (previous model no longer available). Please select a new model in settings.`);
+				new Notice(
+					`OpenAI model for flashcard generation was reset (previous model no longer available). Please select a new model in settings.`
+				);
 			}
 
 			// Check refocus OpenAI model
-			if (this.settings.refocusOpenaiModel && !availableModels.includes(this.settings.refocusOpenaiModel)) {
+			if (
+				this.settings.refocusOpenaiModel &&
+				!availableModels.includes(this.settings.refocusOpenaiModel)
+			) {
 				this.settings.refocusOpenaiModel = "";
-				new Notice(`OpenAI model for refocus operations was reset (previous model no longer available). Please select a new model in settings.`);
+				new Notice(
+					`OpenAI model for refocus operations was reset (previous model no longer available). Please select a new model in settings.`
+				);
 			}
 
 			// Check variant OpenAI model
-			if (this.settings.variantOpenaiModel && !availableModels.includes(this.settings.variantOpenaiModel)) {
+			if (
+				this.settings.variantOpenaiModel &&
+				!availableModels.includes(this.settings.variantOpenaiModel)
+			) {
 				this.settings.variantOpenaiModel = "";
-				new Notice(`OpenAI model for variant generation was reset (previous model no longer available). Please select a new model in settings.`);
+				new Notice(
+					`OpenAI model for variant generation was reset (previous model no longer available). Please select a new model in settings.`
+				);
 			}
 		} else {
 			// Check flashcard generation LM Studio model
-			if (this.settings.lmStudioModel && !availableModels.includes(this.settings.lmStudioModel)) {
+			if (
+				this.settings.lmStudioModel &&
+				!availableModels.includes(this.settings.lmStudioModel)
+			) {
 				this.settings.lmStudioModel = "";
-				new Notice(`LM Studio model for flashcard generation was reset (previous model no longer available). Please select a new model in settings.`);
+				new Notice(
+					`LM Studio model for flashcard generation was reset (previous model no longer available). Please select a new model in settings.`
+				);
 			}
 
 			// Check refocus LM Studio model
-			if (this.settings.refocusLmStudioModel && !availableModels.includes(this.settings.refocusLmStudioModel)) {
+			if (
+				this.settings.refocusLmStudioModel &&
+				!availableModels.includes(this.settings.refocusLmStudioModel)
+			) {
 				this.settings.refocusLmStudioModel = "";
-				new Notice(`LM Studio model for refocus operations was reset (previous model no longer available). Please select a new model in settings.`);
+				new Notice(
+					`LM Studio model for refocus operations was reset (previous model no longer available). Please select a new model in settings.`
+				);
 			}
 
 			// Check variant LM Studio model
-			if (this.settings.variantLmStudioModel && !availableModels.includes(this.settings.variantLmStudioModel)) {
+			if (
+				this.settings.variantLmStudioModel &&
+				!availableModels.includes(this.settings.variantLmStudioModel)
+			) {
 				this.settings.variantLmStudioModel = "";
-				new Notice(`LM Studio model for variant generation was reset (previous model no longer available). Please select a new model in settings.`);
+				new Notice(
+					`LM Studio model for variant generation was reset (previous model no longer available). Please select a new model in settings.`
+				);
 			}
 		}
 	}
@@ -10712,7 +11618,9 @@ ${selection}
 	 * @param operationType The type of operation
 	 * @returns A string like "OpenAI (gpt-4o)" or "LM Studio (local-model)"
 	 */
-	public getProviderModelDescription(operationType: "flashcard" | "refocus" | "variant"): string {
+	public getProviderModelDescription(
+		operationType: "flashcard" | "refocus" | "variant"
+	): string {
 		const providerSettings = this.getProviderSettings(operationType);
 		const { provider, openaiModel, lmStudioModel } = providerSettings;
 
@@ -10728,7 +11636,10 @@ ${selection}
 	 * @returns A promise that resolves to an array of model ID strings.
 	 */
 	public async fetchAvailableModelsLegacy(): Promise<string[]> {
-		return this.fetchAvailableModels(this.settings.apiProvider, this.settings.lmStudioUrl);
+		return this.fetchAvailableModels(
+			this.settings.apiProvider,
+			this.settings.lmStudioUrl
+		);
 	}
 
 	private async getFirstBlockedParaIndex(
@@ -10772,7 +11683,11 @@ ${selection}
 		const data = await this.loadData();
 
 		// Check if we have the old availableModels field
-		if (data && data.availableModels && Array.isArray(data.availableModels)) {
+		if (
+			data &&
+			data.availableModels &&
+			Array.isArray(data.availableModels)
+		) {
 			// Migrate based on the current API provider
 			if (this.settings.apiProvider === "openai") {
 				this.settings.availableOpenaiModels = data.availableModels;
@@ -11061,7 +11976,8 @@ ${selection}
 		tags: string[]
 	): Array<{ start: number; end: number; tag: string }> {
 		const TAG_SCORE_THRESHOLD = 0.5;
-		const locations: Array<{ start: number; end: number; tag: string }> = [];
+		const locations: Array<{ start: number; end: number; tag: string }> =
+			[];
 
 		const normalize = (s: string) =>
 			s
@@ -11086,14 +12002,29 @@ ${selection}
 
 			// Try different starting positions in the text
 			const textWords = normalizedText.split(" ");
-			for (let startIdx = 0; startIdx <= textWords.length - tagWords.length; startIdx++) {
+			for (
+				let startIdx = 0;
+				startIdx <= textWords.length - tagWords.length;
+				startIdx++
+			) {
 				// Try different lengths from this position
-				for (let len = Math.min(tagWords.length, textWords.length - startIdx); len >= 1; len--) {
-					const textSegment = textWords.slice(startIdx, startIdx + len).join(" ");
+				for (
+					let len = Math.min(
+						tagWords.length,
+						textWords.length - startIdx
+					);
+					len >= 1;
+					len--
+				) {
+					const textSegment = textWords
+						.slice(startIdx, startIdx + len)
+						.join(" ");
 
 					// Calculate similarity score for this segment
 					const segmentWords = new Set(textSegment.split(" "));
-					const wordsFound = [...uniqueTagWords].filter(word => segmentWords.has(word)).length;
+					const wordsFound = [...uniqueTagWords].filter((word) =>
+						segmentWords.has(word)
+					).length;
 					const scoreBoW = wordsFound / uniqueTagWords.size;
 
 					// Check for contiguous match
@@ -11114,15 +12045,23 @@ ${selection}
 
 					const finalScore = scoreBoW * 0.3 + scoreLCS * 0.7;
 
-					if (finalScore > bestMatch.score && finalScore >= TAG_SCORE_THRESHOLD) {
+					if (
+						finalScore > bestMatch.score &&
+						finalScore >= TAG_SCORE_THRESHOLD
+					) {
 						// Find actual character positions in original text
-						const segmentInOriginal = textWords.slice(startIdx, startIdx + len).join(" ");
-						const originalStart = this.findSubstringInOriginal(text, segmentInOriginal);
+						const segmentInOriginal = textWords
+							.slice(startIdx, startIdx + len)
+							.join(" ");
+						const originalStart = this.findSubstringInOriginal(
+							text,
+							segmentInOriginal
+						);
 						if (originalStart !== -1) {
 							bestMatch = {
 								score: finalScore,
 								start: originalStart,
-								end: originalStart + segmentInOriginal.length
+								end: originalStart + segmentInOriginal.length,
 							};
 						}
 					}
@@ -11133,7 +12072,7 @@ ${selection}
 				locations.push({
 					start: bestMatch.start,
 					end: bestMatch.end,
-					tag: tag
+					tag: tag,
 				});
 			}
 		}
@@ -11146,7 +12085,10 @@ ${selection}
 	/**
 	 * Find a normalized substring in the original text (accounting for case/punctuation differences)
 	 */
-	private findSubstringInOriginal(originalText: string, normalizedSubstring: string): number {
+	private findSubstringInOriginal(
+		originalText: string,
+		normalizedSubstring: string
+	): number {
 		const normalize = (s: string) =>
 			s
 				.toLowerCase()
@@ -11163,7 +12105,10 @@ ${selection}
 		let originalIndex = 0;
 		let normalizedIndex2 = 0;
 
-		while (normalizedIndex2 < normalizedIndex && originalIndex < originalText.length) {
+		while (
+			normalizedIndex2 < normalizedIndex &&
+			originalIndex < originalText.length
+		) {
 			const origChar = originalText[originalIndex];
 			const normChar = normalize(origChar);
 
@@ -11193,7 +12138,10 @@ ${selection}
 			// Check for overlap
 			if (current.start < lastAdded.end) {
 				// Keep the longer range
-				if ((current.end - current.start) > (lastAdded.end - lastAdded.start)) {
+				if (
+					current.end - current.start >
+					lastAdded.end - lastAdded.start
+				) {
 					result[result.length - 1] = current;
 				}
 				// Otherwise skip current (keep the previous one)
@@ -12615,7 +13563,8 @@ class EpubToNoteModal extends Modal {
 				imageFile = this.zipData.file(relativePath);
 
 				if (!imageFile) {
-					const basePathImage = this.getBasePath() + decodeURIComponent(src);
+					const basePathImage =
+						this.getBasePath() + decodeURIComponent(src);
 					pathsToTry.push(basePathImage);
 					imageFile = this.zipData.file(basePathImage);
 				}
@@ -17487,10 +18436,19 @@ ${Array.from(
   ]
 }`;
 
-		const providerModelDesc = this.plugin.getProviderModelDescription("variant");
-		const notice = new Notice(`🎲 Generating variants using ${providerModelDesc}...`, 0);
+		const providerModelDesc =
+			this.plugin.getProviderModelDescription("variant");
+		const notice = new Notice(
+			`🎲 Generating variants using ${providerModelDesc}...`,
+			0
+		);
 		try {
-			const response = await this.plugin.sendToLlm(prompt, [], {}, "variant");
+			const response = await this.plugin.sendToLlm(
+				prompt,
+				[],
+				{},
+				"variant"
+			);
 			notice.hide();
 
 			const variants = this.parseVariantResponse(response.content);
@@ -17510,8 +18468,11 @@ ${Array.from(
 				this.refreshVariantDropdown();
 				this.syncFrontBackWithFirstVariant();
 
-				const providerModelDesc = this.plugin.getProviderModelDescription("variant");
-				new Notice(`✅ Generated ${variants.length} new variants using ${providerModelDesc}!`);
+				const providerModelDesc =
+					this.plugin.getProviderModelDescription("variant");
+				new Notice(
+					`✅ Generated ${variants.length} new variants using ${providerModelDesc}!`
+				);
 			} else {
 				throw new Error("No valid variants were generated");
 			}
@@ -17621,20 +18582,46 @@ ${Array.from(
 		}
 	}
 
-	private _createCardsFromLlmResponse(response: string): Flashcard[] {
+	private _createCardsFromLlmResponse(
+		response: string,
+		inheritHistoryFrom?: Flashcard
+	): Flashcard[] {
 		const items = extractJsonObjects<{ front: string; back: string }>(
 			response
 		).filter((i) => i.front && i.back);
 
-		return items.map((i) =>
-			this.plugin.createCardObject({
+		return items.map((i) => {
+			const newCard = this.plugin.createCardObject({
 				front: i.front.trim(),
 				back: i.back.trim(),
 				tag: this.card.tag,
 				chapter: this.card.chapter,
 				paraIdx: this.card.paraIdx,
-			})
-		);
+			});
+
+			if (
+				inheritHistoryFrom &&
+				this.plugin.settings.splitInheritHistory
+			) {
+				newCard.review_history = [
+					...inheritHistoryFrom.review_history,
+				];
+				newCard.status = inheritHistoryFrom.status;
+				newCard.last_reviewed = inheritHistoryFrom.last_reviewed;
+				newCard.interval = inheritHistoryFrom.interval;
+				newCard.ease_factor = inheritHistoryFrom.ease_factor;
+				newCard.due = inheritHistoryFrom.due;
+				newCard.blocked = inheritHistoryFrom.blocked;
+				newCard.learning_step_index =
+					inheritHistoryFrom.learning_step_index;
+
+				if (inheritHistoryFrom.ebisu) {
+					newCard.ebisu = { ...inheritHistoryFrom.ebisu };
+				}
+			}
+
+			return newCard;
+		});
 	}
 
 	private async handleRefocus(evt: MouseEvent) {
@@ -17878,7 +18865,7 @@ Return ONLY valid JSON array of this shape: [{"front":"...","back":"..."}]`;
 						if (!response)
 							throw new Error("LLM returned an empty response.");
 						const newCards =
-							this._createCardsFromLlmResponse(response);
+							this._createCardsFromLlmResponse(response, this.card);
 						if (newCards.length === 0)
 							throw new Error(
 								"Could not parse new cards from LLM response."
@@ -18284,7 +19271,8 @@ class MnemonicsModal extends Modal {
 		const memoryPalaceContainer = styleContainer.createDiv({
 			cls: "memory-palace-selection-container",
 		});
-		memoryPalaceContainer.style.cssText = "display: none; margin-top: 10px;";
+		memoryPalaceContainer.style.cssText =
+			"display: none; margin-top: 10px;";
 		memoryPalaceContainer.createEl("label", {
 			text: "Select Memory Palace:",
 			cls: "memory-palace-label",
@@ -18323,13 +19311,17 @@ class MnemonicsModal extends Modal {
 			if (style === "peg") {
 				pegSystemContainer.style.display = "block";
 				if (this.plugin.settings.pegSystems.length > 0) {
-					this.selectedPegSystem = pegSystemDropdown.value || this.plugin.settings.pegSystems[0].name;
+					this.selectedPegSystem =
+						pegSystemDropdown.value ||
+						this.plugin.settings.pegSystems[0].name;
 					pegSystemDropdown.value = this.selectedPegSystem;
 				}
 			} else if (style === "spatial") {
 				memoryPalaceContainer.style.display = "block";
 				if (this.plugin.settings.memoryPalaces.length > 0) {
-					this.selectedMemoryPalace = memoryPalaceDropdown.value || this.plugin.settings.memoryPalaces[0].name;
+					this.selectedMemoryPalace =
+						memoryPalaceDropdown.value ||
+						this.plugin.settings.memoryPalaces[0].name;
 					memoryPalaceDropdown.value = this.selectedMemoryPalace;
 				}
 			} else {
@@ -18418,7 +19410,8 @@ class MnemonicsModal extends Modal {
 		const multiGenContainer = freeformSection.createDiv({
 			cls: "multi-gen-container",
 		});
-		multiGenContainer.style.cssText = "margin-top: 10px; margin-bottom: 10px;";
+		multiGenContainer.style.cssText =
+			"margin-top: 10px; margin-bottom: 10px;";
 
 		const multiGenToggle = multiGenContainer.createEl("label", {
 			cls: "multi-gen-toggle-label",
@@ -18764,9 +19757,13 @@ class MnemonicsModal extends Modal {
 			// Extract all prior mnemonics (everything before "NEW MNEMONICS:" if it exists)
 			if (rawValue.includes("NEW MNEMONICS:")) {
 				const parts = rawValue.split("NEW MNEMONICS:");
-				priorMnemonics = parts[0].replace("PRIOR MNEMONICS:", "").trim();
+				priorMnemonics = parts[0]
+					.replace("PRIOR MNEMONICS:", "")
+					.trim();
 			} else if (rawValue.includes("PRIOR MNEMONICS:")) {
-				priorMnemonics = rawValue.replace("PRIOR MNEMONICS:", "").trim();
+				priorMnemonics = rawValue
+					.replace("PRIOR MNEMONICS:", "")
+					.trim();
 			} else if (rawValue) {
 				// Content exists but no labels yet - treat as prior mnemonics
 				priorMnemonics = rawValue;
@@ -18774,9 +19771,10 @@ class MnemonicsModal extends Modal {
 
 			// Count existing mnemonics to determine next number
 			if (priorMnemonics) {
-				const mnemonicMatches = priorMnemonics.match(/Mnemonic (\d+):/g);
+				const mnemonicMatches =
+					priorMnemonics.match(/Mnemonic (\d+):/g);
 				if (mnemonicMatches) {
-					const numbers = mnemonicMatches.map(m => {
+					const numbers = mnemonicMatches.map((m) => {
 						const match = m.match(/\d+/);
 						return match ? parseInt(match[0]) : 0;
 					});
@@ -18785,7 +19783,15 @@ class MnemonicsModal extends Modal {
 			}
 
 			const existingMnemonicsContext = priorMnemonics
-				? `\n\nPRIOR MNEMONICS:\n\`\`\`\n${priorMnemonics}\n\`\`\`\n\nThe user already has the above mnemonics. Create ${this.generateMultiple ? "3" : "1"} additional mnemonic${this.generateMultiple ? "s" : ""} that complement${this.generateMultiple ? "" : "s"} or provide${this.generateMultiple ? "" : "s"} alternative${this.generateMultiple ? "s" : ""} to what's already there.`
+				? `\n\nPRIOR MNEMONICS:\n\`\`\`\n${priorMnemonics}\n\`\`\`\n\nThe user already has the above mnemonics. Create ${
+						this.generateMultiple ? "3" : "1"
+				  } additional mnemonic${
+						this.generateMultiple ? "s" : ""
+				  } that complement${
+						this.generateMultiple ? "" : "s"
+				  } or provide${this.generateMultiple ? "" : "s"} alternative${
+						this.generateMultiple ? "s" : ""
+				  } to what's already there.`
 				: "";
 
 			// Get style-specific instructions
@@ -18821,30 +19827,40 @@ class MnemonicsModal extends Modal {
 					break;
 				case "peg":
 					if (this.selectedPegSystem) {
-						const pegSystem = this.plugin.settings.pegSystems.find(s => s.name === this.selectedPegSystem);
+						const pegSystem = this.plugin.settings.pegSystems.find(
+							(s) => s.name === this.selectedPegSystem
+						);
 						if (pegSystem) {
-							const pegList = pegSystem.pegs.map(p => `${p.number}=${p.word}`).join(", ");
-							styleInstructions =
-								`Use the PEG/BODY METHOD - attach each item to a numbered peg using the "${pegSystem.name}" system:\n\n${pegList}\n\nDo not modify these peg words. Create vivid interactions between each item and its peg/body location.`;
+							const pegList = pegSystem.pegs
+								.map((p) => `${p.number}=${p.word}`)
+								.join(", ");
+							styleInstructions = `Use the PEG/BODY METHOD - attach each item to a numbered peg using the "${pegSystem.name}" system:\n\n${pegList}\n\nDo not modify these peg words. Create vivid interactions between each item and its peg/body location.`;
 						} else {
-							styleInstructions = "Use the PEG/BODY METHOD - No peg system selected.";
+							styleInstructions =
+								"Use the PEG/BODY METHOD - No peg system selected.";
 						}
 					} else {
-						styleInstructions = "Use the PEG/BODY METHOD - No peg system selected.";
+						styleInstructions =
+							"Use the PEG/BODY METHOD - No peg system selected.";
 					}
 					break;
 				case "spatial":
 					if (this.selectedMemoryPalace) {
-						const palace = this.plugin.settings.memoryPalaces.find(p => p.name === this.selectedMemoryPalace);
+						const palace = this.plugin.settings.memoryPalaces.find(
+							(p) => p.name === this.selectedMemoryPalace
+						);
 						if (palace) {
-							const locationList = palace.locations.map(l => `${l.order}=${l.location}`).join(", ");
-							styleInstructions =
-								`Create a MEMORY PALACE/SPATIAL arrangement using the "${palace.name}" palace:\n\nLocations: ${locationList}\n\nPlace items in these specific locations in sequence. Describe where each item is positioned and what it's doing in that location.`;
+							const locationList = palace.locations
+								.map((l) => `${l.order}=${l.location}`)
+								.join(", ");
+							styleInstructions = `Create a MEMORY PALACE/SPATIAL arrangement using the "${palace.name}" palace:\n\nLocations: ${locationList}\n\nPlace items in these specific locations in sequence. Describe where each item is positioned and what it's doing in that location.`;
 						} else {
-							styleInstructions = "Create a MEMORY PALACE/SPATIAL arrangement - No memory palace selected.";
+							styleInstructions =
+								"Create a MEMORY PALACE/SPATIAL arrangement - No memory palace selected.";
 						}
 					} else {
-						styleInstructions = "Create a MEMORY PALACE/SPATIAL arrangement - No memory palace selected.";
+						styleInstructions =
+							"Create a MEMORY PALACE/SPATIAL arrangement - No memory palace selected.";
 					}
 					break;
 				default:
@@ -18854,7 +19870,12 @@ class MnemonicsModal extends Modal {
 
 			// Determine if we need card type instructions
 			// Skip generic card type analysis if using a specific mnemonic strategy
-			const hasSpecificStrategy = ["sounds-alike", "acronym", "peg", "spatial"].includes(this.selectedStyle);
+			const hasSpecificStrategy = [
+				"sounds-alike",
+				"acronym",
+				"peg",
+				"spatial",
+			].includes(this.selectedStyle);
 
 			let cardTypeInstructions = "";
 			if (this.cardTypeOverride) {
@@ -18894,33 +19915,67 @@ class MnemonicsModal extends Modal {
 			let outputInstructions = "";
 			if (this.selectedStyle === "acronym") {
 				outputInstructions = this.generateMultiple
-					? `Return 3 different acronym/acrostic options in this exact format:\n\nMnemonic ${nextMnemonicNumber}:\nKey words: [Item 1 → Word → Letter, Item 2 → Word → Letter, etc.]\nAcronym: [The resulting acronym/acrostic]\nExplanation: [Brief vivid description if helpful]\n\nMnemonic ${nextMnemonicNumber + 1}:\nKey words: [Different key words chosen from the items]\nAcronym: [The resulting acronym/acrostic]\nExplanation: [Brief vivid description if helpful]\n\nMnemonic ${nextMnemonicNumber + 2}:\nKey words: [Yet another set of key words]\nAcronym: [The resulting acronym/acrostic]\nExplanation: [Brief vivid description if helpful]\n\nDo not add any other text or labels.`
+					? `Return 3 different acronym/acrostic options in this exact format:\n\nMnemonic ${nextMnemonicNumber}:\nKey words: [Item 1 → Word → Letter, Item 2 → Word → Letter, etc.]\nAcronym: [The resulting acronym/acrostic]\nExplanation: [Brief vivid description if helpful]\n\nMnemonic ${
+							nextMnemonicNumber + 1
+					  }:\nKey words: [Different key words chosen from the items]\nAcronym: [The resulting acronym/acrostic]\nExplanation: [Brief vivid description if helpful]\n\nMnemonic ${
+							nextMnemonicNumber + 2
+					  }:\nKey words: [Yet another set of key words]\nAcronym: [The resulting acronym/acrostic]\nExplanation: [Brief vivid description if helpful]\n\nDo not add any other text or labels.`
 					: `Return a single acronym/acrostic in this exact format:\n\nMnemonic ${nextMnemonicNumber}:\nKey words: [Item 1 → Word → Letter, Item 2 → Word → Letter, etc.]\nAcronym: [The resulting acronym/acrostic]\nExplanation: [Brief vivid description if helpful]\n\nDo not add any other text or labels.`;
 			} else if (this.selectedStyle === "sounds-alike") {
 				outputInstructions = this.generateMultiple
-					? `Return 3 different sounds-alike options in this exact format:\n\nMnemonic ${nextMnemonicNumber}:\nWord/Phrase: [What needs to be remembered]\nSounds like: [Phonetic breakdown]\nVivid association: [The memorable connection]\n\nMnemonic ${nextMnemonicNumber + 1}:\nWord/Phrase: [What needs to be remembered]\nSounds like: [Different phonetic breakdown]\nVivid association: [The memorable connection]\n\nMnemonic ${nextMnemonicNumber + 2}:\nWord/Phrase: [What needs to be remembered]\nSounds like: [Yet another phonetic breakdown]\nVivid association: [The memorable connection]\n\nDo not add any other text or labels.`
+					? `Return 3 different sounds-alike options in this exact format:\n\nMnemonic ${nextMnemonicNumber}:\nWord/Phrase: [What needs to be remembered]\nSounds like: [Phonetic breakdown]\nVivid association: [The memorable connection]\n\nMnemonic ${
+							nextMnemonicNumber + 1
+					  }:\nWord/Phrase: [What needs to be remembered]\nSounds like: [Different phonetic breakdown]\nVivid association: [The memorable connection]\n\nMnemonic ${
+							nextMnemonicNumber + 2
+					  }:\nWord/Phrase: [What needs to be remembered]\nSounds like: [Yet another phonetic breakdown]\nVivid association: [The memorable connection]\n\nDo not add any other text or labels.`
 					: `Return a single sounds-alike mnemonic in this exact format:\n\nMnemonic ${nextMnemonicNumber}:\nWord/Phrase: [What needs to be remembered]\nSounds like: [Phonetic breakdown]\nVivid association: [The memorable connection]\n\nDo not add any other text or labels.`;
 			} else if (this.selectedStyle === "peg") {
-				const pegSystemName = this.selectedPegSystem || "selected system";
+				const pegSystemName =
+					this.selectedPegSystem || "selected system";
 				outputInstructions = this.generateMultiple
-					? `Return 3 different peg/body method options in this exact format:\n\nMnemonic ${nextMnemonicNumber}:\nPeg system: ${pegSystemName}\nMappings:\n  Item 1 → Peg/Location → [vivid interaction]\n  Item 2 → Peg/Location → [vivid interaction]\n  [etc.]\n\nMnemonic ${nextMnemonicNumber + 1}:\nPeg system: ${pegSystemName}\nMappings:\n  [different mappings]\n\nMnemonic ${nextMnemonicNumber + 2}:\nPeg system: ${pegSystemName}\nMappings:\n  [different mappings]\n\nDo not add any other text or labels.`
+					? `Return 3 different peg/body method options in this exact format:\n\nMnemonic ${nextMnemonicNumber}:\nPeg system: ${pegSystemName}\nMappings:\n  Item 1 → Peg/Location → [vivid interaction]\n  Item 2 → Peg/Location → [vivid interaction]\n  [etc.]\n\nMnemonic ${
+							nextMnemonicNumber + 1
+					  }:\nPeg system: ${pegSystemName}\nMappings:\n  [different mappings]\n\nMnemonic ${
+							nextMnemonicNumber + 2
+					  }:\nPeg system: ${pegSystemName}\nMappings:\n  [different mappings]\n\nDo not add any other text or labels.`
 					: `Return a single peg/body method mnemonic in this exact format:\n\nMnemonic ${nextMnemonicNumber}:\nPeg system: ${pegSystemName}\nMappings:\n  Item 1 → Peg/Location → [vivid interaction]\n  Item 2 → Peg/Location → [vivid interaction]\n  [etc.]\n\nDo not add any other text or labels.`;
 			} else if (this.selectedStyle === "spatial") {
-				const palaceName = this.selectedMemoryPalace || "selected palace";
+				const palaceName =
+					this.selectedMemoryPalace || "selected palace";
 				outputInstructions = this.generateMultiple
-					? `Return 3 different memory palace/spatial options in this exact format:\n\nMnemonic ${nextMnemonicNumber}:\nLocation: ${palaceName}\nSpatial mappings:\n  Item 1 → [Location 1] → [what's happening there]\n  Item 2 → [Location 2] → [what's happening there]\n  [etc.]\n\nMnemonic ${nextMnemonicNumber + 1}:\nLocation: ${palaceName}\nSpatial mappings:\n  [different mappings]\n\nMnemonic ${nextMnemonicNumber + 2}:\nLocation: ${palaceName}\nSpatial mappings:\n  [different mappings]\n\nDo not add any other text or labels.`
+					? `Return 3 different memory palace/spatial options in this exact format:\n\nMnemonic ${nextMnemonicNumber}:\nLocation: ${palaceName}\nSpatial mappings:\n  Item 1 → [Location 1] → [what's happening there]\n  Item 2 → [Location 2] → [what's happening there]\n  [etc.]\n\nMnemonic ${
+							nextMnemonicNumber + 1
+					  }:\nLocation: ${palaceName}\nSpatial mappings:\n  [different mappings]\n\nMnemonic ${
+							nextMnemonicNumber + 2
+					  }:\nLocation: ${palaceName}\nSpatial mappings:\n  [different mappings]\n\nDo not add any other text or labels.`
 					: `Return a single memory palace/spatial mnemonic in this exact format:\n\nMnemonic ${nextMnemonicNumber}:\nLocation: ${palaceName}\nSpatial mappings:\n  Item 1 → [Location 1] → [what's happening there]\n  Item 2 → [Location 2] → [what's happening there]\n  [etc.]\n\nDo not add any other text or labels.`;
 			} else {
 				// Visual strategies (default, alliterative, rhyming, humorous, visual, story)
 				outputInstructions = this.generateMultiple
-					? `Return ${this.generateMultiple ? "3 different vivid mental image" : "a single vivid mental image"} option${this.generateMultiple ? "s" : ""} in this exact format:\n\nMnemonic ${nextMnemonicNumber}:\n[Your vivid mental image]\n\nMnemonic ${nextMnemonicNumber + 1}:\n[Your vivid mental image]\n\nMnemonic ${nextMnemonicNumber + 2}:\n[Your vivid mental image]\n\nDo not explain or label the card type. Do not describe your reasoning. Just output the memory image${this.generateMultiple ? "s" : ""}.`
+					? `Return ${
+							this.generateMultiple
+								? "3 different vivid mental image"
+								: "a single vivid mental image"
+					  } option${
+							this.generateMultiple ? "s" : ""
+					  } in this exact format:\n\nMnemonic ${nextMnemonicNumber}:\n[Your vivid mental image]\n\nMnemonic ${
+							nextMnemonicNumber + 1
+					  }:\n[Your vivid mental image]\n\nMnemonic ${
+							nextMnemonicNumber + 2
+					  }:\n[Your vivid mental image]\n\nDo not explain or label the card type. Do not describe your reasoning. Just output the memory image${
+							this.generateMultiple ? "s" : ""
+					  }.`
 					: `Return a single vivid mental image in this exact format:\n\nMnemonic ${nextMnemonicNumber}:\n[Your vivid mental image]\n\nDo not explain or label the card type. Do not describe your reasoning. Just output the memory image.`;
 			}
 
 			const prompt = `You are a mnemonic coach helping someone remember flashcards. ${
 				hasSpecificStrategy
 					? "Apply the specified mnemonic technique to create a memorable hook for this card."
-					: `Your job is to ${this.cardTypeOverride ? "create" : "first identify what kind of memory is required and then generate"} a vivid image, scene, or memory hook accordingly.`
+					: `Your job is to ${
+							this.cardTypeOverride
+								? "create"
+								: "first identify what kind of memory is required and then generate"
+					  } a vivid image, scene, or memory hook accordingly.`
 			}
 
 STYLE PREFERENCE: ${styleInstructions}
@@ -18934,7 +19989,12 @@ BACK: ${back}${majorSystemContext}${existingMnemonicsContext}
 
 ${outputInstructions}`;
 
-			const response = await this.plugin.sendToLlm(prompt, [], {}, "flashcard");
+			const response = await this.plugin.sendToLlm(
+				prompt,
+				[],
+				{},
+				"flashcard"
+			);
 
 			if (response.content.trim()) {
 				if (priorMnemonics) {
@@ -19099,7 +20159,12 @@ If Major System words are available above, feel free to incorporate any that cre
 
 Provide only the emoji sequence, no additional explanation.`;
 
-			const response = await this.plugin.sendToLlm(prompt, [], {}, "flashcard");
+			const response = await this.plugin.sendToLlm(
+				prompt,
+				[],
+				{},
+				"flashcard"
+			);
 
 			if (response.content.trim()) {
 				if (existingContentForDisplay) {
@@ -19154,15 +20219,10 @@ class PegSystemsManagementModal extends Modal {
 			.setButtonText("Create New Peg System")
 			.setCta()
 			.onClick(() => {
-				new PegSystemEditModal(
-					this.plugin,
-					null,
-					null,
-					() => {
-						this.onUpdate();
-						this.onOpen(); // Refresh
-					}
-				).open();
+				new PegSystemEditModal(this.plugin, null, null, () => {
+					this.onUpdate();
+					this.onOpen(); // Refresh
+				}).open();
 			});
 
 		const pegSystems = this.plugin.settings.pegSystems;
@@ -19240,15 +20300,10 @@ class PegSystemsManagementModal extends Modal {
 			new ButtonComponent(buttonContainer)
 				.setButtonText("Edit")
 				.onClick(() => {
-					new PegSystemEditModal(
-						this.plugin,
-						index,
-						system,
-						() => {
-							this.onUpdate();
-							this.onOpen(); // Refresh
-						}
-					).open();
+					new PegSystemEditModal(this.plugin, index, system, () => {
+						this.onUpdate();
+						this.onOpen(); // Refresh
+					}).open();
 				});
 
 			new ButtonComponent(buttonContainer)
@@ -19648,15 +20703,10 @@ class MemoryPalacesManagementModal extends Modal {
 			.setButtonText("Create New Memory Palace")
 			.setCta()
 			.onClick(() => {
-				new MemoryPalaceEditModal(
-					this.plugin,
-					null,
-					null,
-					() => {
-						this.onUpdate();
-						this.onOpen(); // Refresh
-					}
-				).open();
+				new MemoryPalaceEditModal(this.plugin, null, null, () => {
+					this.onUpdate();
+					this.onOpen(); // Refresh
+				}).open();
 			});
 
 		const palaces = this.plugin.settings.memoryPalaces;
@@ -20515,7 +21565,8 @@ class CardBrowser extends NavigationAwareModal {
 
 		this.searchInput = searchContainer.createEl("input", {
 			type: "text",
-			placeholder: 'Search cards (or front:"text", back:"text", tag:"exact-tag")',
+			placeholder:
+				'Search cards (or front:"text", back:"text", tag:"exact-tag")',
 		}) as HTMLInputElement;
 		this.searchInput.style.flex = "1";
 		this.searchInput.style.padding = "4px 8px";
@@ -20785,7 +21836,9 @@ class CardBrowser extends NavigationAwareModal {
 		const frontMatch = query.match(/front:"(.+)"$/);
 		if (frontMatch) {
 			const frontQuery = frontMatch[1];
-			return (card.front || "").toLowerCase() === frontQuery.toLowerCase();
+			return (
+				(card.front || "").toLowerCase() === frontQuery.toLowerCase()
+			);
 		}
 
 		// Exact back search with quotes
@@ -20806,14 +21859,18 @@ class CardBrowser extends NavigationAwareModal {
 		const simpleFrontMatch = query.match(/front:(\S+)/);
 		if (simpleFrontMatch) {
 			const frontQuery = simpleFrontMatch[1];
-			return (card.front || "").toLowerCase().includes(frontQuery.toLowerCase());
+			return (card.front || "")
+				.toLowerCase()
+				.includes(frontQuery.toLowerCase());
 		}
 
 		// Partial back search without quotes
 		const simpleBackMatch = query.match(/back:(\S+)/);
 		if (simpleBackMatch) {
 			const backQuery = simpleBackMatch[1];
-			return (card.back || "").toLowerCase().includes(backQuery.toLowerCase());
+			return (card.back || "")
+				.toLowerCase()
+				.includes(backQuery.toLowerCase());
 		}
 
 		const searchFields = [
@@ -21082,19 +22139,21 @@ class CardBrowser extends NavigationAwareModal {
 	private async startCustomStudy() {
 		const selectedPathsArray = Array.from(this.selectedPaths);
 
-		const pathDisplay = this.selectedPaths.size === 0
-			? "search results"
-			: this.selectedPaths.size === 1
-			? selectedPathsArray[0]
-			: `${this.selectedPaths.size} selected items`;
+		const pathDisplay =
+			this.selectedPaths.size === 0
+				? "search results"
+				: this.selectedPaths.size === 1
+				? selectedPathsArray[0]
+				: `${this.selectedPaths.size} selected items`;
 
-		new Notice(`🎯 Custom study: ${pathDisplay} (using working ribbon path)`);
+		new Notice(
+			`🎯 Custom study: ${pathDisplay} (using working ribbon path)`
+		);
 
 		// Close browser and start review using the working ribbon logic
 		this.close();
 		this.plugin.startCustomSessionFromPaths(selectedPathsArray, true);
 	}
-
 
 	private cycleFilterState(currentState: FilterState): FilterState {
 		switch (currentState) {
@@ -22474,7 +23533,9 @@ class GNSettingsTab extends PluginSettingTab {
 					.addOption("lmstudio", "LM Studio")
 					.setValue(this.plugin.settings.apiProvider)
 					.onChange(async (value) => {
-						this.plugin.settings.apiProvider = value as "openai" | "lmstudio";
+						this.plugin.settings.apiProvider = value as
+							| "openai"
+							| "lmstudio";
 						await this.plugin.saveSettings();
 						this.display();
 					})
@@ -22486,7 +23547,9 @@ class GNSettingsTab extends PluginSettingTab {
 		) {
 			new Setting(containerEl)
 				.setName("OpenAI API key")
-				.setDesc("Required for OpenAI text generation and/or image analysis.")
+				.setDesc(
+					"Required for OpenAI text generation and/or image analysis."
+				)
 				.addText((text) =>
 					text
 						.setPlaceholder("sk-…")
@@ -22503,8 +23566,8 @@ class GNSettingsTab extends PluginSettingTab {
 				.setName("OpenAI Text Model")
 				.addDropdown((dropdown) => {
 					dropdown.addOption("", "-- Select a model --");
-					this.plugin.settings.availableOpenaiModels.forEach((model) =>
-						dropdown.addOption(model, model)
+					this.plugin.settings.availableOpenaiModels.forEach(
+						(model) => dropdown.addOption(model, model)
 					);
 					dropdown
 						.setValue(this.plugin.settings.openaiModel)
@@ -22529,8 +23592,8 @@ class GNSettingsTab extends PluginSettingTab {
 				.setName("LM Studio Model")
 				.addDropdown((dropdown) => {
 					dropdown.addOption("", "-- Select a model --");
-					this.plugin.settings.availableLmStudioModels.forEach((model) =>
-						dropdown.addOption(model, model)
+					this.plugin.settings.availableLmStudioModels.forEach(
+						(model) => dropdown.addOption(model, model)
 					);
 					dropdown
 						.setValue(this.plugin.settings.lmStudioModel)
@@ -22548,7 +23611,10 @@ class GNSettingsTab extends PluginSettingTab {
 				button.setButtonText("Fetch").onClick(async () => {
 					button.setDisabled(true).setButtonText("Fetching...");
 					try {
-						await this.plugin.fetchAvailableModels(this.plugin.settings.apiProvider, this.plugin.settings.lmStudioUrl);
+						await this.plugin.fetchAvailableModels(
+							this.plugin.settings.apiProvider,
+							this.plugin.settings.lmStudioUrl
+						);
 						new Notice("Fetched models.");
 					} finally {
 						this.display();
@@ -22558,7 +23624,9 @@ class GNSettingsTab extends PluginSettingTab {
 
 		new Setting(containerEl)
 			.setName("Temperature")
-			.setDesc("Controls randomness. 0 is deterministic, 1 is max creativity.")
+			.setDesc(
+				"Controls randomness. 0 is deterministic, 1 is max creativity."
+			)
 			.addSlider((slider) =>
 				slider
 					.setLimits(0, 1, 0.01)
@@ -22583,7 +23651,10 @@ class GNSettingsTab extends PluginSettingTab {
 					.addOption("lmstudio", "LM Studio")
 					.setValue(this.plugin.settings.refocusApiProvider)
 					.onChange(async (value) => {
-						this.plugin.settings.refocusApiProvider = value as "match" | "openai" | "lmstudio";
+						this.plugin.settings.refocusApiProvider = value as
+							| "match"
+							| "openai"
+							| "lmstudio";
 						await this.plugin.saveSettings();
 						this.display();
 					})
@@ -22594,8 +23665,8 @@ class GNSettingsTab extends PluginSettingTab {
 				.setName("OpenAI Model")
 				.addDropdown((dropdown) => {
 					dropdown.addOption("", "-- Select a model --");
-					this.plugin.settings.availableOpenaiModels.forEach((model) =>
-						dropdown.addOption(model, model)
+					this.plugin.settings.availableOpenaiModels.forEach(
+						(model) => dropdown.addOption(model, model)
 					);
 					dropdown
 						.setValue(this.plugin.settings.refocusOpenaiModel)
@@ -22635,8 +23706,8 @@ class GNSettingsTab extends PluginSettingTab {
 				.setName("LM Studio Model")
 				.addDropdown((dropdown) => {
 					dropdown.addOption("", "-- Select a model --");
-					this.plugin.settings.availableLmStudioModels.forEach((model) =>
-						dropdown.addOption(model, model)
+					this.plugin.settings.availableLmStudioModels.forEach(
+						(model) => dropdown.addOption(model, model)
 					);
 					dropdown
 						.setValue(this.plugin.settings.refocusLmStudioModel)
@@ -22653,7 +23724,10 @@ class GNSettingsTab extends PluginSettingTab {
 					button.setButtonText("Fetch").onClick(async () => {
 						button.setDisabled(true).setButtonText("Fetching...");
 						try {
-							await this.plugin.fetchAvailableModels("lmstudio", this.plugin.settings.refocusLmStudioUrl);
+							await this.plugin.fetchAvailableModels(
+								"lmstudio",
+								this.plugin.settings.refocusLmStudioUrl
+							);
 							new Notice("Fetched LM Studio models.");
 						} finally {
 							this.display();
@@ -22662,14 +23736,29 @@ class GNSettingsTab extends PluginSettingTab {
 				);
 		} else {
 			// Match mode - show current flashcard generation settings for reference
-			const desc = this.plugin.settings.apiProvider === "openai"
-				? `Using: OpenAI (${this.plugin.settings.openaiModel})`
-				: `Using: LM Studio (${this.plugin.settings.lmStudioModel})`;
+			const desc =
+				this.plugin.settings.apiProvider === "openai"
+					? `Using: OpenAI (${this.plugin.settings.openaiModel})`
+					: `Using: LM Studio (${this.plugin.settings.lmStudioModel})`;
 
 			new Setting(containerEl)
 				.setName("Current Configuration")
 				.setDesc(desc);
 		}
+
+		new Setting(containerEl)
+			.setName("Split cards inherit review history")
+			.setDesc(
+				"When enabled (default), cards created from splitting inherit the parent card's review history, scheduling state, and algorithm-specific data. This maintains learning progress across split cards."
+			)
+			.addToggle((toggle) =>
+				toggle
+					.setValue(this.plugin.settings.splitInheritHistory)
+					.onChange(async (value) => {
+						this.plugin.settings.splitInheritHistory = value;
+						await this.plugin.saveSettings();
+					})
+			);
 
 		// VARIANT GENERATION SUBSECTION
 		containerEl.createEl("h4", { text: "Variant Generation" });
@@ -22684,7 +23773,10 @@ class GNSettingsTab extends PluginSettingTab {
 					.addOption("lmstudio", "LM Studio")
 					.setValue(this.plugin.settings.variantApiProvider)
 					.onChange(async (value) => {
-						this.plugin.settings.variantApiProvider = value as "match" | "openai" | "lmstudio";
+						this.plugin.settings.variantApiProvider = value as
+							| "match"
+							| "openai"
+							| "lmstudio";
 						await this.plugin.saveSettings();
 						this.display();
 					})
@@ -22695,8 +23787,8 @@ class GNSettingsTab extends PluginSettingTab {
 				.setName("OpenAI Model")
 				.addDropdown((dropdown) => {
 					dropdown.addOption("", "-- Select a model --");
-					this.plugin.settings.availableOpenaiModels.forEach((model) =>
-						dropdown.addOption(model, model)
+					this.plugin.settings.availableOpenaiModels.forEach(
+						(model) => dropdown.addOption(model, model)
 					);
 					dropdown
 						.setValue(this.plugin.settings.variantOpenaiModel)
@@ -22736,8 +23828,8 @@ class GNSettingsTab extends PluginSettingTab {
 				.setName("LM Studio Model")
 				.addDropdown((dropdown) => {
 					dropdown.addOption("", "-- Select a model --");
-					this.plugin.settings.availableLmStudioModels.forEach((model) =>
-						dropdown.addOption(model, model)
+					this.plugin.settings.availableLmStudioModels.forEach(
+						(model) => dropdown.addOption(model, model)
 					);
 					dropdown
 						.setValue(this.plugin.settings.variantLmStudioModel)
@@ -22754,7 +23846,10 @@ class GNSettingsTab extends PluginSettingTab {
 					button.setButtonText("Fetch").onClick(async () => {
 						button.setDisabled(true).setButtonText("Fetching...");
 						try {
-							await this.plugin.fetchAvailableModels("lmstudio", this.plugin.settings.variantLmStudioUrl);
+							await this.plugin.fetchAvailableModels(
+								"lmstudio",
+								this.plugin.settings.variantLmStudioUrl
+							);
 							new Notice("Fetched LM Studio models.");
 						} finally {
 							this.display();
@@ -22763,9 +23858,10 @@ class GNSettingsTab extends PluginSettingTab {
 				);
 		} else {
 			// Match mode - show current flashcard generation settings for reference
-			const desc = this.plugin.settings.apiProvider === "openai"
-				? `Using: OpenAI (${this.plugin.settings.openaiModel})`
-				: `Using: LM Studio (${this.plugin.settings.lmStudioModel})`;
+			const desc =
+				this.plugin.settings.apiProvider === "openai"
+					? `Using: OpenAI (${this.plugin.settings.openaiModel})`
+					: `Using: LM Studio (${this.plugin.settings.lmStudioModel})`;
 
 			new Setting(containerEl)
 				.setName("Current Configuration")
@@ -22775,7 +23871,9 @@ class GNSettingsTab extends PluginSettingTab {
 		// IMAGE ANALYSIS SECTION
 		new Setting(containerEl)
 			.setName("Analyze images on generate (Experimental)")
-			.setDesc("Analyze images using an OpenAI vision model. This feature requires an OpenAI API key regardless of the main provider setting.")
+			.setDesc(
+				"Analyze images using an OpenAI vision model. This feature requires an OpenAI API key regardless of the main provider setting."
+			)
 			.addToggle((toggle) =>
 				toggle
 					.setValue(this.plugin.settings.analyzeImagesOnGenerate)
@@ -22789,7 +23887,9 @@ class GNSettingsTab extends PluginSettingTab {
 		if (this.plugin.settings.analyzeImagesOnGenerate) {
 			new Setting(containerEl)
 				.setName("OpenAI Multimodal Model")
-				.setDesc("Model for image analysis (e.g., gpt-4o, gpt-4o-mini).")
+				.setDesc(
+					"Model for image analysis (e.g., gpt-4o, gpt-4o-mini)."
+				)
 				.addDropdown((dropdown) => {
 					dropdown.addOption("gpt-4o", "gpt-4o");
 					dropdown.addOption("gpt-4o-mini", "gpt-4o-mini");
@@ -22838,6 +23938,275 @@ class GNSettingsTab extends PluginSettingTab {
 							}
 						})
 				);
+		}
+
+		// --- FSRS SECTION ---
+		containerEl.createEl("h3", { text: "Spaced Repetition Algorithm" });
+
+		new Setting(containerEl)
+			.setName("Algorithm")
+			.setDesc(
+				"Choose between SM-2 (traditional) or Ebisu (Bayesian)."
+			)
+			.addDropdown((dropdown) =>
+				dropdown
+					.addOption("SM2", "SM-2 (SuperMemo 2)")
+					.addOption("Ebisu", "Ebisu (Bayesian)")
+					.setValue(this.plugin.settings.algorithm)
+					.onChange(async (value) => {
+						this.plugin.settings.algorithm = value as
+							| "SM2"
+							| "Ebisu";
+						await this.plugin.saveSettings();
+						this.display();
+					})
+			);
+
+		// Ebisu specific settings
+		if (this.plugin.settings.algorithm === "Ebisu") {
+			containerEl.createEl("h3", { text: "Ebisu Settings" });
+
+			// Target recall
+			new Setting(containerEl)
+				.setName("Target recall")
+				.setDesc(
+					"Target probability of recalling the card (0.70 - 0.95). This determines when you review."
+				)
+				.addSlider((slider) =>
+					slider
+						.setLimits(0.7, 0.95, 0.01)
+						.setValue(this.plugin.settings.ebisuTargetRecall)
+						.setDynamicTooltip()
+						.onChange(async (value) => {
+							this.plugin.settings.ebisuTargetRecall = value;
+							await this.plugin.saveSettings();
+						})
+				)
+				.addExtraButton((button) =>
+					button
+						.setIcon("reset")
+						.setTooltip("Reset to 85%")
+						.onClick(async () => {
+							this.plugin.settings.ebisuTargetRecall = 0.85;
+							await this.plugin.saveSettings();
+							this.display();
+						})
+				);
+
+			// Always recalculate from history
+			new Setting(containerEl)
+				.setName("Always recalculate from history")
+				.setDesc(
+					"When enabled, ignores stored alpha/beta values and recalculates the model from review history on every review. Useful for parameter tuning to see changes reflected immediately in mature cards."
+				)
+				.addToggle((toggle) =>
+					toggle
+						.setValue(this.plugin.settings.ebisuAlwaysRecalculate)
+						.onChange(async (value) => {
+							this.plugin.settings.ebisuAlwaysRecalculate = value;
+							await this.plugin.saveSettings();
+						})
+				);
+
+			// Default half-life
+			new Setting(containerEl)
+				.setName("Default half-life (hours)")
+				.setDesc(
+					"Initial half-life for new cards in hours (e.g., 24 = 1 day)."
+				)
+				.addText((text) =>
+					text
+						.setValue(
+							String(this.plugin.settings.ebisuDefaultHalflife)
+						)
+						.onChange(async (value) => {
+							const num = parseFloat(value);
+							if (!isNaN(num) && num > 0) {
+								this.plugin.settings.ebisuDefaultHalflife = num;
+								await this.plugin.saveSettings();
+							}
+						})
+				);
+
+			// Alpha parameter
+			new Setting(containerEl)
+				.setName("Alpha (α)")
+				.setDesc(
+					"Confidence in the half-life (2-4 typical). Higher = more confident in initial estimate."
+				)
+				.addText((text) =>
+					text
+						.setValue(
+							String(this.plugin.settings.ebisuDefaultAlpha)
+						)
+						.onChange(async (value) => {
+							const num = parseFloat(value);
+							if (!isNaN(num) && num >= 1) {
+								this.plugin.settings.ebisuDefaultAlpha = num;
+								await this.plugin.saveSettings();
+							}
+						})
+				);
+
+			// Beta parameter
+			new Setting(containerEl)
+				.setName("Beta (β)")
+				.setDesc("Typically equal to Alpha for symmetric prior.")
+				.addText((text) =>
+					text
+						.setValue(String(this.plugin.settings.ebisuDefaultBeta))
+						.onChange(async (value) => {
+							const num = parseFloat(value);
+							if (!isNaN(num) && num >= 1) {
+								this.plugin.settings.ebisuDefaultBeta = num;
+								await this.plugin.saveSettings();
+							}
+						})
+				);
+
+			// Update parameters section
+			containerEl.createEl("h4", { text: "Rating Update Parameters" });
+			containerEl.createEl("p", {
+				text: "Configure how each rating updates the model as successes/total trials.",
+				cls: "setting-item-description",
+			});
+
+			// Again parameters
+			new Setting(containerEl)
+				.setName("Again (successes/total)")
+				.setDesc(
+					"How to interpret 'Again' rating (default: 0/1 = complete failure)."
+				)
+				.addText((text) =>
+					text
+						.setPlaceholder("Successes")
+						.setValue(
+							String(this.plugin.settings.ebisuAgainSuccesses)
+						)
+						.onChange(async (value) => {
+							const num = parseInt(value);
+							if (!isNaN(num) && num >= 0) {
+								this.plugin.settings.ebisuAgainSuccesses = num;
+								await this.plugin.saveSettings();
+							}
+						})
+				)
+				.addText((text) =>
+					text
+						.setPlaceholder("Total")
+						.setValue(String(this.plugin.settings.ebisuAgainTotal))
+						.onChange(async (value) => {
+							const num = parseInt(value);
+							if (!isNaN(num) && num >= 1) {
+								this.plugin.settings.ebisuAgainTotal = num;
+								await this.plugin.saveSettings();
+							}
+						})
+				);
+
+			// Hard parameters
+			new Setting(containerEl)
+				.setName("Hard (successes/total)")
+				.setDesc(
+					"How to interpret 'Hard' rating (default: 1/2 = 50% success)."
+				)
+				.addText((text) =>
+					text
+						.setPlaceholder("Successes")
+						.setValue(
+							String(this.plugin.settings.ebisuHardSuccesses)
+						)
+						.onChange(async (value) => {
+							const num = parseInt(value);
+							if (!isNaN(num) && num >= 0) {
+								this.plugin.settings.ebisuHardSuccesses = num;
+								await this.plugin.saveSettings();
+							}
+						})
+				)
+				.addText((text) =>
+					text
+						.setPlaceholder("Total")
+						.setValue(String(this.plugin.settings.ebisuHardTotal))
+						.onChange(async (value) => {
+							const num = parseInt(value);
+							if (!isNaN(num) && num >= 1) {
+								this.plugin.settings.ebisuHardTotal = num;
+								await this.plugin.saveSettings();
+							}
+						})
+				);
+
+			// Good parameters
+			new Setting(containerEl)
+				.setName("Good (successes/total)")
+				.setDesc(
+					"How to interpret 'Good' rating (default: 1/1 = full success)."
+				)
+				.addText((text) =>
+					text
+						.setPlaceholder("Successes")
+						.setValue(
+							String(this.plugin.settings.ebisuGoodSuccesses)
+						)
+						.onChange(async (value) => {
+							const num = parseInt(value);
+							if (!isNaN(num) && num >= 0) {
+								this.plugin.settings.ebisuGoodSuccesses = num;
+								await this.plugin.saveSettings();
+							}
+						})
+				)
+				.addText((text) =>
+					text
+						.setPlaceholder("Total")
+						.setValue(String(this.plugin.settings.ebisuGoodTotal))
+						.onChange(async (value) => {
+							const num = parseInt(value);
+							if (!isNaN(num) && num >= 1) {
+								this.plugin.settings.ebisuGoodTotal = num;
+								await this.plugin.saveSettings();
+							}
+						})
+				);
+
+			// Easy parameters
+			new Setting(containerEl)
+				.setName("Easy (successes/total)")
+				.setDesc(
+					"How to interpret 'Easy' rating (default: 1/1 = full success)."
+				)
+				.addText((text) =>
+					text
+						.setPlaceholder("Successes")
+						.setValue(
+							String(this.plugin.settings.ebisuEasySuccesses)
+						)
+						.onChange(async (value) => {
+							const num = parseInt(value);
+							if (!isNaN(num) && num >= 0) {
+								this.plugin.settings.ebisuEasySuccesses = num;
+								await this.plugin.saveSettings();
+							}
+						})
+				)
+				.addText((text) =>
+					text
+						.setPlaceholder("Total")
+						.setValue(String(this.plugin.settings.ebisuEasyTotal))
+						.onChange(async (value) => {
+							const num = parseInt(value);
+							if (!isNaN(num) && num >= 1) {
+								this.plugin.settings.ebisuEasyTotal = num;
+								await this.plugin.saveSettings();
+							}
+						})
+				);
+		}
+
+		// SM-2 specific settings (shown when SM-2 is selected)
+		if (this.plugin.settings.algorithm === "SM2") {
+			containerEl.createEl("h3", { text: "SM-2 Settings" });
 		}
 
 		this.createNumericArraySetting(
@@ -22948,7 +24317,9 @@ class GNSettingsTab extends PluginSettingTab {
 
 		new Setting(containerEl)
 			.setName("Enable card appearance randomization")
-			.setDesc("Randomize visual properties of flashcard fronts during review")
+			.setDesc(
+				"Randomize visual properties of flashcard fronts during review"
+			)
 			.addToggle((toggle) =>
 				toggle
 					.setValue(this.plugin.settings.randomizeCardAppearance)
@@ -22961,17 +24332,15 @@ class GNSettingsTab extends PluginSettingTab {
 
 		if (this.plugin.settings.randomizeCardAppearance) {
 			// Font Size
-			new Setting(containerEl)
-				.setName("Font size")
-				.addToggle((toggle) =>
-					toggle
-						.setValue(this.plugin.settings.randomizeFontSize)
-						.onChange(async (value) => {
-							this.plugin.settings.randomizeFontSize = value;
-							await this.plugin.saveSettings();
-							this.display();
-						})
-				);
+			new Setting(containerEl).setName("Font size").addToggle((toggle) =>
+				toggle
+					.setValue(this.plugin.settings.randomizeFontSize)
+					.onChange(async (value) => {
+						this.plugin.settings.randomizeFontSize = value;
+						await this.plugin.saveSettings();
+						this.display();
+					})
+			);
 
 			if (this.plugin.settings.randomizeFontSize) {
 				new Setting(containerEl)
@@ -22979,11 +24348,16 @@ class GNSettingsTab extends PluginSettingTab {
 					.addText((text) =>
 						text
 							.setPlaceholder("Min")
-							.setValue(String(this.plugin.settings.randomizeFontSizeMin))
+							.setValue(
+								String(
+									this.plugin.settings.randomizeFontSizeMin
+								)
+							)
 							.onChange(async (value) => {
 								const num = parseInt(value);
 								if (!isNaN(num) && num > 0) {
-									this.plugin.settings.randomizeFontSizeMin = num;
+									this.plugin.settings.randomizeFontSizeMin =
+										num;
 									await this.plugin.saveSettings();
 								}
 							})
@@ -22991,11 +24365,16 @@ class GNSettingsTab extends PluginSettingTab {
 					.addText((text) =>
 						text
 							.setPlaceholder("Max")
-							.setValue(String(this.plugin.settings.randomizeFontSizeMax))
+							.setValue(
+								String(
+									this.plugin.settings.randomizeFontSizeMax
+								)
+							)
 							.onChange(async (value) => {
 								const num = parseInt(value);
 								if (!isNaN(num) && num > 0) {
-									this.plugin.settings.randomizeFontSizeMax = num;
+									this.plugin.settings.randomizeFontSizeMax =
+										num;
 									await this.plugin.saveSettings();
 								}
 							})
@@ -23017,8 +24396,14 @@ class GNSettingsTab extends PluginSettingTab {
 
 			if (this.plugin.settings.randomizeFontFamily) {
 				const availableFonts = [
-					"Arial", "Helvetica", "Times New Roman", "Georgia",
-					"Courier New", "Verdana", "Trebuchet MS", "Impact"
+					"Arial",
+					"Helvetica",
+					"Times New Roman",
+					"Georgia",
+					"Courier New",
+					"Verdana",
+					"Trebuchet MS",
+					"Impact",
 				];
 
 				const fontsContainer = containerEl.createDiv();
@@ -23030,15 +24415,29 @@ class GNSettingsTab extends PluginSettingTab {
 					label.style.display = "inline-block";
 					label.style.marginRight = "15px";
 					label.style.marginBottom = "5px";
-					const checkbox = label.createEl("input", { type: "checkbox" });
-					checkbox.checked = this.plugin.settings.randomizeFontFamilies.includes(font);
+					const checkbox = label.createEl("input", {
+						type: "checkbox",
+					});
+					checkbox.checked =
+						this.plugin.settings.randomizeFontFamilies.includes(
+							font
+						);
 					checkbox.addEventListener("change", async () => {
 						if (checkbox.checked) {
-							if (!this.plugin.settings.randomizeFontFamilies.includes(font)) {
-								this.plugin.settings.randomizeFontFamilies.push(font);
+							if (
+								!this.plugin.settings.randomizeFontFamilies.includes(
+									font
+								)
+							) {
+								this.plugin.settings.randomizeFontFamilies.push(
+									font
+								);
 							}
 						} else {
-							this.plugin.settings.randomizeFontFamilies = this.plugin.settings.randomizeFontFamilies.filter(f => f !== font);
+							this.plugin.settings.randomizeFontFamilies =
+								this.plugin.settings.randomizeFontFamilies.filter(
+									(f) => f !== font
+								);
 						}
 						await this.plugin.saveSettings();
 					});
@@ -23047,17 +24446,15 @@ class GNSettingsTab extends PluginSettingTab {
 			}
 
 			// Text Color
-			new Setting(containerEl)
-				.setName("Text color")
-				.addToggle((toggle) =>
-					toggle
-						.setValue(this.plugin.settings.randomizeTextColor)
-						.onChange(async (value) => {
-							this.plugin.settings.randomizeTextColor = value;
-							await this.plugin.saveSettings();
-							this.display();
-						})
-				);
+			new Setting(containerEl).setName("Text color").addToggle((toggle) =>
+				toggle
+					.setValue(this.plugin.settings.randomizeTextColor)
+					.onChange(async (value) => {
+						this.plugin.settings.randomizeTextColor = value;
+						await this.plugin.saveSettings();
+						this.display();
+					})
+			);
 
 			if (this.plugin.settings.randomizeTextColor) {
 				const availableColors = [
@@ -23069,7 +24466,7 @@ class GNSettingsTab extends PluginSettingTab {
 					{ name: "Dk Green", hex: "#006600" },
 					{ name: "Purple", hex: "#660066" },
 					{ name: "Red", hex: "#cc0000" },
-					{ name: "Orange", hex: "#cc6600" }
+					{ name: "Orange", hex: "#cc6600" },
 				];
 
 				const colorsContainer = containerEl.createDiv();
@@ -23081,15 +24478,29 @@ class GNSettingsTab extends PluginSettingTab {
 					label.style.display = "inline-block";
 					label.style.marginRight = "15px";
 					label.style.marginBottom = "5px";
-					const checkbox = label.createEl("input", { type: "checkbox" });
-					checkbox.checked = this.plugin.settings.randomizeTextColors.includes(color.hex);
+					const checkbox = label.createEl("input", {
+						type: "checkbox",
+					});
+					checkbox.checked =
+						this.plugin.settings.randomizeTextColors.includes(
+							color.hex
+						);
 					checkbox.addEventListener("change", async () => {
 						if (checkbox.checked) {
-							if (!this.plugin.settings.randomizeTextColors.includes(color.hex)) {
-								this.plugin.settings.randomizeTextColors.push(color.hex);
+							if (
+								!this.plugin.settings.randomizeTextColors.includes(
+									color.hex
+								)
+							) {
+								this.plugin.settings.randomizeTextColors.push(
+									color.hex
+								);
 							}
 						} else {
-							this.plugin.settings.randomizeTextColors = this.plugin.settings.randomizeTextColors.filter(c => c !== color.hex);
+							this.plugin.settings.randomizeTextColors =
+								this.plugin.settings.randomizeTextColors.filter(
+									(c) => c !== color.hex
+								);
 						}
 						await this.plugin.saveSettings();
 					});
@@ -23099,8 +24510,11 @@ class GNSettingsTab extends PluginSettingTab {
 					colorSwatch.style.height = "12px";
 					colorSwatch.style.backgroundColor = color.hex;
 					colorSwatch.style.marginRight = "3px";
-					colorSwatch.style.border = "1px solid var(--background-modifier-border)";
-					label.appendChild(document.createTextNode(` ${color.name}`));
+					colorSwatch.style.border =
+						"1px solid var(--background-modifier-border)";
+					label.appendChild(
+						document.createTextNode(` ${color.name}`)
+					);
 				}
 			}
 
@@ -23118,7 +24532,12 @@ class GNSettingsTab extends PluginSettingTab {
 				);
 
 			if (this.plugin.settings.randomizeTextAlignment) {
-				const availableAlignments = ["left", "center", "right", "justify"];
+				const availableAlignments = [
+					"left",
+					"center",
+					"right",
+					"justify",
+				];
 
 				const alignContainer = containerEl.createDiv();
 				alignContainer.style.marginLeft = "30px";
@@ -23129,19 +24548,40 @@ class GNSettingsTab extends PluginSettingTab {
 					label.style.display = "inline-block";
 					label.style.marginRight = "15px";
 					label.style.marginBottom = "5px";
-					const checkbox = label.createEl("input", { type: "checkbox" });
-					checkbox.checked = this.plugin.settings.randomizeTextAlignments.includes(alignment);
+					const checkbox = label.createEl("input", {
+						type: "checkbox",
+					});
+					checkbox.checked =
+						this.plugin.settings.randomizeTextAlignments.includes(
+							alignment
+						);
 					checkbox.addEventListener("change", async () => {
 						if (checkbox.checked) {
-							if (!this.plugin.settings.randomizeTextAlignments.includes(alignment)) {
-								this.plugin.settings.randomizeTextAlignments.push(alignment);
+							if (
+								!this.plugin.settings.randomizeTextAlignments.includes(
+									alignment
+								)
+							) {
+								this.plugin.settings.randomizeTextAlignments.push(
+									alignment
+								);
 							}
 						} else {
-							this.plugin.settings.randomizeTextAlignments = this.plugin.settings.randomizeTextAlignments.filter(a => a !== alignment);
+							this.plugin.settings.randomizeTextAlignments =
+								this.plugin.settings.randomizeTextAlignments.filter(
+									(a) => a !== alignment
+								);
 						}
 						await this.plugin.saveSettings();
 					});
-					label.appendChild(document.createTextNode(` ${alignment.charAt(0).toUpperCase() + alignment.slice(1)}`));
+					label.appendChild(
+						document.createTextNode(
+							` ${
+								alignment.charAt(0).toUpperCase() +
+								alignment.slice(1)
+							}`
+						)
+					);
 				}
 			}
 
@@ -23164,11 +24604,16 @@ class GNSettingsTab extends PluginSettingTab {
 					.addText((text) =>
 						text
 							.setPlaceholder("Min")
-							.setValue(String(this.plugin.settings.randomizeLineHeightMin))
+							.setValue(
+								String(
+									this.plugin.settings.randomizeLineHeightMin
+								)
+							)
 							.onChange(async (value) => {
 								const num = parseFloat(value);
 								if (!isNaN(num) && num > 0) {
-									this.plugin.settings.randomizeLineHeightMin = num;
+									this.plugin.settings.randomizeLineHeightMin =
+										num;
 									await this.plugin.saveSettings();
 								}
 							})
@@ -23176,11 +24621,16 @@ class GNSettingsTab extends PluginSettingTab {
 					.addText((text) =>
 						text
 							.setPlaceholder("Max")
-							.setValue(String(this.plugin.settings.randomizeLineHeightMax))
+							.setValue(
+								String(
+									this.plugin.settings.randomizeLineHeightMax
+								)
+							)
 							.onChange(async (value) => {
 								const num = parseFloat(value);
 								if (!isNaN(num) && num > 0) {
-									this.plugin.settings.randomizeLineHeightMax = num;
+									this.plugin.settings.randomizeLineHeightMax =
+										num;
 									await this.plugin.saveSettings();
 								}
 							})
@@ -23206,11 +24656,17 @@ class GNSettingsTab extends PluginSettingTab {
 					.addText((text) =>
 						text
 							.setPlaceholder("Min")
-							.setValue(String(this.plugin.settings.randomizeLetterSpacingMin))
+							.setValue(
+								String(
+									this.plugin.settings
+										.randomizeLetterSpacingMin
+								)
+							)
 							.onChange(async (value) => {
 								const num = parseFloat(value);
 								if (!isNaN(num)) {
-									this.plugin.settings.randomizeLetterSpacingMin = num;
+									this.plugin.settings.randomizeLetterSpacingMin =
+										num;
 									await this.plugin.saveSettings();
 								}
 							})
@@ -23218,11 +24674,17 @@ class GNSettingsTab extends PluginSettingTab {
 					.addText((text) =>
 						text
 							.setPlaceholder("Max")
-							.setValue(String(this.plugin.settings.randomizeLetterSpacingMax))
+							.setValue(
+								String(
+									this.plugin.settings
+										.randomizeLetterSpacingMax
+								)
+							)
 							.onChange(async (value) => {
 								const num = parseFloat(value);
 								if (!isNaN(num)) {
-									this.plugin.settings.randomizeLetterSpacingMax = num;
+									this.plugin.settings.randomizeLetterSpacingMax =
+										num;
 									await this.plugin.saveSettings();
 								}
 							})
@@ -23243,7 +24705,12 @@ class GNSettingsTab extends PluginSettingTab {
 				);
 
 			if (this.plugin.settings.randomizeTextTransform) {
-				const availableTransforms = ["Normal", "UPPERCASE", "lowercase", "Capitalize"];
+				const availableTransforms = [
+					"Normal",
+					"UPPERCASE",
+					"lowercase",
+					"Capitalize",
+				];
 
 				const transformContainer = containerEl.createDiv();
 				transformContainer.style.marginLeft = "30px";
@@ -23254,15 +24721,29 @@ class GNSettingsTab extends PluginSettingTab {
 					label.style.display = "inline-block";
 					label.style.marginRight = "15px";
 					label.style.marginBottom = "5px";
-					const checkbox = label.createEl("input", { type: "checkbox" });
-					checkbox.checked = this.plugin.settings.randomizeTextTransforms.includes(transform);
+					const checkbox = label.createEl("input", {
+						type: "checkbox",
+					});
+					checkbox.checked =
+						this.plugin.settings.randomizeTextTransforms.includes(
+							transform
+						);
 					checkbox.addEventListener("change", async () => {
 						if (checkbox.checked) {
-							if (!this.plugin.settings.randomizeTextTransforms.includes(transform)) {
-								this.plugin.settings.randomizeTextTransforms.push(transform);
+							if (
+								!this.plugin.settings.randomizeTextTransforms.includes(
+									transform
+								)
+							) {
+								this.plugin.settings.randomizeTextTransforms.push(
+									transform
+								);
 							}
 						} else {
-							this.plugin.settings.randomizeTextTransforms = this.plugin.settings.randomizeTextTransforms.filter(t => t !== transform);
+							this.plugin.settings.randomizeTextTransforms =
+								this.plugin.settings.randomizeTextTransforms.filter(
+									(t) => t !== transform
+								);
 						}
 						await this.plugin.saveSettings();
 					});
@@ -23271,17 +24752,15 @@ class GNSettingsTab extends PluginSettingTab {
 			}
 
 			// Rotation
-			new Setting(containerEl)
-				.setName("Rotation")
-				.addToggle((toggle) =>
-					toggle
-						.setValue(this.plugin.settings.randomizeRotation)
-						.onChange(async (value) => {
-							this.plugin.settings.randomizeRotation = value;
-							await this.plugin.saveSettings();
-							this.display();
-						})
-				);
+			new Setting(containerEl).setName("Rotation").addToggle((toggle) =>
+				toggle
+					.setValue(this.plugin.settings.randomizeRotation)
+					.onChange(async (value) => {
+						this.plugin.settings.randomizeRotation = value;
+						await this.plugin.saveSettings();
+						this.display();
+					})
+			);
 
 			if (this.plugin.settings.randomizeRotation) {
 				new Setting(containerEl)
@@ -23289,11 +24768,16 @@ class GNSettingsTab extends PluginSettingTab {
 					.addText((text) =>
 						text
 							.setPlaceholder("Min")
-							.setValue(String(this.plugin.settings.randomizeRotationMin))
+							.setValue(
+								String(
+									this.plugin.settings.randomizeRotationMin
+								)
+							)
 							.onChange(async (value) => {
 								const num = parseFloat(value);
 								if (!isNaN(num)) {
-									this.plugin.settings.randomizeRotationMin = num;
+									this.plugin.settings.randomizeRotationMin =
+										num;
 									await this.plugin.saveSettings();
 								}
 							})
@@ -23301,11 +24785,16 @@ class GNSettingsTab extends PluginSettingTab {
 					.addText((text) =>
 						text
 							.setPlaceholder("Max")
-							.setValue(String(this.plugin.settings.randomizeRotationMax))
+							.setValue(
+								String(
+									this.plugin.settings.randomizeRotationMax
+								)
+							)
 							.onChange(async (value) => {
 								const num = parseFloat(value);
 								if (!isNaN(num)) {
-									this.plugin.settings.randomizeRotationMax = num;
+									this.plugin.settings.randomizeRotationMax =
+										num;
 									await this.plugin.saveSettings();
 								}
 							})
@@ -23313,17 +24802,15 @@ class GNSettingsTab extends PluginSettingTab {
 			}
 
 			// Blur
-			new Setting(containerEl)
-				.setName("Blur")
-				.addToggle((toggle) =>
-					toggle
-						.setValue(this.plugin.settings.randomizeBlur)
-						.onChange(async (value) => {
-							this.plugin.settings.randomizeBlur = value;
-							await this.plugin.saveSettings();
-							this.display();
-						})
-				);
+			new Setting(containerEl).setName("Blur").addToggle((toggle) =>
+				toggle
+					.setValue(this.plugin.settings.randomizeBlur)
+					.onChange(async (value) => {
+						this.plugin.settings.randomizeBlur = value;
+						await this.plugin.saveSettings();
+						this.display();
+					})
+			);
 
 			if (this.plugin.settings.randomizeBlur) {
 				new Setting(containerEl)
@@ -23332,7 +24819,9 @@ class GNSettingsTab extends PluginSettingTab {
 					.addText((text) =>
 						text
 							.setPlaceholder("Min")
-							.setValue(String(this.plugin.settings.randomizeBlurMin))
+							.setValue(
+								String(this.plugin.settings.randomizeBlurMin)
+							)
 							.onChange(async (value) => {
 								const num = parseFloat(value);
 								if (!isNaN(num) && num >= 0) {
@@ -23344,7 +24833,9 @@ class GNSettingsTab extends PluginSettingTab {
 					.addText((text) =>
 						text
 							.setPlaceholder("Max")
-							.setValue(String(this.plugin.settings.randomizeBlurMax))
+							.setValue(
+								String(this.plugin.settings.randomizeBlurMax)
+							)
 							.onChange(async (value) => {
 								const num = parseFloat(value);
 								if (!isNaN(num) && num >= 0) {
@@ -23362,7 +24853,8 @@ class GNSettingsTab extends PluginSettingTab {
 					toggle
 						.setValue(this.plugin.settings.randomizeBackgroundColor)
 						.onChange(async (value) => {
-							this.plugin.settings.randomizeBackgroundColor = value;
+							this.plugin.settings.randomizeBackgroundColor =
+								value;
 							await this.plugin.saveSettings();
 							this.display();
 						})
@@ -23376,7 +24868,7 @@ class GNSettingsTab extends PluginSettingTab {
 					{ name: "Lt Blue", hex: "#e6f2ff" },
 					{ name: "Lt Pink", hex: "#ffe6f0" },
 					{ name: "Lt Yellow", hex: "#fffacd" },
-					{ name: "Lt Green", hex: "#e6ffe6" }
+					{ name: "Lt Green", hex: "#e6ffe6" },
 				];
 
 				const bgColorsContainer = containerEl.createDiv();
@@ -23388,15 +24880,29 @@ class GNSettingsTab extends PluginSettingTab {
 					label.style.display = "inline-block";
 					label.style.marginRight = "15px";
 					label.style.marginBottom = "5px";
-					const checkbox = label.createEl("input", { type: "checkbox" });
-					checkbox.checked = this.plugin.settings.randomizeBackgroundColors.includes(color.hex);
+					const checkbox = label.createEl("input", {
+						type: "checkbox",
+					});
+					checkbox.checked =
+						this.plugin.settings.randomizeBackgroundColors.includes(
+							color.hex
+						);
 					checkbox.addEventListener("change", async () => {
 						if (checkbox.checked) {
-							if (!this.plugin.settings.randomizeBackgroundColors.includes(color.hex)) {
-								this.plugin.settings.randomizeBackgroundColors.push(color.hex);
+							if (
+								!this.plugin.settings.randomizeBackgroundColors.includes(
+									color.hex
+								)
+							) {
+								this.plugin.settings.randomizeBackgroundColors.push(
+									color.hex
+								);
 							}
 						} else {
-							this.plugin.settings.randomizeBackgroundColors = this.plugin.settings.randomizeBackgroundColors.filter(c => c !== color.hex);
+							this.plugin.settings.randomizeBackgroundColors =
+								this.plugin.settings.randomizeBackgroundColors.filter(
+									(c) => c !== color.hex
+								);
 						}
 						await this.plugin.saveSettings();
 					});
@@ -23406,8 +24912,11 @@ class GNSettingsTab extends PluginSettingTab {
 					colorSwatch.style.height = "12px";
 					colorSwatch.style.backgroundColor = color.hex;
 					colorSwatch.style.marginRight = "3px";
-					colorSwatch.style.border = "1px solid var(--background-modifier-border)";
-					label.appendChild(document.createTextNode(` ${color.name}`));
+					colorSwatch.style.border =
+						"1px solid var(--background-modifier-border)";
+					label.appendChild(
+						document.createTextNode(` ${color.name}`)
+					);
 				}
 			}
 		}
@@ -25265,7 +26774,10 @@ class BulkRefocusReviewModal extends Modal {
 
 		// Calculate totals
 		const totalOriginal = this.refocusResults.length;
-		const totalNew = this.refocusResults.reduce((sum, result) => sum + result.refocusedCards.length, 0);
+		const totalNew = this.refocusResults.reduce(
+			(sum, result) => sum + result.refocusedCards.length,
+			0
+		);
 
 		this.contentEl.createEl("p", {
 			text: `${totalNew} new cards generated from ${totalOriginal} original cards. Review the results below:`,
@@ -25275,7 +26787,8 @@ class BulkRefocusReviewModal extends Modal {
 		const scrollContainer = this.contentEl.createDiv();
 		scrollContainer.style.maxHeight = "400px";
 		scrollContainer.style.overflowY = "auto";
-		scrollContainer.style.border = "1px solid var(--background-modifier-border)";
+		scrollContainer.style.border =
+			"1px solid var(--background-modifier-border)";
 		scrollContainer.style.borderRadius = "8px";
 		scrollContainer.style.padding = "16px";
 		scrollContainer.style.marginBottom = "20px";
@@ -25284,7 +26797,9 @@ class BulkRefocusReviewModal extends Modal {
 		this.refocusResults.forEach((result, index) => {
 			if (index > 0) {
 				scrollContainer.createEl("hr", {
-					attr: { style: "margin: 20px 0; border-color: var(--background-modifier-border);" }
+					attr: {
+						style: "margin: 20px 0; border-color: var(--background-modifier-border);",
+					},
 				});
 			}
 
@@ -25310,11 +26825,14 @@ class BulkRefocusReviewModal extends Modal {
 
 			// New cards
 			const newSection = scrollContainer.createDiv();
-			newSection.createEl("h4", { text: `New Cards (${result.refocusedCards.length}):` });
+			newSection.createEl("h4", {
+				text: `New Cards (${result.refocusedCards.length}):`,
+			});
 
 			result.refocusedCards.forEach((newCard, cardIndex) => {
 				const newCardDiv = newSection.createDiv();
-				newCardDiv.style.backgroundColor = "var(--background-primary-alt)";
+				newCardDiv.style.backgroundColor =
+					"var(--background-primary-alt)";
 				newCardDiv.style.padding = "8px";
 				newCardDiv.style.borderRadius = "4px";
 				newCardDiv.style.fontSize = "0.9em";
@@ -25360,7 +26878,10 @@ class BulkRefocusReviewModal extends Modal {
 }
 
 class DuplicateCardsModal extends Modal {
-	private deletedCards = new Map<string, { card: Flashcard; deckPath: string }>(); // For undo functionality
+	private deletedCards = new Map<
+		string,
+		{ card: Flashcard; deckPath: string }
+	>(); // For undo functionality
 
 	constructor(
 		private plugin: GatedNotesPlugin,
@@ -25374,7 +26895,10 @@ class DuplicateCardsModal extends Modal {
 		makeModalDraggable(this, this.plugin);
 
 		const totalGroups = this.duplicateGroups.length;
-		const totalDuplicates = this.duplicateGroups.reduce((sum, group) => sum + group.cards.length, 0);
+		const totalDuplicates = this.duplicateGroups.reduce(
+			(sum, group) => sum + group.cards.length,
+			0
+		);
 
 		this.contentEl.createEl("p", {
 			text: `Found ${totalGroups} groups containing ${totalDuplicates} potentially duplicate cards. Review and delete unwanted duplicates:`,
@@ -25384,7 +26908,8 @@ class DuplicateCardsModal extends Modal {
 		const scrollContainer = this.contentEl.createDiv();
 		scrollContainer.style.maxHeight = "500px";
 		scrollContainer.style.overflowY = "auto";
-		scrollContainer.style.border = "1px solid var(--background-modifier-border)";
+		scrollContainer.style.border =
+			"1px solid var(--background-modifier-border)";
 		scrollContainer.style.borderRadius = "8px";
 		scrollContainer.style.padding = "16px";
 		scrollContainer.style.marginBottom = "20px";
@@ -25393,13 +26918,17 @@ class DuplicateCardsModal extends Modal {
 		this.duplicateGroups.forEach((group, groupIndex) => {
 			if (groupIndex > 0) {
 				scrollContainer.createEl("hr", {
-					attr: { style: "margin: 24px 0; border-color: var(--background-modifier-border);" }
+					attr: {
+						style: "margin: 24px 0; border-color: var(--background-modifier-border);",
+					},
 				});
 			}
 
 			const groupHeader = scrollContainer.createDiv();
 			groupHeader.style.marginBottom = "16px";
-			groupHeader.createEl("h3", { text: `Duplicate Group ${groupIndex + 1}` });
+			groupHeader.createEl("h3", {
+				text: `Duplicate Group ${groupIndex + 1}`,
+			});
 
 			group.cards.forEach((cardInfo, cardIndex) => {
 				const cardDiv = scrollContainer.createDiv();
@@ -25428,11 +26957,19 @@ class DuplicateCardsModal extends Modal {
 				metaDiv.style.color = "var(--text-muted)";
 				metaDiv.style.marginBottom = "8px";
 
-				const locationText = cardInfo.card.chapter.split('/').pop()?.replace('.md', '') || 'Unknown';
+				const locationText =
+					cardInfo.card.chapter
+						.split("/")
+						.pop()
+						?.replace(".md", "") || "Unknown";
 				metaDiv.createSpan({ text: `Location: ${locationText}` });
 
 				if (cardInfo.similarity < 1.0) {
-					metaDiv.createSpan({ text: ` • Similarity: ${Math.round(cardInfo.similarity * 100)}%` });
+					metaDiv.createSpan({
+						text: ` • Similarity: ${Math.round(
+							cardInfo.similarity * 100
+						)}%`,
+					});
 				}
 
 				// Action button container (below metadata)
@@ -25447,10 +26984,14 @@ class DuplicateCardsModal extends Modal {
 
 				// Suspend button
 				const suspendButton = buttonDiv.createEl("button");
-				suspendButton.textContent = cardInfo.card.suspended ? "↻ Unsuspend" : "⏸️ Suspend";
+				suspendButton.textContent = cardInfo.card.suspended
+					? "↻ Unsuspend"
+					: "⏸️ Suspend";
 				suspendButton.style.padding = "4px 8px";
 				suspendButton.style.fontSize = "0.8em";
-				suspendButton.style.backgroundColor = cardInfo.card.suspended ? "var(--interactive-success)" : "var(--interactive-normal)";
+				suspendButton.style.backgroundColor = cardInfo.card.suspended
+					? "var(--interactive-success)"
+					: "var(--interactive-normal)";
 				suspendButton.style.color = "var(--text-on-accent)";
 				suspendButton.style.border = "none";
 				suspendButton.style.borderRadius = "4px";
@@ -25464,9 +27005,18 @@ class DuplicateCardsModal extends Modal {
 				suspendButton.onclick = async () => {
 					try {
 						await this.toggleSuspendCard(cardInfo.card);
-						suspendButton.textContent = cardInfo.card.suspended ? "↻ Unsuspend" : "⏸️ Suspend";
-						suspendButton.style.backgroundColor = cardInfo.card.suspended ? "var(--interactive-success)" : "var(--interactive-normal)";
-						new Notice(cardInfo.card.suspended ? "Card suspended" : "Card unsuspended");
+						suspendButton.textContent = cardInfo.card.suspended
+							? "↻ Unsuspend"
+							: "⏸️ Suspend";
+						suspendButton.style.backgroundColor = cardInfo.card
+							.suspended
+							? "var(--interactive-success)"
+							: "var(--interactive-normal)";
+						new Notice(
+							cardInfo.card.suspended
+								? "Card suspended"
+								: "Card unsuspended"
+						);
 					} catch (error) {
 						new Notice("❌ Failed to toggle suspend");
 						console.error("Suspend toggle error:", error);
@@ -25475,10 +27025,14 @@ class DuplicateCardsModal extends Modal {
 
 				// Flag button
 				const flagButton = buttonDiv.createEl("button");
-				flagButton.textContent = cardInfo.card.flagged ? "🏴 Unflag" : "🏁 Flag";
+				flagButton.textContent = cardInfo.card.flagged
+					? "🏴 Unflag"
+					: "🏁 Flag";
 				flagButton.style.padding = "4px 8px";
 				flagButton.style.fontSize = "0.8em";
-				flagButton.style.backgroundColor = cardInfo.card.flagged ? "var(--interactive-accent)" : "var(--interactive-normal)";
+				flagButton.style.backgroundColor = cardInfo.card.flagged
+					? "var(--interactive-accent)"
+					: "var(--interactive-normal)";
 				flagButton.style.color = "var(--text-on-accent)";
 				flagButton.style.border = "none";
 				flagButton.style.borderRadius = "4px";
@@ -25492,9 +27046,17 @@ class DuplicateCardsModal extends Modal {
 				flagButton.onclick = async () => {
 					try {
 						await this.toggleFlagCard(cardInfo.card);
-						flagButton.textContent = cardInfo.card.flagged ? "🏴 Unflag" : "🏁 Flag";
-						flagButton.style.backgroundColor = cardInfo.card.flagged ? "var(--interactive-accent)" : "var(--interactive-normal)";
-						new Notice(cardInfo.card.flagged ? "Card flagged" : "Card unflagged");
+						flagButton.textContent = cardInfo.card.flagged
+							? "🏴 Unflag"
+							: "🏁 Flag";
+						flagButton.style.backgroundColor = cardInfo.card.flagged
+							? "var(--interactive-accent)"
+							: "var(--interactive-normal)";
+						new Notice(
+							cardInfo.card.flagged
+								? "Card flagged"
+								: "Card unflagged"
+						);
 					} catch (error) {
 						new Notice("❌ Failed to toggle flag");
 						console.error("Flag toggle error:", error);
@@ -25506,7 +27068,8 @@ class DuplicateCardsModal extends Modal {
 				deleteButton.textContent = "🗑️ Delete";
 				deleteButton.style.padding = "4px 8px";
 				deleteButton.style.fontSize = "0.8em";
-				deleteButton.style.backgroundColor = "var(--interactive-accent)";
+				deleteButton.style.backgroundColor =
+					"var(--interactive-accent)";
 				deleteButton.style.color = "var(--text-on-accent)";
 				deleteButton.style.border = "none";
 				deleteButton.style.borderRadius = "4px";
@@ -25516,7 +27079,8 @@ class DuplicateCardsModal extends Modal {
 				if (isDeleted) {
 					cardDiv.style.opacity = "0.5";
 					deleteButton.textContent = "↶ Undo";
-					deleteButton.style.backgroundColor = "var(--interactive-normal)";
+					deleteButton.style.backgroundColor =
+						"var(--interactive-normal)";
 				}
 
 				deleteButton.onclick = async () => {
@@ -25527,7 +27091,8 @@ class DuplicateCardsModal extends Modal {
 							this.deletedCards.delete(cardId);
 							cardDiv.style.opacity = "1";
 							deleteButton.textContent = "🗑️ Delete";
-							deleteButton.style.backgroundColor = "var(--interactive-accent)";
+							deleteButton.style.backgroundColor =
+								"var(--interactive-accent)";
 							deleteButton.disabled = false;
 							// Re-enable other buttons
 							suspendButton.disabled = false;
@@ -25539,11 +27104,12 @@ class DuplicateCardsModal extends Modal {
 							await this.deleteCardWithUndo(cardInfo.card);
 							this.deletedCards.set(cardId, {
 								card: cardInfo.card,
-								deckPath: this.getDeckPath(cardInfo.card)
+								deckPath: this.getDeckPath(cardInfo.card),
 							});
 							cardDiv.style.opacity = "0.5";
 							deleteButton.textContent = "↶ Undo";
-							deleteButton.style.backgroundColor = "var(--interactive-normal)";
+							deleteButton.style.backgroundColor =
+								"var(--interactive-normal)";
 							// Disable other buttons when deleted
 							suspendButton.disabled = true;
 							suspendButton.style.opacity = "0.5";
@@ -25572,7 +27138,7 @@ class DuplicateCardsModal extends Modal {
 	}
 
 	private getDeckPath(card: Flashcard): string {
-		const folderPath = card.chapter.split('/').slice(0, -1).join('/');
+		const folderPath = card.chapter.split("/").slice(0, -1).join("/");
 		return folderPath ? `${folderPath}/${DECK_FILE_NAME}` : DECK_FILE_NAME;
 	}
 
@@ -25619,10 +27185,12 @@ class DuplicateCardsModal extends Modal {
 
 class DuplicateDetectionConfirmModal extends Modal {
 	private selectedScope: string;
-	private excludeSuspended: boolean = true;  // Default to excluding suspended cards
-	private excludeFlagged: boolean = false;   // Default to including flagged cards
-	private comparisonMode: ComparisonMode = ComparisonMode.FRONT_PLUS_BACK;  // Default to front+back
-	private scopeStats: { [key: string]: { cards: number; comparisons: number } } = {};
+	private excludeSuspended: boolean = true; // Default to excluding suspended cards
+	private excludeFlagged: boolean = false; // Default to including flagged cards
+	private comparisonMode: ComparisonMode = ComparisonMode.FRONT_PLUS_BACK; // Default to front+back
+	private scopeStats: {
+		[key: string]: { cards: number; comparisons: number };
+	} = {};
 	private statsEl!: HTMLElement; // Will be initialized in onOpen
 
 	constructor(
@@ -25631,7 +27199,15 @@ class DuplicateDetectionConfirmModal extends Modal {
 		private noteTypeText: string,
 		private cardTypeText: string,
 		private isPolyglotMode: boolean,
-		private onConfirm: (result: { confirmed: boolean; selectedScope: string; excludeSuspended: boolean; excludeFlagged: boolean; comparisonMode: ComparisonMode } | null) => void
+		private onConfirm: (
+			result: {
+				confirmed: boolean;
+				selectedScope: string;
+				excludeSuspended: boolean;
+				excludeFlagged: boolean;
+				comparisonMode: ComparisonMode;
+			} | null
+		) => void
 	) {
 		super(plugin.app);
 		this.selectedScope = "/"; // Default to vault-wide
@@ -25655,7 +27231,7 @@ class DuplicateDetectionConfirmModal extends Modal {
 		scopeSection.createEl("h3", { text: "Select search scope:" });
 
 		// Build hierarchical path options
-		const pathParts = this.currentFile.path.split('/');
+		const pathParts = this.currentFile.path.split("/");
 		const scopeOptions = this.buildScopeOptions(pathParts);
 
 		// Create radio buttons for scope selection
@@ -25668,7 +27244,7 @@ class DuplicateDetectionConfirmModal extends Modal {
 
 			const radio = optionDiv.createEl("input", {
 				type: "radio",
-				attr: { name: "scope-selection", value: option.value }
+				attr: { name: "scope-selection", value: option.value },
 			});
 
 			if (option.value === this.selectedScope) {
@@ -25687,7 +27263,7 @@ class DuplicateDetectionConfirmModal extends Modal {
 			label.style.cursor = "pointer";
 			label.onclick = () => {
 				radio.checked = true;
-				radio.onchange?.(new Event('change'));
+				radio.onchange?.(new Event("change"));
 			};
 		}
 
@@ -25705,7 +27281,7 @@ class DuplicateDetectionConfirmModal extends Modal {
 
 		const suspendedCheckbox = suspendedDiv.createEl("input", {
 			type: "checkbox",
-			attr: { id: "exclude-suspended" }
+			attr: { id: "exclude-suspended" },
 		});
 		suspendedCheckbox.checked = this.excludeSuspended;
 		suspendedCheckbox.onchange = async () => {
@@ -25732,7 +27308,7 @@ class DuplicateDetectionConfirmModal extends Modal {
 
 		const flaggedCheckbox = flaggedDiv.createEl("input", {
 			type: "checkbox",
-			attr: { id: "exclude-flagged" }
+			attr: { id: "exclude-flagged" },
 		});
 		flaggedCheckbox.checked = this.excludeFlagged;
 		flaggedCheckbox.onchange = async () => {
@@ -25765,7 +27341,9 @@ class DuplicateDetectionConfirmModal extends Modal {
 		comparisonLabel.textContent = "Compare:";
 		comparisonLabel.style.minWidth = "60px";
 
-		const comparisonSelect = comparisonDiv.createEl("select") as HTMLSelectElement;
+		const comparisonSelect = comparisonDiv.createEl(
+			"select"
+		) as HTMLSelectElement;
 		comparisonSelect.style.flex = "1";
 		comparisonSelect.style.padding = "4px 8px";
 		comparisonSelect.style.border = "1px solid var(--interactive-normal)";
@@ -25773,17 +27351,29 @@ class DuplicateDetectionConfirmModal extends Modal {
 
 		// Add comparison mode options
 		const comparisonOptions = [
-			{ value: ComparisonMode.FRONT, label: "Front only (front-to-front)" },
+			{
+				value: ComparisonMode.FRONT,
+				label: "Front only (front-to-front)",
+			},
 			{ value: ComparisonMode.BACK, label: "Back only (back-to-back)" },
-			{ value: ComparisonMode.FRONT_OR_BACK, label: "Front OR Back (max of both)" },
-			{ value: ComparisonMode.FRONT_AND_BACK, label: "Front AND Back (probabilistic)" },
-			{ value: ComparisonMode.FRONT_PLUS_BACK, label: "Front+Back (concatenated)" }
+			{
+				value: ComparisonMode.FRONT_OR_BACK,
+				label: "Front OR Back (max of both)",
+			},
+			{
+				value: ComparisonMode.FRONT_AND_BACK,
+				label: "Front AND Back (probabilistic)",
+			},
+			{
+				value: ComparisonMode.FRONT_PLUS_BACK,
+				label: "Front+Back (concatenated)",
+			},
 		];
 
 		for (const option of comparisonOptions) {
 			const optionEl = comparisonSelect.createEl("option", {
 				value: option.value,
-				text: option.label
+				text: option.label,
 			});
 			if (option.value === this.comparisonMode) {
 				optionEl.selected = true;
@@ -25828,37 +27418,41 @@ class DuplicateDetectionConfirmModal extends Modal {
 					selectedScope: this.selectedScope,
 					excludeSuspended: this.excludeSuspended,
 					excludeFlagged: this.excludeFlagged,
-					comparisonMode: this.comparisonMode
+					comparisonMode: this.comparisonMode,
 				});
 				this.close();
 			});
 	}
 
-	private buildScopeOptions(pathParts: string[]): Array<{ label: string; value: string }> {
+	private buildScopeOptions(
+		pathParts: string[]
+	): Array<{ label: string; value: string }> {
 		const options: Array<{ label: string; value: string }> = [];
 
 		// Current note only
 		options.push({
 			label: `📄 Current note only (${this.currentFile.name})`,
-			value: this.currentFile.path
+			value: this.currentFile.path,
 		});
 
 		// Build folder hierarchy
 		let currentPath = "";
 		for (let i = 0; i < pathParts.length - 1; i++) {
-			currentPath = currentPath ? `${currentPath}/${pathParts[i]}` : pathParts[i];
+			currentPath = currentPath
+				? `${currentPath}/${pathParts[i]}`
+				: pathParts[i];
 			const folderName = pathParts[i];
 			const indent = "  ".repeat(i + 1);
 			options.push({
 				label: `📁 ${indent}${folderName}/ folder`,
-				value: currentPath
+				value: currentPath,
 			});
 		}
 
 		// Vault-wide (root)
 		options.push({
 			label: `🏛️ Entire vault`,
-			value: "/"
+			value: "/",
 		});
 
 		return options;
@@ -25883,9 +27477,12 @@ class DuplicateDetectionConfirmModal extends Modal {
 		let totalCards = 0;
 		let totalComparisons = 0;
 
-		const filteredDeckFiles = allDeckFiles.filter(deckFile => {
+		const filteredDeckFiles = allDeckFiles.filter((deckFile) => {
 			if (scope === this.currentFile.path) {
-				return deckFile.path === this.plugin.getDeckPathForNote(this.currentFile.path);
+				return (
+					deckFile.path ===
+					this.plugin.getDeckPathForNote(this.currentFile.path)
+				);
 			} else if (scope === "/") {
 				return true;
 			} else {
@@ -25900,18 +27497,23 @@ class DuplicateDetectionConfirmModal extends Modal {
 
 				// Apply polyglot filtering
 				let targetCards = this.isPolyglotMode
-					? allDeckCards.filter(card => this.plugin.isPolyglotCard(card))
-					: allDeckCards.filter(card => !this.plugin.isPolyglotCard(card));
+					? allDeckCards.filter((card) =>
+							this.plugin.isPolyglotCard(card)
+					  )
+					: allDeckCards.filter(
+							(card) => !this.plugin.isPolyglotCard(card)
+					  );
 
 				// Apply suspended/flagged filtering
-				targetCards = targetCards.filter(card => {
+				targetCards = targetCards.filter((card) => {
 					if (card.suspended && this.excludeSuspended) return false;
 					if (card.flagged && this.excludeFlagged) return false;
 					return true;
 				});
 
 				if (targetCards.length >= 2) {
-					const deckComparisons = (targetCards.length * (targetCards.length - 1)) / 2;
+					const deckComparisons =
+						(targetCards.length * (targetCards.length - 1)) / 2;
 					totalComparisons += deckComparisons;
 					totalCards += targetCards.length;
 				}
@@ -25921,7 +27523,10 @@ class DuplicateDetectionConfirmModal extends Modal {
 		}
 
 		const cacheKey = this.getCacheKey(scope);
-		this.scopeStats[cacheKey] = { cards: totalCards, comparisons: totalComparisons };
+		this.scopeStats[cacheKey] = {
+			cards: totalCards,
+			comparisons: totalComparisons,
+		};
 	}
 
 	private async updateStats(): Promise<void> {
@@ -25934,9 +27539,15 @@ class DuplicateDetectionConfirmModal extends Modal {
 		this.statsEl.empty();
 		this.statsEl.createEl("strong", { text: "Analysis scope:" });
 		this.statsEl.createEl("br");
-		this.statsEl.createSpan({ text: `• ${stats.cards.toLocaleString()} ${this.cardTypeText} cards found` });
+		this.statsEl.createSpan({
+			text: `• ${stats.cards.toLocaleString()} ${
+				this.cardTypeText
+			} cards found`,
+		});
 		this.statsEl.createEl("br");
-		this.statsEl.createSpan({ text: `• ${stats.comparisons.toLocaleString()} total comparisons needed` });
+		this.statsEl.createSpan({
+			text: `• ${stats.comparisons.toLocaleString()} total comparisons needed`,
+		});
 
 		if (stats.comparisons > 1000000) {
 			const warningEl = this.statsEl.createEl("p");
@@ -25944,7 +27555,9 @@ class DuplicateDetectionConfirmModal extends Modal {
 			warningEl.style.marginTop = "8px";
 			warningEl.createEl("strong", { text: "⚠️ Large dataset detected" });
 			warningEl.createEl("br");
-			warningEl.createSpan({ text: "This analysis may take several minutes to complete." });
+			warningEl.createSpan({
+				text: "This analysis may take several minutes to complete.",
+			});
 		}
 	}
 
@@ -26009,7 +27622,13 @@ class LlmEditModal extends Modal {
 	private tags: string[];
 	private plugin: GatedNotesPlugin;
 
-	constructor(app: App, file: TFile, originalText: string, tags: string[], plugin: GatedNotesPlugin) {
+	constructor(
+		app: App,
+		file: TFile,
+		originalText: string,
+		tags: string[],
+		plugin: GatedNotesPlugin
+	) {
 		super(app);
 		this.file = file;
 		this.originalText = originalText;
@@ -26041,7 +27660,8 @@ class LlmEditModal extends Modal {
 		// Edit request input
 		contentEl.createEl("h3", { text: "Describe your desired changes:" });
 		const textareaEl = contentEl.createEl("textarea", {
-			placeholder: "Example: Add footnotes parenthetically, improve clarity, fix grammar..."
+			placeholder:
+				"Example: Add footnotes parenthetically, improve clarity, fix grammar...",
 		});
 		textareaEl.style.cssText = `
 			width: 100%;
@@ -26084,7 +27704,6 @@ class LlmEditModal extends Modal {
 	}
 
 	private async generateEdit() {
-
 		if (!this.editRequest.trim()) {
 			new Notice("Please describe the changes you want to make.");
 			return;
@@ -26102,17 +27721,25 @@ ${this.originalText}
 Return only the edited text, maintaining the original structure and formatting as much as possible.`;
 
 			// Make LLM call
-			const response = await this.plugin.sendToLlm(prompt, [], {}, "flashcard");
+			const response = await this.plugin.sendToLlm(
+				prompt,
+				[],
+				{},
+				"flashcard"
+			);
 
 			const editedText = response.content.trim();
 			loadingNotice.hide();
 
 			// Show diff view
 			this.showDiffView(editedText);
-
 		} catch (error) {
 			loadingNotice.hide();
-			new Notice(`Error generating edit: ${error instanceof Error ? error.message : String(error)}`);
+			new Notice(
+				`Error generating edit: ${
+					error instanceof Error ? error.message : String(error)
+				}`
+			);
 			console.error("LLM edit error:", error);
 		}
 	}
@@ -26146,9 +27773,11 @@ Return only the edited text, maintaining the original structure and formatting a
 			span.textContent = part.value;
 
 			if (part.added) {
-				span.style.cssText = "background-color: #dcfce7; color: #166534;";
+				span.style.cssText =
+					"background-color: #dcfce7; color: #166534;";
 			} else if (part.removed) {
-				span.style.cssText = "background-color: #fef2f2; color: #dc2626; text-decoration: line-through;";
+				span.style.cssText =
+					"background-color: #fef2f2; color: #dc2626; text-decoration: line-through;";
 			}
 		});
 
@@ -26159,8 +27788,12 @@ Return only the edited text, maintaining the original structure and formatting a
 
 		// Show stats
 		const statsEl = contentEl.createDiv("gn-diff-stats");
-		const addedCount = diff.filter((p: Change) => p.added).reduce((acc: number, p: Change) => acc + p.value.length, 0);
-		const removedCount = diff.filter((p: Change) => p.removed).reduce((acc: number, p: Change) => acc + p.value.length, 0);
+		const addedCount = diff
+			.filter((p: Change) => p.added)
+			.reduce((acc: number, p: Change) => acc + p.value.length, 0);
+		const removedCount = diff
+			.filter((p: Change) => p.removed)
+			.reduce((acc: number, p: Change) => acc + p.value.length, 0);
 
 		statsEl.innerHTML = `
 			<div style="margin: 8px 0; font-size: 0.9em; color: var(--text-muted);">
@@ -26188,16 +27821,20 @@ Return only the edited text, maintaining the original structure and formatting a
 			.onClick(() => this.acceptChanges(editedText));
 	}
 
-	private highlightTagsInDiff(diffContainer: HTMLElement, editedText: string) {
+	private highlightTagsInDiff(
+		diffContainer: HTMLElement,
+		editedText: string
+	) {
 		// Simple tag detection - count how many of our tags are still present in the text
-		const tagsFound = this.tags.filter(tag => {
+		const tagsFound = this.tags.filter((tag) => {
 			const normalizedText = editedText.toLowerCase();
 			const normalizedTag = tag.toLowerCase();
 			return normalizedText.includes(normalizedTag);
 		});
 
 		// Add tag detection summary
-		const tagSummary = diffContainer.parentElement!.createDiv("gn-tag-summary");
+		const tagSummary =
+			diffContainer.parentElement!.createDiv("gn-tag-summary");
 		tagSummary.innerHTML = `
 			<div style="margin: 8px 0; padding: 8px; background: rgba(255, 235, 59, 0.1); border-radius: 4px; font-size: 0.9em;">
 				📍 Found ${tagsFound.length}/${this.tags.length} flashcard tags in edited text
@@ -26212,16 +27849,24 @@ Return only the edited text, maintaining the original structure and formatting a
 
 			// Recalculate paragraph IDs if flashcards exist
 			if (this.tags.length > 0) {
-				new Notice("Changes applied. Recalculating flashcard paragraph IDs...");
+				new Notice(
+					"Changes applied. Recalculating flashcard paragraph IDs..."
+				);
 				await this.plugin.recalculateParaIdx(this.file, false);
-				new Notice("Changes applied and flashcard paragraphs updated successfully!");
+				new Notice(
+					"Changes applied and flashcard paragraphs updated successfully!"
+				);
 			} else {
 				new Notice("Changes applied successfully!");
 			}
 
 			this.close();
 		} catch (error) {
-			new Notice(`Error applying changes: ${error instanceof Error ? error.message : String(error)}`);
+			new Notice(
+				`Error applying changes: ${
+					error instanceof Error ? error.message : String(error)
+				}`
+			);
 			console.error("Error applying LLM edit:", error);
 		}
 	}

@@ -37,7 +37,8 @@ export default {
   plugins: [
     typescript(),
     resolve({
-      preferBuiltins: true
+      preferBuiltins: false,
+      browser: true
     }),
     commonjs(),
     isProd && terser({

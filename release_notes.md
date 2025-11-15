@@ -1,3 +1,48 @@
+# v2.10.0
+
+## 🎯 Ebisu Bayesian Scheduling & Split Card Inheritance 🎯
+
+This release replaces complex neural network scheduling with a lightweight, interpretable Bayesian algorithm (Ebisu), simplifies the scheduling options to SM-2 and Ebisu only, and adds intelligent review history inheritance for split cards to preserve learning progress.
+
+### 🚀 New Features
+
+-   **🎯 Ebisu Bayesian Scheduling Algorithm:** A new, scientifically-grounded scheduling algorithm based on Bayesian inference:
+    -   **Beta Distribution Modeling:** Uses Beta distributions to model recall probability over time with statistical rigor
+    -   **Configurable Prior Parameters:** Set default half-life (hours), alpha/beta confidence parameters for new cards
+    -   **Rating-Specific Updates:** Customize success/total parameters for each rating (Again: 0/1, Hard: 1/2, Good: 1/1, Easy: 2/2)
+    -   **Target Recall Setting:** Configure target recall probability (default 85%) for interval calculations
+    -   **History Replay Mode:** Optional "always recalculate from history" setting for parameter tuning experiments
+    -   **Comprehensive Logging:** Console logs show model updates, recall probabilities, and interval calculations
+    -   **Lightweight Implementation:** Uses pre-bundled ebisu-js library (no heavy ML frameworks)
+-   **📊 Split Card Review History Inheritance:** Split cards now preserve learning progress:
+    -   **Automatic Inheritance (Default):** Split cards inherit parent's review_history, status, intervals, and algorithm data
+    -   **Algorithm Preservation:** Copies SM-2 ease factors or Ebisu model (alpha, beta, time) from parent
+    -   **Toggleable Setting:** Can be disabled if you prefer split cards to start fresh
+    -   **Seamless Integration:** Works transparently with both SM-2 and Ebisu algorithms
+-   **⚡ Simplified Algorithm Options:** Streamlined scheduling to two proven approaches:
+    -   **SM-2 (Traditional):** Classic SuperMemo 2 algorithm with ease factors
+    -   **Ebisu (Bayesian):** Modern Bayesian approach with statistical modeling
+    -   **Settings UI Update:** Clean dropdown with only two choices for easier decision-making
+
+### ⚠️ Breaking Changes
+
+-   **🔴 REMOVED: FSRS Algorithm:** The FSRS scheduling algorithm has been removed to simplify the codebase
+    -   Existing FSRS cards will need to be reset or manually migrated to SM-2 or Ebisu
+    -   FSRS settings and UI panels have been removed
+-   **🔴 REMOVED: GRU/TensorFlow Neural Network Model:** The experimental GRU recall model has been removed
+    -   Removed dependencies: @tensorflow/tfjs (saves ~50MB)
+    -   Removed files: train_gru.ts, recall_infer.ts, export_weights.ts
+    -   Simplified codebase with no runtime TensorFlow overhead
+
+### 🎨 Improvements
+
+-   **📝 Code Cleanup:** Removed 300+ lines of unused scheduling code
+-   **📚 Better Documentation:** Added docstrings to all scheduling methods
+-   **🔧 Cleaner Settings:** Removed complex FSRS parameter configuration UI
+-   **⚡ Faster Builds:** Reduced bundle size by removing TensorFlow dependencies
+
+---
+
 # v2.9.0
 
 ## ✨ Comprehensive Mnemonic System, New Flashcard Types & Advanced Card Management ✨

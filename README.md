@@ -2,7 +2,7 @@
 
 **AI-powered, gated reading and spaced repetition for Obsidian.**
 
-**Gated Notes** is an Obsidian plugin that transforms reading into an active learning process. Inspired by [Andy Matuschak and Michael Nielsen’s concept of the “Mnemonic Medium”](https://numinous.productions/ttft/#introducing-mnemonic-medium), it combines **gated reading** with an **SM-2 spaced repetition system** and **AI-driven flashcard generation**.
+**Gated Notes** is an Obsidian plugin that transforms reading into an active learning process. Inspired by [Andy Matuschak and Michael Nielsen's concept of the "Mnemonic Medium"](https://numinous.productions/ttft/#introducing-mnemonic-medium), it combines **gated reading** with **scientifically-grounded spaced repetition** (SM-2 or Bayesian Ebisu) and **AI-driven flashcard generation**.
 
 Instead of passively consuming information, you must _earn_ your way through a note: later sections remain blurred until you’ve correctly answered flashcards tied to earlier sections.
 
@@ -25,6 +25,12 @@ Instead of passively consuming information, you must _earn_ your way through a n
     -   The plugin keeps a log of all AI API calls, allowing you to track your token usage and spending over time.
 
 -   **🧠 Smarter Review & Learning Engine:**
+    -   **🎯 Ebisu Bayesian Scheduling:** Choose between traditional SM-2 or modern Bayesian scheduling:
+        -   **Beta Distribution Modeling:** Uses statistical inference to model recall probability over time
+        -   **Configurable Parameters:** Set half-life, confidence priors, and rating-specific update rules
+        -   **History Replay Mode:** Optional recalculation from review history for parameter experimentation
+        -   **Lightweight & Interpretable:** No heavy ML frameworks, just proven Bayesian statistics
+    -   **📊 Split Card History Inheritance:** Split cards preserve parent's review history and scheduling state
     -   **🎯 Advanced Mnemonic System:** Comprehensive memory aid system with AI-powered generation:
         -   **Automatic Number Detection:** Detects numbers in your cards and generates memorable phonetic word associations using the Major System
         -   **10 AI Generation Styles:** Choose from Alliterative, Rhyming, Humorous, Visual/Concrete, Story-based, Sounds-Alike/Phonetic, Acronym/Acrostic, Peg/Body Method, Memory Palace/Spatial, or Default approaches
